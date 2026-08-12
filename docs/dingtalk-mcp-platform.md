@@ -2,7 +2,7 @@
 
 ## 架构结论
 
-`MWE审批MCP` 首选使用钉钉 MCP 开发平台托管对外 MCP 网关：
+`MWE审批MCP` 只使用钉钉 MCP 开发平台托管的对外 MCP 网关：
 
 ```text
 客户端 --Streamable HTTP--> mcp-gw.dingtalk.com
@@ -10,27 +10,25 @@
        --OpenAPI--> api.dingtalk.com
 ```
 
-- 对外 MCP Server URL：官方文档说明服务通过钉钉统一网关；2026-08-12 从钉钉官方 MCP 市场实际取得的配置使用 `streamable-http`，主机为 `mcp-gw.dingtalk.com`。这可确认首选路径由钉钉托管网关，但 `MWE审批MCP` 尚未发布，其最终具体 URL 仍需在首次发布后核验。
-- 工具动作 URL：由我们托管。钉钉 MCP 开发平台的 `HTTP` 创建方式要求为每个工具配置普通 HTTP API；它不是让开发者上传一个现成 MCP Server URL。
-- 直接自托管回退：本项目仍提供 `POST /mcp` 的标准 Streamable HTTP MCP。若在 Deap“自定义 MCP”中直接填写该 URL，它由我们托管，不属于钉钉托管网关。
+- 对外 MCP Server URL：官方文档说明服务通过钉钉统一网关；2026-08-12 从钉钉官方 MCP 市场实际取得的配置使用 `streamable-http`，主机为 `mcp-gw.dingtalk.com`。这可确认网关由钉钉托管，但 `MWE审批MCP` 尚未发布，其最终具体 URL 仍需在首次发布后核验。
+- 工具动作 URL：由我们托管。钉钉 MCP 开发平台的 `HTTP` 创建方式要求为每个工具配置普通 HTTP API；该 URL 不是 MCP Server URL，也不会提供给 MCP 客户端。
+- 本项目不暴露 `/mcp`，不使用 Deap 自定义 MCP URL，也没有自托管 MCP 回退。
 - 不提供 stdio。
 
 官方说明：
 
 - [钉钉 MCP 广场介绍](https://open.dingtalk.com/document/development/mcp-square-introduction)：服务经钉钉统一网关，平台负责升级、替换、监控和 SLA 等治理。
-- [钉钉 Deap 使用 MCP 服务](https://open.dingtalk.com/document/development/dingtalk-deap-platform-using-mcp-services)：自定义 MCP 需要填写 HTTP URL，这是直接连接自托管服务的另一条路径。
 - [阿里云百炼使用钉钉 MCP 服务](https://open.dingtalk.com/document/development/alibaba-cloud-uses-dingtalk-mcp-services)：客户端配置类型为 Streamable HTTP。
 
 ## 本项目后端配置
 
-部署时注入两个不同的随机密钥，均至少 32 UTF-8 字节：
+部署时注入平台到后端的随机密钥，至少 32 UTF-8 字节：
 
 ```text
-MCP_HTTP_API_KEY=<直接访问 /mcp 的密钥>
 MCP_PLATFORM_API_KEY=<仅供钉钉平台调用工具动作的密钥>
 ```
 
-反向代理必须提供 HTTPS，并把实际域名加入 `MCP_HTTP_ALLOWED_HOSTS`。不要把 Node.js 明文端口直接暴露到公网。
+反向代理必须提供 HTTPS，并把实际后端域名加入 `APPROVAL_BACKEND_ALLOWED_HOSTS`。不要把 Node.js 明文端口直接暴露到公网。
 
 钉钉平台中每个工具的 HTTP 设置相同：
 
@@ -71,8 +69,8 @@ Body: 工具参数对象
 2. 使用后端专用 Bearer Key，逐个验证只读工具动作。
 3. 在钉钉 MCP 开发平台创建或选择 `MWE审批MCP` 服务；不要使用现有“测试MCP”作为生产服务。
 4. 工具创建方式选 `HTTP`，按上表配置 URL、Header、输入参数和输出字段。
-5. 先发布只读工具并执行 MCP 检测；确认平台生成的配置类型为 `streamable-http`，URL 主机为 `mcp-gw.dingtalk.com`。
+5. 先发布只读工具并执行 MCP 检测；只接受平台生成的 `streamable-http` 配置，并确认 URL 主机严格为 `mcp-gw.dingtalk.com`，否则停止接入。
 6. 再加入写工具。保留 `confirm`、`dryRun`、调用人绑定、userId allowlist、processCode allowlist 和持久化幂等键。
-7. MCP Server URL 若包含 `key`，只放入调用端密钥存储，不复制到工单、截图、日志或 Git。
+7. MCP 客户端只保存钉钉平台生成的完整配置；URL 中的 `key` 只放入调用端密钥存储，不复制到工单、截图、日志或 Git。
 
 当前还没有可供平台访问的正式 HTTPS 后端域名，因此本轮没有在开发者平台保存任何工具或发布版本。待域名与密钥就绪后再完成第 3 至第 7 步。

@@ -12,8 +12,8 @@
 - 发起、同意、拒绝、撤销；全部写操作绑定服务端固定调用人，并要求显式确认和本地 userId allowlist。
 - 表单附件、评论/操作记录附件、图片元数据的统一识别。
 - 表单与评论附件安全下载：下载授权、临时 URL 换取、HTTPS/Host/重定向校验、大小上限、SHA-256 和 Base64 返回。
-- 只提供无会话 Streamable HTTP MCP，不包含 stdio 传输。
-- 为钉钉 MCP 开发平台提供复用同一工具契约的普通 HTTPS 动作后端。
+- MCP 客户端只使用钉钉官方生成的 Streamable HTTP 配置，MCP 域名必须为 `mcp-gw.dingtalk.com`。
+- 本项目不暴露 MCP 传输端点，也不包含 stdio；只提供钉钉 MCP 开发平台调用的 HTTPS 工具后端。
 
 保留了 DWS 中已经形成用户习惯的工具名：
 
@@ -96,38 +96,36 @@ DINGTALK_WRITE_USER_IDS=userId-1,userId-2
 APPROVAL_ALLOWED_PROCESS_CODES=PROC-xxxx,PROC-yyyy
 ```
 
-不要把 Client Secret、access token、HTTP API Key 或附件临时 URL 提交到 Git。
+不要把 Client Secret、access token、平台后端 API Key、官方 MCP 配置中的 `key` 或附件临时 URL 提交到 Git。
 
-## 启动 Streamable HTTP MCP
+## 启动平台工具后端
 
 默认只监听 `127.0.0.1:3000`：
 
 ```powershell
 $env:DINGTALK_CLIENT_ID = "dingxxxxxxxx"
 $env:DINGTALK_CLIENT_SECRET = "从密钥存储注入"
-$env:MCP_HTTP_API_KEY = "至少32字节的随机密钥"
-$env:MCP_PLATFORM_API_KEY = "另一个至少32字节的随机密钥"
+$env:MCP_PLATFORM_API_KEY = "至少32字节的随机密钥"
 node .\dist\transports\http.js
 ```
 
 端点：
 
-- MCP：`POST /mcp`
 - 钉钉 MCP 开发平台工具后端：`POST /platform/tools/<toolName>`
 - 健康检查：`GET /healthz`
 
-HTTP 传输每个请求创建独立的 MCP server/transport，禁用会话共享，以规避跨客户端状态泄漏。非 loopback 监听时，服务强制要求：
+本服务不是 MCP Server，客户端不得把它配置为 MCP URL。它只接受钉钉平台到后端的普通 HTTP 调用。非 loopback 监听时，服务强制要求：
 
-- `MCP_HTTP_API_KEY`：至少 32 UTF-8 字节，客户端使用 `Authorization: Bearer ...`。
-- `MCP_HTTP_ALLOWED_HOSTS`：允许的 Host，逗号分隔。
+- `MCP_PLATFORM_API_KEY`：至少 32 UTF-8 字节，由钉钉平台使用 `Authorization: Bearer ...`。
+- `APPROVAL_BACKEND_ALLOWED_HOSTS`：后端允许的 Host，逗号分隔。
 
-服务自身只提供 HTTP。远程部署必须放在 TLS 反向代理或受控隧道之后，不应把明文端口直接暴露到公网。
+远程部署必须放在 TLS 反向代理之后，不应把 Node.js 明文端口直接暴露到公网。
 
-`MCP_PLATFORM_API_KEY` 与 `MCP_HTTP_API_KEY` 必须使用不同随机值。前者由钉钉 MCP 开发平台的各个 HTTP 工具动作通过 `Authorization: Bearer ...` 发送；未配置时，整个 `/platform/tools/*` 路由返回 404。平台后端请求体就是该工具的参数对象，成功响应保持 `{ "result": ... }`，工具校验或业务错误返回 HTTP 422 和 `{ "error": ... }`。
+未配置 `MCP_PLATFORM_API_KEY` 时，整个 `/platform/tools/*` 路由返回 404。平台后端请求体就是该工具的参数对象，成功响应保持 `{ "result": ... }`，工具校验或业务错误返回 HTTP 422 和 `{ "error": ... }`。
 
-## 首选：钉钉 MCP 开发平台托管
+## 唯一 MCP 发布路径：钉钉官方托管
 
-生产首选链路是：
+生产唯一链路是：
 
 ```text
 MCP 客户端
@@ -136,11 +134,11 @@ MCP 客户端
   -> 钉钉官方 OpenAPI（api.dingtalk.com）
 ```
 
-在开发者平台中，每个工具选择 `HTTP` 创建方式，方法为 `POST`，URL 指向本项目对应的 `/platform/tools/<toolName>`，请求头设置后端专用 Bearer Key，请求体参数与工具 Schema 保持一致。钉钉 MCP 开发平台负责生成和维护外部 Streamable HTTP MCP 地址；本项目的 HTTPS 动作地址仍需由我们部署和维护。
+在开发者平台中，每个工具选择 `HTTP` 创建方式，方法为 `POST`，URL 指向本项目对应的 `/platform/tools/<toolName>`，请求头设置后端专用 Bearer Key，请求体参数与工具 Schema 保持一致。钉钉 MCP 开发平台负责生成和维护外部 Streamable HTTP MCP 地址；本项目的 HTTPS 动作地址仍需由我们部署和维护，但它不是 MCP 域名。
 
-2026-08-12 在已登录的钉钉官方 MCP 市场实测，“获取 MCP Server 配置”返回 `type: streamable-http`，URL 主机为钉钉官方域名 `mcp-gw.dingtalk.com`；官方文档同时说明 MCP 服务通过钉钉统一网关。由此可确认首选路径由钉钉托管 MCP 网关。`MWE审批MCP` 尚未发布，所以它最终生成的具体 URL 仍须在首次发布后核验。URL 中的 `key` 是敏感凭据，禁止写入代码、文档、日志或 Git。
+2026-08-12 在已登录的钉钉官方 MCP 市场实测，“获取 MCP Server 配置”返回 `type: streamable-http`，URL 主机为钉钉官方域名 `mcp-gw.dingtalk.com`；官方文档同时说明 MCP 服务通过钉钉统一网关。由此可确认 MCP 网关由钉钉托管。`MWE审批MCP` 尚未发布，所以它最终生成的具体 URL 仍须在首次发布后核验。URL 中的 `key` 是敏感凭据，禁止写入代码、文档、日志或 Git。
 
-钉钉 Deap 的“自定义 MCP”也允许直接填写本项目 `/mcp` URL，但该模式下远端 MCP URL 是我们自托管的地址，并非钉钉托管。因此它只作为回退路径，不是本项目首选发布方式。完整设置步骤和工具端点表见 [`docs/dingtalk-mcp-platform.md`](docs/dingtalk-mcp-platform.md)。
+不使用 Deap 自定义 MCP URL，也不提供任何自托管 MCP 回退。完整设置步骤和工具端点表见 [`docs/dingtalk-mcp-platform.md`](docs/dingtalk-mcp-platform.md)。
 
 ## 写操作安全语义
 
@@ -181,7 +179,7 @@ src/
   core/           错误模型、审计与持久化幂等账本
   dingtalk/       accessToken 缓存和 OpenAPI client
   mcp/            MCP 工具注册
-  transports/     Streamable HTTP 与钉钉平台 HTTP 动作路由
+  transports/     钉钉平台普通 HTTP 工具后端
 tests/             OpenAPI、MCP、HTTP 和附件安全测试
 ```
 

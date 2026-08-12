@@ -9,7 +9,7 @@ export type ApprovalToolResult = Awaited<ReturnType<Client["callTool"]>>;
 /**
  * Reuses the MCP tool catalog for DingTalk MCP Platform's ordinary HTTP actions.
  * This keeps validation, write confirmations, and error payloads identical on
- * the platform-managed gateway and the directly hosted Streamable HTTP route.
+ * every platform-managed tool action without exposing a self-hosted MCP route.
  */
 export async function invokeApprovalTool(
   service: ApprovalService,

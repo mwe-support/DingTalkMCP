@@ -1,16 +1,12 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-
 import type { ApprovalService } from "../approval/service.js";
-import { createApprovalMcpServer } from "../mcp/create-server.js";
 import { invokeApprovalTool } from "../mcp/invoke-tool.js";
 
 export interface ApprovalHttpOptions {
   host: string;
   port: number;
-  apiKey: string | undefined;
   platformApiKey?: string | undefined;
   allowedHosts: string[];
 }
@@ -59,7 +55,7 @@ async function handleRequest(
     return;
   }
 
-  const requestUrl = new URL(request.url ?? "/", "http://mcp.invalid");
+  const requestUrl = new URL(request.url ?? "/", "http://approval-tools.invalid");
   if (requestUrl.pathname === "/healthz" && request.method === "GET") {
     json(response, 200, { status: "ok", service: "mwe-dingtalk-approval-mcp" });
     return;
@@ -71,50 +67,7 @@ async function handleRequest(
     return;
   }
 
-  if (requestUrl.pathname !== "/mcp") {
-    json(response, 404, { error: "Not Found" });
-    return;
-  }
-  if (!authorized(request.headers.authorization, options.apiKey)) {
-    response.setHeader("www-authenticate", "Bearer");
-    json(response, 401, { error: "Unauthorized" });
-    return;
-  }
-  if (request.method !== "POST") {
-    response.setHeader("allow", "POST");
-    jsonRpcError(response, 405, -32000, "Method not allowed.");
-    return;
-  }
-
-  let body: unknown;
-  try {
-    body = await readJsonBody(request, 1024 * 1024);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Invalid JSON request body";
-    jsonRpcError(response, 400, -32700, message);
-    return;
-  }
-
-  const server = createApprovalMcpServer(service);
-  const transport = new StreamableHTTPServerTransport({ enableJsonResponse: true });
-  let closed = false;
-  const cleanup = (): void => {
-    if (closed) return;
-    closed = true;
-    void Promise.allSettled([transport.close(), server.close()]);
-  };
-  response.once("close", cleanup);
-  response.once("finish", cleanup);
-  try {
-    // SDK 1.30.0's optional callback declarations conflict with exactOptionalPropertyTypes.
-    await server.connect(transport as unknown as Parameters<typeof server.connect>[0]);
-    await transport.handleRequest(request, response, body);
-  } catch {
-    cleanup();
-    if (!response.headersSent) {
-      jsonRpcError(response, 500, -32603, "Internal server error.");
-    }
-  }
+  json(response, 404, { error: "Not Found" });
 }
 
 async function handlePlatformTool(
@@ -182,20 +135,14 @@ async function handlePlatformTool(
 
 function validateOptions(options: ApprovalHttpOptions): void {
   const loopback = isLoopback(options.host);
-  if (!loopback && options.apiKey === undefined) {
-    throw new Error("MCP_HTTP_API_KEY is required when HTTP binds outside loopback.");
+  if (!loopback && options.platformApiKey === undefined) {
+    throw new Error("MCP_PLATFORM_API_KEY is required when HTTP binds outside loopback.");
   }
   if (!loopback && options.allowedHosts.length === 0) {
-    throw new Error("MCP_HTTP_ALLOWED_HOSTS is required when HTTP binds outside loopback.");
-  }
-  if (options.apiKey !== undefined && Buffer.byteLength(options.apiKey, "utf8") < 32) {
-    throw new Error("MCP_HTTP_API_KEY must contain at least 32 UTF-8 bytes.");
+    throw new Error("APPROVAL_BACKEND_ALLOWED_HOSTS is required when HTTP binds outside loopback.");
   }
   if (options.platformApiKey !== undefined && Buffer.byteLength(options.platformApiKey, "utf8") < 32) {
     throw new Error("MCP_PLATFORM_API_KEY must contain at least 32 UTF-8 bytes.");
-  }
-  if (options.apiKey !== undefined && options.apiKey === options.platformApiKey) {
-    throw new Error("MCP_HTTP_API_KEY and MCP_PLATFORM_API_KEY must be different.");
   }
 }
 
@@ -274,8 +221,4 @@ function json(response: ServerResponse, status: number, body: unknown): void {
   response.setHeader("content-type", "application/json; charset=utf-8");
   response.setHeader("cache-control", "no-store");
   response.end(JSON.stringify(body));
-}
-
-function jsonRpcError(response: ServerResponse, status: number, code: number, message: string): void {
-  json(response, status, { jsonrpc: "2.0", error: { code, message }, id: null });
 }

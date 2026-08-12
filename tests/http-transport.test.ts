@@ -1,5 +1,3 @@
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -23,7 +21,6 @@ async function fixture() {
   const server = await startApprovalHttpServer(service, {
     host: "127.0.0.1",
     port: 0,
-    apiKey: "0123456789abcdef0123456789abcdef",
     platformApiKey: "abcdef0123456789abcdef0123456789",
     allowedHosts: [],
   });
@@ -32,34 +29,21 @@ async function fixture() {
   return { baseUrl: `http://127.0.0.1:${address.port}`, server };
 }
 
-describe("stateless Streamable HTTP transport", () => {
-  it("requires its bearer key and exposes a minimal health endpoint", async () => {
+describe("DingTalk MCP Platform HTTP tool backend", () => {
+  it("exposes health but never exposes a self-hosted MCP endpoint", async () => {
     const { baseUrl } = await fixture();
 
     await expect(fetch(`${baseUrl}/healthz`).then((response) => response.status)).resolves.toBe(200);
     await expect(
       fetch(`${baseUrl}/mcp`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: {
+          authorization: "Bearer abcdef0123456789abcdef0123456789",
+          "content-type": "application/json",
+        },
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
       }).then((response) => response.status),
-    ).resolves.toBe(401);
-  });
-
-  it("serves MCP tools with a fresh stateless server for authenticated requests", async () => {
-    const { baseUrl } = await fixture();
-    const client = new Client({ name: "http-test", version: "1.0.0" });
-    const transport = new StreamableHTTPClientTransport(new URL(`${baseUrl}/mcp`), {
-      requestInit: { headers: { authorization: "Bearer 0123456789abcdef0123456789abcdef" } },
-    });
-    // SDK 1.30.0's optional session declaration conflicts with exactOptionalPropertyTypes.
-    await client.connect(transport as unknown as Parameters<typeof client.connect>[0]);
-    resources.push(client);
-
-    const tools = await client.listTools();
-
-    expect(tools.tools.map((tool) => tool.name)).toContain("get_approval_capabilities");
-    expect(transport.sessionId).toBeUndefined();
+    ).resolves.toBe(404);
   });
 
   it("exposes authenticated ordinary HTTP tool actions for DingTalk's hosted MCP platform", async () => {
@@ -124,7 +108,7 @@ describe("stateless Streamable HTTP transport", () => {
     });
   });
 
-  it("requires independent keys for direct MCP and DingTalk platform access", async () => {
+  it("requires the platform backend key for a non-loopback listener", async () => {
     const service = new ApprovalService({
       api: { request: vi.fn() } as unknown as Pick<DingTalkApiClient, "request">,
     });
@@ -132,10 +116,17 @@ describe("stateless Streamable HTTP transport", () => {
       startApprovalHttpServer(service, {
         host: "127.0.0.1",
         port: 0,
-        apiKey: "0123456789abcdef0123456789abcdef",
-        platformApiKey: "0123456789abcdef0123456789abcdef",
+        platformApiKey: "too-short",
         allowedHosts: [],
       }),
-    ).rejects.toThrow("MCP_HTTP_API_KEY and MCP_PLATFORM_API_KEY must be different");
+    ).rejects.toThrow("MCP_PLATFORM_API_KEY must contain at least 32 UTF-8 bytes");
+    await expect(
+      startApprovalHttpServer(service, {
+        host: "0.0.0.0",
+        port: 0,
+        platformApiKey: undefined,
+        allowedHosts: ["approval-tools.example.com"],
+      }),
+    ).rejects.toThrow("MCP_PLATFORM_API_KEY is required when HTTP binds outside loopback");
   });
 });
