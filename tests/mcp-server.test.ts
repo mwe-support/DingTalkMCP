@@ -340,6 +340,23 @@ describe("approval MCP public contract", () => {
     );
   });
 
+  it("publishes a guarded start schema without caller-controlled identity or routing overrides", async () => {
+    const { client } = await connectedClient();
+
+    const tools = await client.listTools();
+    const start = tools.tools.find((tool) => tool.name === "start_process_instance");
+    const schema = start?.inputSchema as {
+      properties?: Record<string, unknown>;
+      required?: string[];
+    };
+
+    expect(start).toBeDefined();
+    expect(schema.required).toEqual(expect.arrayContaining(["confirm", "processCode", "deptId", "formComponentValues"]));
+    expect(schema.properties).not.toHaveProperty("originatorUserId");
+    expect(schema.properties).not.toHaveProperty("approvers");
+    expect(schema.properties).not.toHaveProperty("ProcessInstanceCreationPopRequest");
+  });
+
   it("returns normalized and raw detail through an actual MCP tool call", async () => {
     const { client, request } = await connectedClient({
       result: { processInstanceId: "pi-1", ccUserIds: [{ nonStandard: true }] },
@@ -386,7 +403,7 @@ describe("approval MCP public contract", () => {
     expect(request).not.toHaveBeenCalled();
   });
 
-  it("preserves optional official fields in the DWS creation wrapper", async () => {
+  it("preserves supported optional official fields in the guarded creation input", async () => {
     const { client, request } = await connectedClient({ instanceId: "pi-created" });
 
     const result = await client.callTool({
@@ -394,12 +411,13 @@ describe("approval MCP public contract", () => {
       arguments: {
         confirm: true,
         requestId: "23c99962-c4c2-41c2-a61b-48ed3bc4a99a",
-        ProcessInstanceCreationPopRequest: {
-          processCode: "PROC-1",
-          formComponentValues: [],
-          bizDetailPageUrl: "https://example.invalid/detail",
-          microappAgentId: 12345,
-        },
+        processCode: "PROC-1",
+        deptId: 1,
+        formComponentValues: [],
+        bizDetailPageUrl: "https://example.invalid/detail",
+        microappAgentId: 12345,
+        originatorUserId: "attacker-controlled-user",
+        approvers: [{ userIds: ["attacker-selected-approver"] }],
       },
     });
 
@@ -409,6 +427,7 @@ describe("approval MCP public contract", () => {
       path: "/v1.0/workflow/processInstances",
       body: {
         processCode: "PROC-1",
+        deptId: 1,
         formComponentValues: [],
         bizDetailPageUrl: "https://example.invalid/detail",
         microappAgentId: 12345,

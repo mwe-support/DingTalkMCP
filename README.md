@@ -69,7 +69,7 @@ download_approval_attachment
 get_approval_capabilities
 ```
 
-读取工具可直接使用现有参数；`forecast_process` 同时接受 DWS 的 `ProcessForecastPopRequest` 包装，`start_process_instance` 同时接受 `ProcessInstanceCreationPopRequest`。写工具刻意增加 `confirm`、发起请求增加 `requestId`，因此是“DWS 契约适配 + 更严格安全扩展”，不是对钉钉官方 OA MCP 的无保护替身。
+读取工具可直接使用现有参数；`forecast_process` 同时接受 DWS 的 `ProcessForecastPopRequest` 包装。`start_process_instance` 刻意不接受任意请求包装、`originatorUserId` 或 `approvers`，只公开与平台版一致的受控顶层字段；写工具增加 `confirm`，代码版发起还增加 `requestId`，因此是“必要兼容 + 更严格安全扩展”，不是对钉钉官方 OA MCP 的无保护替身。
 
 官方公开 OpenAPI 没有与 DWS 私有 `list_pending_approvals` 完全等价的个人收件箱接口，因此当前版本没有伪造这个工具。后续通过 `bpms_instance_change` / `bpms_task_change` 事件建立本地投影后再补齐。
 
@@ -157,24 +157,24 @@ node .\dist\transports\http.js
 
 ## 唯一 MCP 发布路径：钉钉官方托管
 
-生产唯一链路是：
+当前生产链路是：
 
 ```text
 MCP 客户端
   -> 钉钉官方 Streamable HTTP 网关（mcp-gw.dingtalk.com）
-  -> 本项目 /platform/tools/<toolName> HTTPS 动作
+  -> 钉钉 MCP 开发平台配置的 HTTP 动作
   -> 钉钉官方 OpenAPI（api.dingtalk.com）
 ```
 
-在开发者平台中，每个工具选择 `HTTP` 创建方式，方法为 `POST`，URL 指向本项目对应的 `/platform/tools/<toolName>`，请求头设置后端专用 Bearer Key，请求体参数与工具 Schema 保持一致。钉钉 MCP 开发平台负责生成和维护外部 Streamable HTTP MCP 地址；本项目的 HTTPS 动作地址仍需由我们部署和维护，但它不是 MCP 域名。
+未来工具数量和更新频率需要代码化管理时，平台 HTTP 动作才切换到本项目 `/platform/tools/<toolName>` HTTPS 后端，再由后端调用钉钉 OpenAPI。钉钉 MCP 开发平台始终负责生成和维护外部 Streamable HTTP MCP 地址；未来本项目的 HTTPS 动作地址由我们部署和维护，但它不是 MCP 域名。
 
 2026-08-12 在已登录的钉钉官方 MCP 市场实测，“获取 MCP Server 配置”返回 `type: streamable-http`，URL 主机为钉钉官方域名 `mcp-gw.dingtalk.com`；官方文档同时说明 MCP 服务通过钉钉统一网关。由此可确认当前 `MWE审批MCP` 版本 1 的 MCP 网关由钉钉托管。URL 中的 `key` 是敏感凭据，禁止写入代码、文档、日志或 Git。
 
 不使用 Deap 自定义 MCP URL，也不提供任何自托管 MCP 回退。完整设置步骤和工具端点表见 [`docs/dingtalk-mcp-platform.md`](docs/dingtalk-mcp-platform.md)。
 
-## 写操作安全语义
+## 未来代码后端的写操作安全语义
 
-发起、同意、拒绝和撤销必须同时满足：
+以下保护属于尚未部署的代码后端，不代表当前平台直连工具已经具备。代码后端启用后，发起、同意、拒绝和撤销必须同时满足：
 
 1. MCP 参数 `confirm=true`，代表宿主已获得用户明确确认。
 2. 操作者由服务端 `DINGTALK_CALLER_USER_ID` 固定绑定；客户端即使传 userId，也只能与它相同。

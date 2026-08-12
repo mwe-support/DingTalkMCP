@@ -177,22 +177,19 @@ export function createApprovalMcpServer(service: ApprovalService): McpServer {
     {
       title: "Start an approval instance",
       description:
-        "Create a real DingTalk OA approval instance. Accepts the DWS ProcessInstanceCreationPopRequest wrapper plus explicit confirmation and a UUID requestId safety extension.",
+        "Create a real DingTalk OA approval instance for the server-bound caller. Requires explicit confirmation, preserves the OA backend route, and never accepts caller identity or approver overrides.",
       inputSchema: {
-        confirm: z.boolean().optional().describe("Set true only after the user explicitly confirms creation"),
+        confirm: z.boolean().describe("Set true only after the user explicitly confirms creation"),
         dryRun: z.boolean().optional().describe("Validate and preview without creating an approval"),
         requestId: z.string().uuid().optional().describe("Client-generated UUID used for persistent idempotency"),
-        ProcessInstanceCreationPopRequest: jsonRecord
-          .describe("DWS-compatible official creation request body wrapper")
-          .optional(),
-        processCode: z.string().min(1).optional(),
-        originatorUserId: userId.optional(),
-        deptId: z.number().int().optional(),
-        formComponentValues: z.array(jsonRecord).optional(),
-        approvers: z.array(jsonRecord).optional(),
+        processCode: z.string().min(1),
+        deptId: z.number().int(),
+        formComponentValues: z.array(jsonRecord),
         ccList: z.array(z.string().min(1)).optional(),
         ccPosition: z.enum(["START", "FINISH", "START_FINISH"]).optional(),
         targetSelectActioners: z.array(jsonRecord).optional(),
+        bizDetailPageUrl: z.url().optional(),
+        microappAgentId: z.number().int().optional(),
       },
       annotations: writeAnnotations,
     },
@@ -338,42 +335,39 @@ function requireOneRequest(
 }
 
 function normalizeStartInput(input: {
-  confirm?: boolean | undefined;
+  confirm: boolean;
   dryRun?: boolean | undefined;
   requestId?: string | undefined;
-  ProcessInstanceCreationPopRequest?: Record<string, unknown> | undefined;
-  processCode?: string | undefined;
-  originatorUserId?: string | undefined;
-  deptId?: number | undefined;
-  formComponentValues?: Record<string, unknown>[] | undefined;
-  approvers?: Record<string, unknown>[] | undefined;
+  processCode: string;
+  deptId: number;
+  formComponentValues: Record<string, unknown>[];
   ccList?: string[] | undefined;
   ccPosition?: "START" | "FINISH" | "START_FINISH" | undefined;
   targetSelectActioners?: Record<string, unknown>[] | undefined;
+  bizDetailPageUrl?: string | undefined;
+  microappAgentId?: number | undefined;
 }) {
-  const request = input.ProcessInstanceCreationPopRequest ?? withoutUndefined({
+  const request = withoutUndefined({
     processCode: input.processCode,
-    originatorUserId: input.originatorUserId,
     deptId: input.deptId,
     formComponentValues: input.formComponentValues,
-    approvers: input.approvers,
     ccList: input.ccList,
     ccPosition: input.ccPosition,
     targetSelectActioners: input.targetSelectActioners,
+    bizDetailPageUrl: input.bizDetailPageUrl,
+    microappAgentId: input.microappAgentId,
   });
   const processCode = requiredString(request.processCode, "processCode");
   const deptId = optionalInteger(request.deptId, "deptId");
   const formComponentValues = requiredArray(request.formComponentValues, "formComponentValues");
   return {
     ...request,
-    confirm: input.confirm ?? false,
+    confirm: input.confirm,
     ...(input.dryRun === undefined ? {} : { dryRun: input.dryRun }),
     requestId: input.requestId ?? "",
     processCode,
-    ...(typeof request.originatorUserId === "string" ? { originatorUserId: request.originatorUserId } : {}),
     ...(deptId === undefined ? {} : { deptId }),
     formComponentValues,
-    ...(Array.isArray(request.approvers) ? { approvers: request.approvers } : {}),
     ...(Array.isArray(request.ccList) ? { ccList: request.ccList.filter((value): value is string => typeof value === "string") } : {}),
     ...(typeof request.ccPosition === "string" ? { ccPosition: request.ccPosition } : {}),
     ...(Array.isArray(request.targetSelectActioners)

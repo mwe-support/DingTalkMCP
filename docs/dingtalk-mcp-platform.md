@@ -46,7 +46,7 @@
 | `get_approval_instance` | 2 | `GET /v1.0/workflow/processInstances` | 详情和附件元数据 |
 | `start_process_instance` | 1 | `POST /v1.0/workflow/processInstances` | 当前用户发起，复用 OA 后台流程 |
 
-平台统一使用已保存的企业内部应用 Token 鉴权。发起工具只把公开参数映射到请求体，并把系统操作用户 ID 映射到 `originatorUserId`。`confirm` 是必填的 Agent 安全契约，但平台直连 HTTP 动作无法像代码后端一样实施持久化幂等、allowlist 和服务端二次确认；这些增强能力保留在仓库实现中。
+两个直连 OA OpenAPI 的工具使用平台已保存的企业内部应用 Token 鉴权；能力查询由钉钉 FaaS 返回静态说明，不依赖该 Token，且 FaaS 不会自动继承它。发起工具只把公开参数映射到请求体，并把系统操作用户 ID 映射到 `originatorUserId`。`confirm` 是必填的 Agent 安全契约，但平台直连 HTTP 动作无法像代码后端一样实施持久化幂等、allowlist 和服务端二次确认；这些增强能力保留在仓库实现中。
 
 ## 未来代码后端配置
 
