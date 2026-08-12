@@ -9,6 +9,7 @@ export interface ApprovalMcpConfig {
   writeUserIds: string[];
   allowedProcessCodes: string[];
   downloadMaxBytes: number;
+  attachmentBatchMaxBytes: number;
   downloadHostSuffixes: string[];
   idempotencyLedgerPath: string;
 }
@@ -41,6 +42,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApprovalMcpCon
       env.APPROVAL_DOWNLOAD_MAX_BYTES,
       10 * 1024 * 1024,
       "APPROVAL_DOWNLOAD_MAX_BYTES",
+    ),
+    attachmentBatchMaxBytes: positiveInteger(
+      env.APPROVAL_ATTACHMENT_BATCH_MAX_BYTES,
+      15 * 1024 * 1024,
+      "APPROVAL_ATTACHMENT_BATCH_MAX_BYTES",
     ),
     downloadHostSuffixes: csv(env.APPROVAL_DOWNLOAD_HOST_SUFFIXES, [
       ".dingtalk.com",

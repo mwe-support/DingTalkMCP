@@ -18,6 +18,8 @@ export type ApprovalMcpErrorCode =
   | "ATTACHMENT_URL_REJECTED"
   | "ATTACHMENT_DOWNLOAD_FAILED"
   | "ATTACHMENT_TOO_LARGE"
+  | "ATTACHMENT_BATCH_TOO_LARGE"
+  | "ATTACHMENT_NOT_FOUND"
   | "INVALID_RESPONSE";
 
 export class ApprovalMcpError extends Error {

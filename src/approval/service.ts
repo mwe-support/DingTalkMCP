@@ -1,13 +1,18 @@
 import { createHash } from "node:crypto";
 
 import { noopAuditSink, type ApprovalAuditContext, type ApprovalAuditSink } from "../core/audit.js";
-import { ApprovalMcpError } from "../core/errors.js";
+import { ApprovalMcpError, type ApprovalMcpErrorCode } from "../core/errors.js";
 import {
   InMemoryIdempotencyLedger,
   type IdempotencyLedger,
 } from "../core/idempotency.js";
 import { getDingTalkRequestId, type DingTalkApiClient } from "../dingtalk/client.js";
-import { AttachmentDownloader, extractApprovalAttachments } from "./attachments.js";
+import {
+  AttachmentDownloader,
+  extractApprovalAttachments,
+  type ApprovalAttachment,
+  type ApprovalAttachmentSource,
+} from "./attachments.js";
 import { array, asRecord, normalizeProcessInstance, text, unwrapResult } from "./normalize.js";
 
 type ApiPort = Pick<DingTalkApiClient, "request">;
@@ -49,6 +54,7 @@ export interface RevokeProcessInstanceInput {
 interface ApprovalServiceOptions {
   api: ApiPort;
   downloader?: AttachmentDownloader;
+  attachmentBatchMaxBytes?: number;
   writeUserIds?: Iterable<string>;
   callerUserId?: string;
   allowedProcessCodes?: Iterable<string>;
@@ -56,11 +62,32 @@ interface ApprovalServiceOptions {
   idempotencyLedger?: IdempotencyLedger;
 }
 
+export interface GetApprovalInstanceInput {
+  processInstanceId: string;
+  attachmentAction?: "list" | "read";
+  attachmentIds?: string[];
+  maxAttachments?: number;
+}
+
+export interface ApprovalAttachmentReadResult {
+  ok: boolean;
+  fileId: string;
+  source?: ApprovalAttachmentSource;
+  fileName?: string;
+  content?: Awaited<ReturnType<AttachmentDownloader["downloadToBase64"]>>;
+  error?: {
+    code: ApprovalMcpErrorCode | "INTERNAL_ERROR";
+    message: string;
+    retryable: boolean;
+  };
+}
+
 const ACTIVE_TASK_STATUSES = new Set(["NEW", "PENDING", "RUNNING", "TODO"]);
 
 export class ApprovalService {
   readonly #api: ApiPort;
   readonly #downloader: AttachmentDownloader;
+  readonly #attachmentBatchMaxBytes: number;
   readonly #writeUserIds: Set<string>;
   readonly #callerUserId: string | undefined;
   readonly #allowedProcessCodes: Set<string>;
@@ -71,6 +98,7 @@ export class ApprovalService {
   constructor(options: ApprovalServiceOptions) {
     this.#api = options.api;
     this.#downloader = options.downloader ?? new AttachmentDownloader();
+    this.#attachmentBatchMaxBytes = options.attachmentBatchMaxBytes ?? 15 * 1024 * 1024;
     this.#writeUserIds = new Set(options.writeUserIds ?? []);
     this.#callerUserId = options.callerUserId;
     this.#allowedProcessCodes = new Set(options.allowedProcessCodes ?? []);
@@ -89,6 +117,33 @@ export class ApprovalService {
     });
     const raw = unwrapResult(payload);
     return { normalized: normalizeProcessInstance(raw), raw };
+  }
+
+  async getApprovalInstance(input: GetApprovalInstanceInput): Promise<{
+    processInstanceId: string;
+    normalized: ReturnType<typeof normalizeProcessInstance>;
+    raw: unknown;
+    attachments: ReturnType<typeof extractApprovalAttachments>;
+    attachmentReads: ApprovalAttachmentReadResult[];
+  }> {
+    const detail = await this.getProcessInstanceDetail(input.processInstanceId);
+    const attachments = extractApprovalAttachments(detail.raw);
+    const attachmentReads =
+      input.attachmentAction === "read"
+        ? await this.#readSelectedAttachments(
+            input.processInstanceId,
+            attachments,
+            input.attachmentIds ?? [],
+            input.maxAttachments ?? 3,
+          )
+        : [];
+    return {
+      processInstanceId: input.processInstanceId,
+      normalized: detail.normalized,
+      raw: detail.raw,
+      attachments,
+      attachmentReads,
+    };
   }
 
   async queryProcessInstanceIds(input: Record<string, unknown>): Promise<unknown> {
@@ -342,6 +397,105 @@ export class ApprovalService {
     return this.#downloader.downloadToBase64(info.downloadUri, input.fileName);
   }
 
+  async #readSelectedAttachments(
+    processInstanceId: string,
+    attachments: ReturnType<typeof extractApprovalAttachments>,
+    attachmentIds: string[],
+    maxAttachments: number,
+  ): Promise<ApprovalAttachmentReadResult[]> {
+    const uniqueIds = [...new Set(attachmentIds)];
+    if (uniqueIds.length > maxAttachments) {
+      throw new ApprovalMcpError(
+        "INVALID_INPUT",
+        `This call requests ${uniqueIds.length} attachments but maxAttachments is ${maxAttachments}.`,
+      );
+    }
+    const results: ApprovalAttachmentReadResult[] = [];
+    let encodedContentBytes = 0;
+    for (const fileId of uniqueIds) {
+        const attachment = attachments.find((candidate) => candidate.fileId === fileId);
+        if (attachment === undefined) {
+          results.push({
+            ok: false,
+            fileId,
+            error: {
+              code: "ATTACHMENT_NOT_FOUND",
+              message: "The requested fileId is not present in this approval instance.",
+              retryable: false,
+            },
+          });
+          continue;
+        }
+        if (attachment.fileName === undefined || attachment.fileName === "") {
+          results.push({
+            ok: false,
+            fileId,
+            source: attachment.source,
+            error: {
+              code: "INVALID_RESPONSE",
+              message: "The approval attachment has no usable fileName.",
+              retryable: false,
+            },
+          });
+          continue;
+        }
+        if (
+          attachment.fileSize !== undefined &&
+          encodedContentBytes + base64EncodedBytes(attachment.fileSize) > this.#attachmentBatchMaxBytes
+        ) {
+          results.push(attachmentReadError(
+            attachment,
+            fileId,
+            "ATTACHMENT_BATCH_TOO_LARGE",
+            "The selected attachments exceed the configured combined Base64 content limit.",
+          ));
+          continue;
+        }
+        try {
+          const content = await this.downloadApprovalAttachment({
+            processInstanceId,
+            fileId,
+            ...(attachment.spaceId === undefined ? {} : { spaceId: attachment.spaceId }),
+            fileName: attachment.fileName,
+            withCommentAttachment:
+              attachment.source === "operation" || attachment.source === "operation-image",
+          });
+          const encodedBytes = base64EncodedBytes(content.size);
+          if (encodedContentBytes + encodedBytes > this.#attachmentBatchMaxBytes) {
+            results.push(attachmentReadError(
+              attachment,
+              fileId,
+              "ATTACHMENT_BATCH_TOO_LARGE",
+              "The selected attachments exceed the configured combined Base64 content limit.",
+            ));
+            continue;
+          }
+          encodedContentBytes += encodedBytes;
+          results.push({
+            ok: true,
+            fileId,
+            source: attachment.source,
+            fileName: attachment.fileName,
+            content,
+          });
+        } catch (error) {
+          const known = error instanceof ApprovalMcpError;
+          results.push({
+            ok: false,
+            fileId,
+            source: attachment.source,
+            fileName: attachment.fileName,
+            error: {
+              code: known ? error.code : "INTERNAL_ERROR",
+              message: known ? error.message : "The approval attachment read failed unexpectedly.",
+              retryable: known ? error.retryable : false,
+            },
+          });
+        }
+    }
+    return results;
+  }
+
   getCapabilities(): Record<string, unknown> {
     return {
       application: "MWE审批MCP",
@@ -355,6 +509,7 @@ export class ApprovalService {
         approveReject: this.#writesEnabled(),
         revoke: this.#writesEnabled(),
         listAttachmentMetadata: true,
+        combinedDetailAndAttachmentRead: true,
         downloadFormAttachments: this.#callerUserId !== undefined,
         downloadCommentAttachments: this.#callerUserId !== undefined,
         uploadAttachments: false,
@@ -579,6 +734,25 @@ function omit<T extends object, K extends keyof T>(input: T, keys: readonly K[])
     T,
     K
   >;
+}
+
+function attachmentReadError(
+  attachment: ApprovalAttachment,
+  fileId: string,
+  code: ApprovalMcpErrorCode,
+  message: string,
+): ApprovalAttachmentReadResult {
+  return {
+    ok: false,
+    fileId,
+    source: attachment.source,
+    ...(attachment.fileName === undefined ? {} : { fileName: attachment.fileName }),
+    error: { code, message, retryable: false },
+  };
+}
+
+function base64EncodedBytes(decodedBytes: number): number {
+  return 4 * Math.ceil(decodedBytes / 3);
 }
 
 function withoutUndefined<T extends Record<string, unknown>>(input: T): T {

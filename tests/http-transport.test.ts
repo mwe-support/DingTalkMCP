@@ -76,6 +76,27 @@ describe("DingTalk MCP Platform HTTP tool backend", () => {
     });
   });
 
+  it("exposes the combined get_approval_instance action for the hosted platform", async () => {
+    const { baseUrl } = await fixture();
+    const response = await fetch(`${baseUrl}/platform/tools/get_approval_instance`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer abcdef0123456789abcdef0123456789",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ processInstanceId: "pi-platform-1" }),
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      result: {
+        processInstanceId: "pi-platform-1",
+        attachments: [],
+        attachmentReads: [],
+      },
+    });
+  });
+
   it("rejects unknown platform tool names without invoking DingTalk", async () => {
     const { baseUrl } = await fixture();
     const response = await fetch(`${baseUrl}/platform/tools/not_a_real_tool`, {

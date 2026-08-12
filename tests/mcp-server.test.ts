@@ -3,6 +3,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ApprovalService } from "../src/approval/service.js";
+import { AttachmentDownloader } from "../src/approval/attachments.js";
 import type { DingTalkApiClient } from "../src/dingtalk/client.js";
 import { createApprovalMcpServer } from "../src/mcp/create-server.js";
 
@@ -31,7 +32,288 @@ async function connectedClient(apiResponse: unknown = {}): Promise<{
   return { client, request };
 }
 
+async function connectedClientWithDownloader(
+  request: ReturnType<typeof vi.fn>,
+  downloader: AttachmentDownloader,
+  options: { attachmentBatchMaxBytes?: number } = {},
+): Promise<Client> {
+  const service = new ApprovalService({
+    api: { request } as unknown as Pick<DingTalkApiClient, "request">,
+    downloader,
+    callerUserId: "user-1",
+    ...options,
+  });
+  const server = createApprovalMcpServer(service);
+  const client = new Client({ name: "approval-mcp-test", version: "1.0.0" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  closeables.push(client, server);
+  return client;
+}
+
 describe("approval MCP public contract", () => {
+  it("keeps detail and attachment reading in one get_approval_instance tool", async () => {
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce({
+        result: {
+          processInstanceId: "pi-1",
+          operationRecords: [
+            {
+              attachments: [
+                {
+                  fileId: "file-comment",
+                  spaceId: "space-comment",
+                  fileName: "comment.txt",
+                  fileType: "txt",
+                  fileSize: 19,
+                },
+              ],
+            },
+          ],
+        },
+      })
+      .mockResolvedValueOnce({
+        result: {
+          fileId: "file-comment",
+          downloadUri: "https://files.dingtalk.com/comment.txt",
+        },
+      });
+    const bytes = new TextEncoder().encode("approval attachment");
+    const downloader = new AttachmentDownloader({
+      fetch: vi.fn<typeof fetch>().mockResolvedValue(
+        new Response(bytes, {
+          status: 200,
+          headers: { "content-type": "text/plain", "content-length": String(bytes.byteLength) },
+        }),
+      ),
+      allowedHostSuffixes: [".dingtalk.com"],
+    });
+    const client = await connectedClientWithDownloader(request, downloader);
+
+    const result = await client.callTool({
+      name: "get_approval_instance",
+      arguments: {
+        processInstanceId: "pi-1",
+        attachmentAction: "read",
+        attachmentIds: ["file-comment"],
+      },
+    });
+
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      result: {
+        processInstanceId: "pi-1",
+        attachments: [
+          expect.objectContaining({ source: "operation", fileId: "file-comment", fileName: "comment.txt" }),
+        ],
+        attachmentReads: [
+          expect.objectContaining({
+            ok: true,
+            fileId: "file-comment",
+            content: expect.objectContaining({
+              fileName: "comment.txt",
+              mimeType: "text/plain",
+              size: bytes.byteLength,
+              contentBase64: Buffer.from(bytes).toString("base64"),
+            }),
+          }),
+        ],
+      },
+    });
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(request).toHaveBeenNthCalledWith(2, {
+      method: "POST",
+      path: "/v1.0/workflow/processInstances/spaces/files/urls/download",
+      body: { processInstanceId: "pi-1", fileId: "file-comment", withCommentAttatchment: true },
+    });
+  });
+
+  it("uses the approval-record download path for operation images with fileIds", async () => {
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce({
+        result: {
+          processInstanceId: "pi-image",
+          operationRecords: [
+            {
+              images: [
+                {
+                  fileId: "image-comment",
+                  fileName: "comment.png",
+                  fileType: "png",
+                },
+              ],
+            },
+          ],
+        },
+      })
+      .mockResolvedValueOnce({
+        result: {
+          fileId: "image-comment",
+          downloadUri: "https://files.dingtalk.com/comment.png",
+        },
+      });
+    const downloader = new AttachmentDownloader({
+      fetch: vi.fn<typeof fetch>().mockResolvedValue(
+        new Response(new Uint8Array([1, 2, 3]), {
+          status: 200,
+          headers: { "content-type": "image/png", "content-length": "3" },
+        }),
+      ),
+      allowedHostSuffixes: [".dingtalk.com"],
+    });
+    const client = await connectedClientWithDownloader(request, downloader);
+
+    const result = await client.callTool({
+      name: "get_approval_instance",
+      arguments: {
+        processInstanceId: "pi-image",
+        attachmentAction: "read",
+        attachmentIds: ["image-comment"],
+      },
+    });
+
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      result: {
+        attachmentReads: [expect.objectContaining({ ok: true, source: "operation-image" })],
+      },
+    });
+    expect(request).toHaveBeenNthCalledWith(2, {
+      method: "POST",
+      path: "/v1.0/workflow/processInstances/spaces/files/urls/download",
+      body: { processInstanceId: "pi-image", fileId: "image-comment", withCommentAttatchment: true },
+    });
+  });
+
+  it("keeps the combined attachment response within one aggregate byte budget", async () => {
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce({
+        result: {
+          processInstanceId: "pi-budget",
+          operationRecords: [
+            {
+              attachments: [
+                { fileId: "file-1", fileName: "one.bin", fileSize: 3 },
+                { fileId: "file-2", fileName: "two.bin", fileSize: 3 },
+              ],
+            },
+          ],
+        },
+      })
+      .mockResolvedValueOnce({
+        result: { fileId: "file-1", downloadUri: "https://files.dingtalk.com/one.bin" },
+      });
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(new Uint8Array([1, 2, 3]), {
+        status: 200,
+        headers: { "content-type": "application/octet-stream", "content-length": "3" },
+      }),
+    );
+    const client = await connectedClientWithDownloader(
+      request,
+      new AttachmentDownloader({ fetch: fetchMock, allowedHostSuffixes: [".dingtalk.com"] }),
+      { attachmentBatchMaxBytes: 4 },
+    );
+
+    const result = await client.callTool({
+      name: "get_approval_instance",
+      arguments: {
+        processInstanceId: "pi-budget",
+        attachmentAction: "read",
+        attachmentIds: ["file-1", "file-2"],
+      },
+    });
+
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      result: {
+        attachmentReads: [
+          expect.objectContaining({ ok: true, fileId: "file-1" }),
+          expect.objectContaining({
+            ok: false,
+            fileId: "file-2",
+            error: expect.objectContaining({ code: "ATTACHMENT_BATCH_TOO_LARGE" }),
+          }),
+        ],
+      },
+    });
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns one ledger entry per requested attachment instead of failing the whole tool", async () => {
+    const request = vi.fn().mockResolvedValue({
+      result: {
+        processInstanceId: "pi-1",
+        operationRecords: [
+          {
+            attachments: [
+              { fileId: "file-1", fileName: "one.txt" },
+              { fileId: "file-2", fileName: "two.txt" },
+            ],
+          },
+        ],
+      },
+    });
+    const downloader = new AttachmentDownloader({ fetch: vi.fn<typeof fetch>() });
+    const client = await connectedClientWithDownloader(request, downloader);
+
+    const result = await client.callTool({
+      name: "get_approval_instance",
+      arguments: {
+        processInstanceId: "pi-1",
+        attachmentAction: "read",
+        attachmentIds: ["file-1", "missing-file"],
+      },
+    });
+
+    expect(result.isError).not.toBe(true);
+    const payload = result.structuredContent as {
+      result: { attachmentReads: Array<{ ok: boolean; fileId: string; error?: { code: string } }> };
+    };
+    expect(payload.result.attachmentReads).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ ok: false, fileId: "file-1", error: expect.objectContaining({ code: "INVALID_RESPONSE" }) }),
+        expect.objectContaining({ ok: false, fileId: "missing-file", error: expect.objectContaining({ code: "ATTACHMENT_NOT_FOUND" }) }),
+      ]),
+    );
+  });
+
+  it("rejects attachment read mode without explicit attachment IDs", async () => {
+    const { client, request } = await connectedClient({ result: { processInstanceId: "pi-1" } });
+
+    const result = await client.callTool({
+      name: "get_approval_instance",
+      arguments: { processInstanceId: "pi-1", attachmentAction: "read" },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({ error: { code: "INVALID_INPUT" } });
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("fails closed instead of silently truncating an oversized attachment selection", async () => {
+    const { client, request } = await connectedClient({ result: { processInstanceId: "pi-1" } });
+
+    const result = await client.callTool({
+      name: "get_approval_instance",
+      arguments: {
+        processInstanceId: "pi-1",
+        attachmentAction: "read",
+        attachmentIds: ["one", "two"],
+        maxAttachments: 1,
+      },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({ error: { code: "INVALID_INPUT" } });
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
   it("publishes DWS-compatible approval names plus dedicated attachment tools", async () => {
     const { client } = await connectedClient();
 

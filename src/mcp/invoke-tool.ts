@@ -17,7 +17,7 @@ export async function invokeApprovalTool(
   arguments_: Record<string, unknown>,
 ): Promise<ApprovalToolResult | undefined> {
   const server = createApprovalMcpServer(service);
-  const client = new Client({ name: "mwe-dingtalk-mcp-platform-adapter", version: "0.1.0" });
+  const client = new Client({ name: "mwe-dingtalk-mcp-platform-adapter", version: "0.2.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 
   try {

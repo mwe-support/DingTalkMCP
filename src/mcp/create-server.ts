@@ -25,7 +25,7 @@ const userId = z.string().min(1).describe("DingTalk userId; write operations mus
 export function createApprovalMcpServer(service: ApprovalService): McpServer {
   const server = new McpServer({
     name: "mwe-dingtalk-approval-mcp",
-    version: "0.1.0",
+    version: "0.2.0",
   });
 
   server.registerTool(
@@ -49,6 +49,50 @@ export function createApprovalMcpServer(service: ApprovalService): McpServer {
       annotations: readAnnotations,
     },
     async ({ processInstanceId: id }) => safely(() => service.getProcessInstanceDetail(id)),
+  );
+
+  server.registerTool(
+    "get_approval_instance",
+    {
+      title: "Get approval instance with attachments",
+      description:
+        "Read one DingTalk OA approval instance, normalize all form/operation attachments and images, and optionally return bounded base64 content for selected fileIds in the same call. Use attachmentAction=read only when the user asks to read attachment content; obtain attachmentIds from a metadata call or the same approval context.",
+      inputSchema: {
+        processInstanceId,
+        attachmentAction: z
+          .enum(["list", "read"])
+          .optional()
+          .describe("list (default) returns metadata; read also retrieves selected attachmentIds"),
+        attachmentIds: z
+          .array(z.string().min(1))
+          .max(10)
+          .optional()
+          .describe("fileIds from this instance to read when attachmentAction=read"),
+        maxAttachments: z
+          .number()
+          .int()
+          .min(1)
+          .max(5)
+          .optional()
+          .describe("Maximum attachments read in one call; default 3, hard limit 5"),
+      },
+      annotations: readAnnotations,
+    },
+    async (input) =>
+      safely(() => {
+        if (input.attachmentAction === "read" && (input.attachmentIds === undefined || input.attachmentIds.length === 0)) {
+          throw new ApprovalMcpError(
+            "INVALID_INPUT",
+            "attachmentIds must contain at least one fileId when attachmentAction=read.",
+          );
+        }
+        return service.getApprovalInstance({
+          processInstanceId: input.processInstanceId,
+          ...(input.attachmentAction === undefined ? {} : { attachmentAction: input.attachmentAction }),
+          ...(input.attachmentIds === undefined ? {} : { attachmentIds: input.attachmentIds }),
+          ...(input.maxAttachments === undefined ? {} : { maxAttachments: input.maxAttachments }),
+        });
+      }),
   );
 
   server.registerTool(

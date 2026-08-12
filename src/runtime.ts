@@ -23,6 +23,7 @@ export function createApprovalService(config: ApprovalMcpConfig): ApprovalServic
   return new ApprovalService({
     api,
     downloader,
+    attachmentBatchMaxBytes: config.attachmentBatchMaxBytes,
     writeUserIds: config.writeUserIds,
     ...(config.callerUserId === undefined ? {} : { callerUserId: config.callerUserId }),
     allowedProcessCodes: config.allowedProcessCodes,
