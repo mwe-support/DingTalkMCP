@@ -9,15 +9,20 @@ async function main(): Promise<void> {
   const host = process.env.MCP_HTTP_HOST?.trim() || "127.0.0.1";
   const port = parsePort(process.env.MCP_HTTP_PORT);
   const apiKey = process.env.MCP_HTTP_API_KEY?.trim() || undefined;
+  const platformApiKey = process.env.MCP_PLATFORM_API_KEY?.trim() || undefined;
   const allowedHosts = csv(process.env.MCP_HTTP_ALLOWED_HOSTS);
   const running = await startApprovalHttpServer(createApprovalService(config), {
     host,
     port,
     apiKey,
+    platformApiKey,
     allowedHosts,
   });
   const address = running.httpServer.address() as AddressInfo;
   process.stderr.write(`MWE approval MCP listening on http://${host}:${address.port}/mcp\n`);
+  if (platformApiKey !== undefined) {
+    process.stderr.write(`DingTalk MCP Platform backend listening on /platform/tools/<toolName>\n`);
+  }
 
   const shutdown = (): void => {
     void running.close().finally(() => process.exit(0));

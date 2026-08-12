@@ -12,7 +12,8 @@
 - 发起、同意、拒绝、撤销；全部写操作绑定服务端固定调用人，并要求显式确认和本地 userId allowlist。
 - 表单附件、评论/操作记录附件、图片元数据的统一识别。
 - 表单与评论附件安全下载：下载授权、临时 URL 换取、HTTPS/Host/重定向校验、大小上限、SHA-256 和 Base64 返回。
-- stdio 与无会话 Streamable HTTP 两种 MCP 传输。
+- 只提供无会话 Streamable HTTP MCP，不包含 stdio 传输。
+- 为钉钉 MCP 开发平台提供复用同一工具契约的普通 HTTPS 动作后端。
 
 保留了 DWS 中已经形成用户习惯的工具名：
 
@@ -97,20 +98,6 @@ APPROVAL_ALLOWED_PROCESS_CODES=PROC-xxxx,PROC-yyyy
 
 不要把 Client Secret、access token、HTTP API Key 或附件临时 URL 提交到 Git。
 
-## 启动 stdio MCP
-
-PowerShell 示例：
-
-```powershell
-$env:DINGTALK_CLIENT_ID = "dingxxxxxxxx"
-$env:DINGTALK_CLIENT_SECRET = "从密钥存储注入"
-$env:DINGTALK_CALLER_USER_ID = "测试人员userId"
-$env:DINGTALK_WRITE_USER_IDS = "测试人员userId"
-node .\dist\transports\stdio.js
-```
-
-stdio 进程的 stdout 只用于 MCP 协议；启动错误写到 stderr。
-
 ## 启动 Streamable HTTP MCP
 
 默认只监听 `127.0.0.1:3000`：
@@ -119,12 +106,14 @@ stdio 进程的 stdout 只用于 MCP 协议；启动错误写到 stderr。
 $env:DINGTALK_CLIENT_ID = "dingxxxxxxxx"
 $env:DINGTALK_CLIENT_SECRET = "从密钥存储注入"
 $env:MCP_HTTP_API_KEY = "至少32字节的随机密钥"
+$env:MCP_PLATFORM_API_KEY = "另一个至少32字节的随机密钥"
 node .\dist\transports\http.js
 ```
 
 端点：
 
 - MCP：`POST /mcp`
+- 钉钉 MCP 开发平台工具后端：`POST /platform/tools/<toolName>`
 - 健康检查：`GET /healthz`
 
 HTTP 传输每个请求创建独立的 MCP server/transport，禁用会话共享，以规避跨客户端状态泄漏。非 loopback 监听时，服务强制要求：
@@ -133,6 +122,25 @@ HTTP 传输每个请求创建独立的 MCP server/transport，禁用会话共享
 - `MCP_HTTP_ALLOWED_HOSTS`：允许的 Host，逗号分隔。
 
 服务自身只提供 HTTP。远程部署必须放在 TLS 反向代理或受控隧道之后，不应把明文端口直接暴露到公网。
+
+`MCP_PLATFORM_API_KEY` 与 `MCP_HTTP_API_KEY` 必须使用不同随机值。前者由钉钉 MCP 开发平台的各个 HTTP 工具动作通过 `Authorization: Bearer ...` 发送；未配置时，整个 `/platform/tools/*` 路由返回 404。平台后端请求体就是该工具的参数对象，成功响应保持 `{ "result": ... }`，工具校验或业务错误返回 HTTP 422 和 `{ "error": ... }`。
+
+## 首选：钉钉 MCP 开发平台托管
+
+生产首选链路是：
+
+```text
+MCP 客户端
+  -> 钉钉官方 Streamable HTTP 网关（mcp-gw.dingtalk.com）
+  -> 本项目 /platform/tools/<toolName> HTTPS 动作
+  -> 钉钉官方 OpenAPI（api.dingtalk.com）
+```
+
+在开发者平台中，每个工具选择 `HTTP` 创建方式，方法为 `POST`，URL 指向本项目对应的 `/platform/tools/<toolName>`，请求头设置后端专用 Bearer Key，请求体参数与工具 Schema 保持一致。钉钉 MCP 开发平台负责生成和维护外部 Streamable HTTP MCP 地址；本项目的 HTTPS 动作地址仍需由我们部署和维护。
+
+2026-08-12 在已登录的钉钉官方 MCP 市场实测，“获取 MCP Server 配置”返回 `type: streamable-http`，URL 主机为钉钉官方域名 `mcp-gw.dingtalk.com`；官方文档同时说明 MCP 服务通过钉钉统一网关。由此可确认首选路径由钉钉托管 MCP 网关。`MWE审批MCP` 尚未发布，所以它最终生成的具体 URL 仍须在首次发布后核验。URL 中的 `key` 是敏感凭据，禁止写入代码、文档、日志或 Git。
+
+钉钉 Deap 的“自定义 MCP”也允许直接填写本项目 `/mcp` URL，但该模式下远端 MCP URL 是我们自托管的地址，并非钉钉托管。因此它只作为回退路径，不是本项目首选发布方式。完整设置步骤和工具端点表见 [`docs/dingtalk-mcp-platform.md`](docs/dingtalk-mcp-platform.md)。
 
 ## 写操作安全语义
 
@@ -149,7 +157,7 @@ HTTP 传输每个请求创建独立的 MCP server/transport，禁用会话共享
 
 `start_process_instance.requestId` 是 MCP 侧持久化幂等键，不会作为未知字段传给钉钉 OpenAPI。成功结果写入 `APPROVAL_IDEMPOTENCY_LEDGER_PATH`，重启后仍会复用；同一个 UUID 配不同请求返回 `IDEMPOTENCY_CONFLICT`。若超时或崩溃导致结果不确定，服务返回 `IDEMPOTENCY_OUTCOME_UNKNOWN` 并停止自动重试，要求先在钉钉中核对，避免重复发起。
 
-目录账本为每个 requestId 建立 SHA-256 命名目录，并以原子 `mkdir` 完成“检查并预留”，支持共享同一文件系统的 stdio/HTTP 并发实例。崩溃留下的 `pending` 记录不会被回收，而是持续失败关闭，要求人工核对钉钉实例后处理；跨主机多副本若不共享该目录，应改用带唯一约束事务的共享数据库。
+目录账本为每个 requestId 建立 SHA-256 命名目录，并以原子 `mkdir` 完成“检查并预留”，支持共享同一文件系统的多个 HTTP 并发实例。崩溃留下的 `pending` 记录不会被回收，而是持续失败关闭，要求人工核对钉钉实例后处理；跨主机多副本若不共享该目录，应改用带唯一约束事务的共享数据库。
 
 每个实际写操作会向 stderr 输出一行脱敏 JSON 审计事件，包含动作、固定调用人、实例/task/request 标识和结果，不记录 Client Secret、access token、表单内容、备注或附件正文。
 
@@ -173,7 +181,7 @@ src/
   core/           错误模型、审计与持久化幂等账本
   dingtalk/       accessToken 缓存和 OpenAPI client
   mcp/            MCP 工具注册
-  transports/     stdio 与 Streamable HTTP
+  transports/     Streamable HTTP 与钉钉平台 HTTP 动作路由
 tests/             OpenAPI、MCP、HTTP 和附件安全测试
 ```
 

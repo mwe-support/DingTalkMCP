@@ -8,11 +8,10 @@
     "node": ">=20"
   },
   "scripts": {
+    "prebuild": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "tsc -p tsconfig.build.json",
     "dev:http": "tsx src/transports/http.ts",
-    "dev:stdio": "tsx src/transports/stdio.ts",
     "start:http": "node dist/transports/http.js",
-    "start:stdio": "node dist/transports/stdio.js",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"

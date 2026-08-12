@@ -5,11 +5,13 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 
 import type { ApprovalService } from "../approval/service.js";
 import { createApprovalMcpServer } from "../mcp/create-server.js";
+import { invokeApprovalTool } from "../mcp/invoke-tool.js";
 
 export interface ApprovalHttpOptions {
   host: string;
   port: number;
   apiKey: string | undefined;
+  platformApiKey?: string | undefined;
   allowedHosts: string[];
 }
 
@@ -63,6 +65,12 @@ async function handleRequest(
     return;
   }
 
+  const platformToolName = platformToolFromPath(requestUrl.pathname);
+  if (platformToolName !== undefined) {
+    await handlePlatformTool(service, options, platformToolName, request, response);
+    return;
+  }
+
   if (requestUrl.pathname !== "/mcp") {
     json(response, 404, { error: "Not Found" });
     return;
@@ -109,6 +117,69 @@ async function handleRequest(
   }
 }
 
+async function handlePlatformTool(
+  service: ApprovalService,
+  options: ApprovalHttpOptions,
+  toolName: string,
+  request: IncomingMessage,
+  response: ServerResponse,
+): Promise<void> {
+  if (options.platformApiKey === undefined) {
+    json(response, 404, { error: "Not Found" });
+    return;
+  }
+  if (!authorized(request.headers.authorization, options.platformApiKey)) {
+    response.setHeader("www-authenticate", "Bearer");
+    json(response, 401, { error: "Unauthorized" });
+    return;
+  }
+  if (request.method !== "POST") {
+    response.setHeader("allow", "POST");
+    json(response, 405, { error: "Method Not Allowed" });
+    return;
+  }
+  if (!isJson(request.headers["content-type"])) {
+    json(response, 415, { error: "Content-Type must be application/json" });
+    return;
+  }
+
+  let body: unknown;
+  try {
+    body = await readJsonBody(request, 1024 * 1024);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Invalid JSON request body";
+    json(response, 400, { error: message });
+    return;
+  }
+  if (!isRecord(body)) {
+    json(response, 400, { error: "JSON request body must be an object" });
+    return;
+  }
+
+  try {
+    const result = await invokeApprovalTool(service, toolName, body);
+    if (result === undefined) {
+      json(response, 404, { error: "Unknown approval tool" });
+      return;
+    }
+    if (result.isError === true) {
+      const payload = isRecord(result.structuredContent)
+        ? result.structuredContent
+        : {
+            error: {
+              code: "TOOL_INPUT_OR_EXECUTION_ERROR",
+              message: firstTextContent(result.content) ?? "Approval tool rejected the request.",
+            },
+          };
+      json(response, 422, payload);
+      return;
+    }
+    json(response, 200, isRecord(result.structuredContent) ? result.structuredContent : { result: result.content });
+  } catch {
+    json(response, 500, { error: "Approval tool invocation failed" });
+  }
+}
+
 function validateOptions(options: ApprovalHttpOptions): void {
   const loopback = isLoopback(options.host);
   if (!loopback && options.apiKey === undefined) {
@@ -120,6 +191,19 @@ function validateOptions(options: ApprovalHttpOptions): void {
   if (options.apiKey !== undefined && Buffer.byteLength(options.apiKey, "utf8") < 32) {
     throw new Error("MCP_HTTP_API_KEY must contain at least 32 UTF-8 bytes.");
   }
+  if (options.platformApiKey !== undefined && Buffer.byteLength(options.platformApiKey, "utf8") < 32) {
+    throw new Error("MCP_PLATFORM_API_KEY must contain at least 32 UTF-8 bytes.");
+  }
+  if (options.apiKey !== undefined && options.apiKey === options.platformApiKey) {
+    throw new Error("MCP_HTTP_API_KEY and MCP_PLATFORM_API_KEY must be different.");
+  }
+}
+
+function platformToolFromPath(pathname: string): string | undefined {
+  const prefix = "/platform/tools/";
+  if (!pathname.startsWith(prefix)) return undefined;
+  const name = pathname.slice(prefix.length);
+  return /^[A-Za-z][A-Za-z0-9_]{0,127}$/u.test(name) ? name : "";
 }
 
 function allowedHostSet(options: ApprovalHttpOptions): Set<string> {
@@ -149,6 +233,23 @@ function authorized(header: string | undefined, apiKey: string | undefined): boo
   const supplied = Buffer.from(header.slice(prefix.length), "utf8");
   const expected = Buffer.from(apiKey, "utf8");
   return supplied.byteLength === expected.byteLength && timingSafeEqual(supplied, expected);
+}
+
+function isJson(contentType: string | undefined): boolean {
+  return contentType?.split(";", 1)[0]?.trim().toLowerCase() === "application/json";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function firstTextContent(content: unknown): string | undefined {
+  if (!Array.isArray(content)) return undefined;
+  const item = content.find(
+    (candidate): candidate is Record<string, unknown> =>
+      isRecord(candidate) && candidate.type === "text" && typeof candidate.text === "string",
+  );
+  return typeof item?.text === "string" ? item.text : undefined;
 }
 
 async function readJsonBody(request: IncomingMessage, maxBytes: number): Promise<unknown> {
