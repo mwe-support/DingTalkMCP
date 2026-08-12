@@ -15,6 +15,12 @@ interface DingTalkApiClientOptions {
   timeoutMs?: number;
 }
 
+const requestIdMetadata = new WeakMap<object, string>();
+
+export function getDingTalkRequestId(value: unknown): string | undefined {
+  return typeof value === "object" && value !== null ? requestIdMetadata.get(value) : undefined;
+}
+
 export class DingTalkApiClient {
   readonly #tokenProvider: Pick<DingTalkTokenProvider, "getToken" | "invalidate">;
   readonly #baseUrl: string;
@@ -80,6 +86,10 @@ export class DingTalkApiClient {
       });
     }
 
+    const successfulRequestId = response.headers.get("x-acs-request-id");
+    if (successfulRequestId !== null && typeof payload === "object" && payload !== null) {
+      requestIdMetadata.set(payload, successfulRequestId);
+    }
     return payload as T;
   }
 }

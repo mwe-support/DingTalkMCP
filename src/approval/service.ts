@@ -1,16 +1,25 @@
+import { createHash } from "node:crypto";
+
+import { noopAuditSink, type ApprovalAuditContext, type ApprovalAuditSink } from "../core/audit.js";
 import { ApprovalMcpError } from "../core/errors.js";
-import type { DingTalkApiClient } from "../dingtalk/client.js";
+import {
+  InMemoryIdempotencyLedger,
+  type IdempotencyLedger,
+} from "../core/idempotency.js";
+import { getDingTalkRequestId, type DingTalkApiClient } from "../dingtalk/client.js";
 import { AttachmentDownloader, extractApprovalAttachments } from "./attachments.js";
 import { array, asRecord, normalizeProcessInstance, text, unwrapResult } from "./normalize.js";
 
 type ApiPort = Pick<DingTalkApiClient, "request">;
 
 export interface StartProcessInstanceInput {
+  [key: string]: unknown;
   confirm: boolean;
+  dryRun?: boolean | undefined;
   requestId: string;
   processCode: string;
-  originatorUserId: string;
-  deptId: number;
+  originatorUserId?: string | undefined;
+  deptId?: number | undefined;
   formComponentValues: unknown[];
   approvers?: unknown[] | undefined;
   ccList?: string[] | undefined;
@@ -20,9 +29,10 @@ export interface StartProcessInstanceInput {
 
 export interface ExecuteTaskInput {
   confirm: boolean;
+  dryRun?: boolean | undefined;
   processInstanceId: string;
   taskId: string | number;
-  actionerUserId: string;
+  actionerUserId?: string | undefined;
   result: "agree" | "refuse";
   remark?: string | undefined;
   file?: unknown;
@@ -30,9 +40,9 @@ export interface ExecuteTaskInput {
 
 export interface RevokeProcessInstanceInput {
   confirm: boolean;
+  dryRun?: boolean | undefined;
   processInstanceId: string;
-  operatingUserId: string;
-  isSystem?: boolean | undefined;
+  operatingUserId?: string | undefined;
   remark?: string | undefined;
 }
 
@@ -40,21 +50,32 @@ interface ApprovalServiceOptions {
   api: ApiPort;
   downloader?: AttachmentDownloader;
   writeUserIds?: Iterable<string>;
+  callerUserId?: string;
   allowedProcessCodes?: Iterable<string>;
+  audit?: ApprovalAuditSink;
+  idempotencyLedger?: IdempotencyLedger;
 }
+
+const ACTIVE_TASK_STATUSES = new Set(["NEW", "PENDING", "RUNNING", "TODO"]);
 
 export class ApprovalService {
   readonly #api: ApiPort;
   readonly #downloader: AttachmentDownloader;
   readonly #writeUserIds: Set<string>;
+  readonly #callerUserId: string | undefined;
   readonly #allowedProcessCodes: Set<string>;
+  readonly #audit: ApprovalAuditSink;
+  readonly #idempotencyLedger: IdempotencyLedger;
   readonly #startRequests = new Map<string, { fingerprint: string; promise: Promise<unknown> }>();
 
   constructor(options: ApprovalServiceOptions) {
     this.#api = options.api;
     this.#downloader = options.downloader ?? new AttachmentDownloader();
     this.#writeUserIds = new Set(options.writeUserIds ?? []);
+    this.#callerUserId = options.callerUserId;
     this.#allowedProcessCodes = new Set(options.allowedProcessCodes ?? []);
+    this.#audit = options.audit ?? noopAuditSink;
+    this.#idempotencyLedger = options.idempotencyLedger ?? new InMemoryIdempotencyLedger();
   }
 
   async getProcessInstanceDetail(processInstanceId: string): Promise<{
@@ -72,7 +93,7 @@ export class ApprovalService {
 
   async queryProcessInstanceIds(input: Record<string, unknown>): Promise<unknown> {
     const processCode = text(input.processCode);
-    if (processCode !== undefined) this.#assertProcessAllowed(processCode);
+    this.#assertOptionalProcessAllowed(processCode);
     return this.#api.request({
       method: "POST",
       path: "/v1.0/workflow/processes/instanceIds/query",
@@ -89,7 +110,7 @@ export class ApprovalService {
     const detail = await this.getProcessInstanceDetail(processInstanceId);
     return detail.normalized.tasks.filter((task) => {
       const status = text(asRecord(task)?.status)?.toUpperCase();
-      return status === undefined || ["NEW", "PENDING", "RUNNING", "TODO"].includes(status);
+      return status === undefined || ACTIVE_TASK_STATUSES.has(status);
     });
   }
 
@@ -120,7 +141,7 @@ export class ApprovalService {
 
   async forecastProcess(input: Record<string, unknown>): Promise<unknown> {
     const processCode = text(input.processCode);
-    if (processCode !== undefined) this.#assertProcessAllowed(processCode);
+    this.#assertOptionalProcessAllowed(processCode);
     return this.#api.request({
       method: "POST",
       path: "/v1.0/workflow/processes/forecast",
@@ -129,81 +150,120 @@ export class ApprovalService {
   }
 
   async startProcessInstance(input: StartProcessInstanceInput): Promise<unknown> {
-    this.#assertConfirmedActor(input.confirm, input.originatorUserId);
+    const actorUserId = this.#resolveCaller(input.originatorUserId);
+    this.#assertActorAllowed(actorUserId);
     this.#assertProcessAllowed(input.processCode);
-    const body = omit(input, ["confirm", "requestId"]);
-    const fingerprint = JSON.stringify(body);
-    const existing = this.#startRequests.get(input.requestId);
-    if (existing !== undefined) {
-      if (existing.fingerprint !== fingerprint) {
-        throw new ApprovalMcpError(
-          "IDEMPOTENCY_CONFLICT",
-          "The requestId was already used with a different approval creation payload.",
-        );
-      }
-      return existing.promise;
+    if (input.dryRun === true) {
+      return {
+        dryRun: true,
+        action: "start",
+        processCode: input.processCode,
+        formComponentCount: input.formComponentValues.length,
+        requestIdPresent: input.requestId.trim() !== "",
+      };
     }
+    return this.#audited(
+      {
+        action: "start",
+        actorUserId,
+        processCode: input.processCode,
+        requestId: input.requestId,
+      },
+      async () => {
+        this.#assertConfirmedActor(input.confirm, actorUserId);
+        if (input.requestId.trim() === "") {
+          throw new ApprovalMcpError(
+            "IDEMPOTENCY_KEY_REQUIRED",
+            "Starting an approval requires a stable requestId UUID.",
+          );
+        }
+        const body = { ...omit(input, ["confirm", "dryRun", "requestId"]), originatorUserId: actorUserId };
+        const fingerprint = createHash("sha256").update(stableStringify(body)).digest("hex");
+        const existing = this.#startRequests.get(input.requestId);
+        if (existing !== undefined) {
+          if (existing.fingerprint !== fingerprint) {
+            throw new ApprovalMcpError(
+              "IDEMPOTENCY_CONFLICT",
+              "The requestId was already used with a different approval creation payload.",
+            );
+          }
+          return existing.promise;
+        }
 
-    const request = this.#api
-      .request({
-        method: "POST",
-        path: "/v1.0/workflow/processInstances",
-        body,
-      })
-      .catch((error: unknown) => {
-        this.#startRequests.delete(input.requestId);
-        throw error;
-      });
-    this.#startRequests.set(input.requestId, { fingerprint, promise: request });
-    if (this.#startRequests.size > 1000) {
-      const oldest = this.#startRequests.keys().next().value as string | undefined;
-      if (oldest !== undefined && oldest !== input.requestId) this.#startRequests.delete(oldest);
-    }
-    return request;
+        const request = this.#createIdempotently(input.requestId, fingerprint, body).catch((error: unknown) => {
+          if (!(error instanceof ApprovalMcpError) || error.code !== "IDEMPOTENCY_OUTCOME_UNKNOWN") {
+            this.#startRequests.delete(input.requestId);
+          }
+          throw error;
+        });
+        this.#startRequests.set(input.requestId, { fingerprint, promise: request });
+        if (this.#startRequests.size > 1000) {
+          const oldest = this.#startRequests.keys().next().value as string | undefined;
+          if (oldest !== undefined && oldest !== input.requestId) this.#startRequests.delete(oldest);
+        }
+        return request;
+      }
+    );
   }
 
   async executeTask(input: ExecuteTaskInput): Promise<unknown> {
-    this.#assertConfirmedActor(input.confirm, input.actionerUserId);
-    const current = await this.getProcessInstanceDetail(input.processInstanceId);
-    const task = current.normalized.tasks.map(asRecord).find((candidate) => text(candidate?.taskId) === String(input.taskId));
-    const taskStatus = text(task?.status)?.toUpperCase();
-    if (task === undefined || taskStatus === undefined || !["NEW", "PENDING", "RUNNING", "TODO"].includes(taskStatus)) {
-      throw new ApprovalMcpError(
-        "TASK_NOT_ACTIONABLE",
-        "The approval task is missing or no longer in an actionable state.",
-      );
+    const actorUserId = this.#resolveCaller(input.actionerUserId);
+    this.#assertActorAllowed(actorUserId);
+    if (input.dryRun === true) {
+      await this.#assertTaskActionable(input.processInstanceId, input.taskId, actorUserId);
+      return {
+        dryRun: true,
+        action: input.result === "agree" ? "approve" : "reject",
+        processInstanceId: input.processInstanceId,
+        taskId: String(input.taskId),
+      };
     }
-    const currentActor = text(task.userId ?? task.actionerUserId);
-    if (currentActor !== input.actionerUserId) {
-      throw new ApprovalMcpError(
-        "TASK_ACTOR_MISMATCH",
-        "The current approval task does not belong to the requested actionerUserId.",
-      );
-    }
-    return this.#api.request({
-      method: "POST",
-      path: "/v1.0/workflow/processInstances/execute",
-      body: omit(input, ["confirm"]),
-    });
+    return this.#audited(
+      {
+        action: input.result === "agree" ? "approve" : "reject",
+        actorUserId,
+        processInstanceId: input.processInstanceId,
+        taskId: String(input.taskId),
+      },
+      async () => {
+        this.#assertConfirmedActor(input.confirm, actorUserId);
+        await this.#assertTaskActionable(input.processInstanceId, input.taskId, actorUserId);
+        return this.#api.request({
+          method: "POST",
+          path: "/v1.0/workflow/processInstances/execute",
+          body: { ...omit(input, ["confirm", "dryRun", "actionerUserId"]), actionerUserId: actorUserId },
+        });
+      },
+    );
   }
 
   async revokeProcessInstance(input: RevokeProcessInstanceInput): Promise<unknown> {
-    this.#assertConfirmedActor(input.confirm, input.operatingUserId);
-    const current = await this.getProcessInstanceDetail(input.processInstanceId);
-    const status = current.normalized.status?.toUpperCase();
-    const isSystem = input.isSystem ?? false;
-    const originatorMatches = current.normalized.originatorUserId === input.operatingUserId;
-    if (status !== "RUNNING" || (!isSystem && !originatorMatches)) {
-      throw new ApprovalMcpError(
-        "INSTANCE_NOT_REVOCABLE",
-        "The approval instance is not running or the operator is not its originator.",
-      );
+    const actorUserId = this.#resolveCaller(input.operatingUserId);
+    this.#assertActorAllowed(actorUserId);
+    if (input.dryRun === true) {
+      await this.#assertRevocable(input.processInstanceId, actorUserId);
+      return { dryRun: true, action: "revoke", processInstanceId: input.processInstanceId };
     }
-    return this.#api.request({
-      method: "POST",
-      path: "/v1.0/workflow/processInstances/terminate",
-      body: omit(input, ["confirm"]),
-    });
+    return this.#audited(
+      {
+        action: "revoke",
+        actorUserId,
+        processInstanceId: input.processInstanceId,
+      },
+      async () => {
+        this.#assertConfirmedActor(input.confirm, actorUserId);
+        await this.#assertRevocable(input.processInstanceId, actorUserId);
+        return this.#api.request({
+          method: "POST",
+          path: "/v1.0/workflow/processInstances/terminate",
+          body: {
+            ...omit(input, ["confirm", "dryRun", "operatingUserId"]),
+            operatingUserId: actorUserId,
+            isSystem: false,
+          },
+        });
+      },
+    );
   }
 
   async listApprovalAttachments(processInstanceId: string): Promise<ReturnType<typeof extractApprovalAttachments>> {
@@ -211,25 +271,57 @@ export class ApprovalService {
     return extractApprovalAttachments(detail.raw);
   }
 
-  async getAttachmentDownloadUrl(processInstanceId: string, fileId: string): Promise<{
+  async getAttachmentDownloadUrl(
+    processInstanceId: string,
+    fileId: string,
+    spaceId: string | undefined,
+    options: { withCommentAttachment?: boolean } = {},
+  ): Promise<{
     fileId?: string;
     spaceId?: string;
     downloadUri: string;
   }> {
+    if (!options.withCommentAttachment) {
+      const callerUserId = this.#requireCallerUserId();
+      if (spaceId === undefined || spaceId === "") {
+        throw new ApprovalMcpError(
+          "INVALID_INPUT",
+          "spaceId is required to authorize a form attachment download.",
+        );
+      }
+      await this.#api.request({
+        method: "POST",
+        path: "/v1.0/workflow/processInstances/spaces/files/authDownload",
+        body: {
+          userId: callerUserId,
+          fileInfos: [{ fileId, spaceId }],
+        },
+      });
+    } else {
+      this.#requireCallerUserId();
+    }
     const payload = await this.#api.request({
       method: "POST",
       path: "/v1.0/workflow/processInstances/spaces/files/urls/download",
-      body: { processInstanceId, fileId },
+      body: {
+        processInstanceId,
+        fileId,
+        ...(options.withCommentAttachment
+          ? {
+              withCommentAttatchment: true,
+            }
+          : {}),
+      },
     });
     const result = asRecord(unwrapResult(payload));
     const downloadUri = text(result?.downloadUri);
     if (downloadUri === undefined) {
       throw new ApprovalMcpError("INVALID_RESPONSE", "DingTalk did not return an attachment download URI.");
     }
-    const spaceId = text(result?.spaceId);
+    const returnedSpaceId = text(result?.spaceId);
     return {
       fileId: text(result?.fileId) ?? fileId,
-      ...(spaceId === undefined ? {} : { spaceId }),
+      ...(returnedSpaceId === undefined ? {} : { spaceId: returnedSpaceId }),
       downloadUri,
     };
   }
@@ -237,32 +329,41 @@ export class ApprovalService {
   async downloadApprovalAttachment(input: {
     processInstanceId: string;
     fileId: string;
+    spaceId?: string;
     fileName: string;
+    withCommentAttachment?: boolean;
   }): Promise<Awaited<ReturnType<AttachmentDownloader["downloadToBase64"]>>> {
-    const info = await this.getAttachmentDownloadUrl(input.processInstanceId, input.fileId);
+    const info = await this.getAttachmentDownloadUrl(
+      input.processInstanceId,
+      input.fileId,
+      input.spaceId,
+      input.withCommentAttachment === undefined ? {} : { withCommentAttachment: input.withCommentAttachment },
+    );
     return this.#downloader.downloadToBase64(info.downloadUri, input.fileName);
   }
 
   getCapabilities(): Record<string, unknown> {
     return {
       application: "MWE审批MCP",
+      source: "static_configuration",
       tools: {
         detail: true,
         queryInstanceIds: true,
         formSchema: true,
         forecast: true,
-        start: this.#writeUserIds.size > 0,
-        approveReject: this.#writeUserIds.size > 0,
-        revoke: this.#writeUserIds.size > 0,
+        start: this.#writesEnabled(),
+        approveReject: this.#writesEnabled(),
+        revoke: this.#writesEnabled(),
         listAttachmentMetadata: true,
-        downloadFormAttachments: true,
-        downloadCommentAttachments: false,
+        downloadFormAttachments: this.#callerUserId !== undefined,
+        downloadCommentAttachments: this.#callerUserId !== undefined,
         uploadAttachments: false,
         eventStream: false,
       },
       writeGuard: {
-        enabled: this.#writeUserIds.size > 0,
+        enabled: this.#writesEnabled(),
         requiresConfirm: true,
+        callerIdentityBound: this.#callerUserId !== undefined,
         allowedActorCount: this.#writeUserIds.size,
       },
       processCodeAllowlistEnabled: this.#allowedProcessCodes.size > 0,
@@ -273,6 +374,10 @@ export class ApprovalService {
     if (!confirm) {
       throw new ApprovalMcpError("CONFIRMATION_REQUIRED", "This approval mutation requires explicit confirmation.");
     }
+    this.#assertActorAllowed(actorUserId);
+  }
+
+  #assertActorAllowed(actorUserId: string): void {
     if (!this.#writeUserIds.has(actorUserId)) {
       throw new ApprovalMcpError(
         "WRITE_ACTOR_NOT_ALLOWED",
@@ -281,12 +386,189 @@ export class ApprovalService {
     }
   }
 
+  async #assertTaskActionable(
+    processInstanceId: string,
+    taskId: string | number,
+    actorUserId: string,
+  ): Promise<void> {
+    const current = await this.getProcessInstanceDetail(processInstanceId);
+    this.#assertOptionalProcessAllowed(current.normalized.processCode);
+    const task = current.normalized.tasks
+      .map(asRecord)
+      .find((candidate) => text(candidate?.taskId) === String(taskId));
+    const taskStatus = text(task?.status)?.toUpperCase();
+    if (task === undefined || taskStatus === undefined || !ACTIVE_TASK_STATUSES.has(taskStatus)) {
+      throw new ApprovalMcpError(
+        "TASK_NOT_ACTIONABLE",
+        "The approval task is missing or no longer in an actionable state.",
+      );
+    }
+    const currentActor = text(task.userId ?? task.actionerUserId);
+    if (currentActor !== actorUserId) {
+      throw new ApprovalMcpError(
+        "TASK_ACTOR_MISMATCH",
+        "The current approval task does not belong to the server-bound DingTalk caller.",
+      );
+    }
+  }
+
+  async #assertRevocable(processInstanceId: string, actorUserId: string): Promise<void> {
+    const current = await this.getProcessInstanceDetail(processInstanceId);
+    this.#assertOptionalProcessAllowed(current.normalized.processCode);
+    const status = current.normalized.status?.toUpperCase();
+    const originatorMatches = current.normalized.originatorUserId === actorUserId;
+    if (status !== "RUNNING" || !originatorMatches) {
+      throw new ApprovalMcpError(
+        "INSTANCE_NOT_REVOCABLE",
+        "The approval instance is not running or the operator is not its originator.",
+      );
+    }
+  }
+
+  #resolveCaller(requestedUserId: string | undefined): string {
+    const callerUserId = this.#requireCallerUserId();
+    if (requestedUserId !== undefined && requestedUserId !== callerUserId) {
+      throw new ApprovalMcpError(
+        "CALLER_IDENTITY_MISMATCH",
+        "The requested approval actor does not match this server credential's bound DingTalk caller.",
+      );
+    }
+    return callerUserId;
+  }
+
+  #requireCallerUserId(): string {
+    if (this.#callerUserId === undefined || this.#callerUserId === "") {
+      throw new ApprovalMcpError(
+        "CALLER_IDENTITY_NOT_CONFIGURED",
+        "Approval mutations and comment-attachment downloads require DINGTALK_CALLER_USER_ID.",
+      );
+    }
+    return this.#callerUserId;
+  }
+
+  #writesEnabled(): boolean {
+    return this.#callerUserId !== undefined && this.#writeUserIds.has(this.#callerUserId);
+  }
+
   #assertProcessAllowed(processCode: string): void {
     if (this.#allowedProcessCodes.size > 0 && !this.#allowedProcessCodes.has(processCode)) {
       throw new ApprovalMcpError(
         "PROCESS_CODE_NOT_ALLOWED",
         "The approval processCode is outside the configured allowlist.",
       );
+    }
+  }
+
+  #assertOptionalProcessAllowed(processCode: string | undefined): void {
+    if (this.#allowedProcessCodes.size === 0) return;
+    if (processCode === undefined) {
+      throw new ApprovalMcpError(
+        "PROCESS_CODE_NOT_ALLOWED",
+        "The approval processCode is required while the process allowlist is enabled.",
+      );
+    }
+    this.#assertProcessAllowed(processCode);
+  }
+
+  async #createIdempotently(
+    requestId: string,
+    fingerprint: string,
+    body: Record<string, unknown>,
+  ): Promise<unknown> {
+    const reservation = await this.#idempotencyLedger.reserve(requestId, fingerprint);
+    if (!reservation.created) {
+      const previous = reservation.entry;
+      if (previous.fingerprint !== fingerprint) {
+        throw new ApprovalMcpError(
+          "IDEMPOTENCY_CONFLICT",
+          "The requestId was already used with a different approval creation payload.",
+        );
+      }
+      if (previous.status === "succeeded") return previous.result;
+      throw new ApprovalMcpError(
+        "IDEMPOTENCY_OUTCOME_UNKNOWN",
+        "A previous creation attempt may have reached DingTalk; inspect instances before retrying with a new requestId.",
+      );
+    }
+
+    try {
+      const result = await this.#api.request({
+        method: "POST",
+        path: "/v1.0/workflow/processInstances",
+        body,
+      });
+      await this.#idempotencyLedger.put(requestId, {
+        fingerprint,
+        status: "succeeded",
+        result,
+        updatedAt: new Date().toISOString(),
+      });
+      return result;
+    } catch (error) {
+      if (error instanceof ApprovalMcpError && error.code === "DINGTALK_API_ERROR" && !error.retryable) {
+        await this.#idempotencyLedger.delete(requestId);
+        throw error;
+      }
+      try {
+        await this.#idempotencyLedger.put(requestId, {
+          fingerprint,
+          status: "uncertain",
+          updatedAt: new Date().toISOString(),
+        });
+      } catch {
+        // The previously persisted pending entry still prevents an automatic replay.
+      }
+      throw new ApprovalMcpError(
+        "IDEMPOTENCY_OUTCOME_UNKNOWN",
+        "The creation result is uncertain; inspect DingTalk before deciding whether to submit again.",
+        {
+          cause: error,
+          ...(error instanceof ApprovalMcpError && typeof error.details?.requestId === "string"
+            ? { details: { requestId: error.details.requestId } }
+            : {}),
+        },
+      );
+    }
+  }
+
+  async #audited<T>(context: ApprovalAuditContext, operation: () => Promise<T>): Promise<T> {
+    try {
+      const result = await operation();
+      const returned = asRecord(unwrapResult(result));
+      const returnedInstanceId = text(returned?.instanceId ?? returned?.processInstanceId);
+      const upstreamRequestId = getDingTalkRequestId(result);
+      await this.#recordAudit({
+        ...context,
+        timestamp: new Date().toISOString(),
+        outcome: "succeeded",
+        ...(returnedInstanceId === undefined ? {} : { returnedInstanceId }),
+        ...(upstreamRequestId === undefined ? {} : { upstreamRequestId }),
+      });
+      return result;
+    } catch (error) {
+      const known = error instanceof ApprovalMcpError;
+      const upstreamRequestId = known && typeof error.details?.requestId === "string" ? error.details.requestId : undefined;
+      await this.#recordAudit({
+        ...context,
+        timestamp: new Date().toISOString(),
+        outcome:
+          known && error.code === "IDEMPOTENCY_OUTCOME_UNKNOWN"
+            ? "uncertain"
+            : known && error.code !== "DINGTALK_API_ERROR"
+              ? "rejected"
+              : "failed",
+        ...(known ? { errorCode: error.code } : {}),
+        ...(upstreamRequestId === undefined ? {} : { upstreamRequestId }),
+      });
+      throw error;
+    }
+  }
+
+  async #recordAudit(event: Parameters<ApprovalAuditSink["record"]>[0]): Promise<void> {
+    try {
+      await this.#audit.record(event);
+    } catch {
+      // Audit output must never expose secrets or turn a successful DingTalk mutation into a retry.
     }
   }
 }
@@ -301,4 +583,15 @@ function omit<T extends object, K extends keyof T>(input: T, keys: readonly K[])
 
 function withoutUndefined<T extends Record<string, unknown>>(input: T): T {
   return Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined)) as T;
+}
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  if (typeof value === "object" && value !== null) {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right));
+    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableStringify(item)}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
 }

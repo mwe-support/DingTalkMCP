@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod/v4";
 
 import type { ApprovalService } from "../approval/service.js";
-import { errorPayload } from "../core/errors.js";
+import { ApprovalMcpError, errorPayload } from "../core/errors.js";
 
 const readAnnotations = {
   readOnlyHint: true,
@@ -117,10 +117,15 @@ export function createApprovalMcpServer(service: ApprovalService): McpServer {
       title: "Forecast approval routing",
       description:
         "Forecast the approval route and target-select nodes before creation. Pass the official ProcessForecast request body.",
-      inputSchema: { request: jsonRecord.describe("Official ProcessForecast request body") },
+      inputSchema: {
+        request: jsonRecord.describe("Official ProcessForecast request body").optional(),
+        ProcessForecastPopRequest: jsonRecord
+          .describe("DWS-compatible ProcessForecastPopRequest body wrapper")
+          .optional(),
+      },
       annotations: readAnnotations,
     },
-    async ({ request }) => safely(() => service.forecastProcess(request)),
+    async (input) => safely(() => service.forecastProcess(requireOneRequest(input, "ProcessForecastPopRequest"))),
   );
 
   server.registerTool(
@@ -128,14 +133,18 @@ export function createApprovalMcpServer(service: ApprovalService): McpServer {
     {
       title: "Start an approval instance",
       description:
-        "Create a real DingTalk OA approval instance. Requires explicit confirmation, an allowed originator userId, and a UUID RequestId.",
+        "Create a real DingTalk OA approval instance. Accepts the DWS ProcessInstanceCreationPopRequest wrapper plus explicit confirmation and a UUID requestId safety extension.",
       inputSchema: {
-        confirm: z.literal(true).describe("Must be true after the user explicitly confirms creation"),
-        requestId: z.string().uuid().describe("Client-generated UUID used for idempotency"),
-        processCode: z.string().min(1),
-        originatorUserId: userId,
-        deptId: z.number().int(),
-        formComponentValues: z.array(jsonRecord),
+        confirm: z.boolean().optional().describe("Set true only after the user explicitly confirms creation"),
+        dryRun: z.boolean().optional().describe("Validate and preview without creating an approval"),
+        requestId: z.string().uuid().optional().describe("Client-generated UUID used for persistent idempotency"),
+        ProcessInstanceCreationPopRequest: jsonRecord
+          .describe("DWS-compatible official creation request body wrapper")
+          .optional(),
+        processCode: z.string().min(1).optional(),
+        originatorUserId: userId.optional(),
+        deptId: z.number().int().optional(),
+        formComponentValues: z.array(jsonRecord).optional(),
         approvers: z.array(jsonRecord).optional(),
         ccList: z.array(z.string().min(1)).optional(),
         ccPosition: z.enum(["START", "FINISH", "START_FINISH"]).optional(),
@@ -143,14 +152,15 @@ export function createApprovalMcpServer(service: ApprovalService): McpServer {
       },
       annotations: writeAnnotations,
     },
-    async (input) => safely(() => service.startProcessInstance(input)),
+    async (input) => safely(() => service.startProcessInstance(normalizeStartInput(input))),
   );
 
   const executeSchema = {
-    confirm: z.literal(true).describe("Must be true after the user explicitly confirms this approval decision"),
+    confirm: z.boolean().optional().describe("Set true only after the user explicitly confirms this approval decision"),
+    dryRun: z.boolean().optional().describe("Refresh and validate the task without executing a decision"),
     processInstanceId,
     taskId: z.union([z.string().min(1), z.number().int().nonnegative()]),
-    actionerUserId: userId,
+    actionerUserId: userId.optional().describe("Optional compatibility field; must match the server-bound caller"),
     remark: z.string().max(1024).optional(),
     file: jsonRecord.optional(),
   };
@@ -163,7 +173,15 @@ export function createApprovalMcpServer(service: ApprovalService): McpServer {
       inputSchema: executeSchema,
       annotations: writeAnnotations,
     },
-    async (input) => safely(() => service.executeTask({ ...input, result: "agree" })),
+    async (input) =>
+      safely(() =>
+        service.executeTask({
+          ...input,
+          confirm: input.confirm ?? false,
+          ...(input.dryRun === undefined ? {} : { dryRun: input.dryRun }),
+          result: "agree",
+        }),
+      ),
   );
 
   server.registerTool(
@@ -174,7 +192,15 @@ export function createApprovalMcpServer(service: ApprovalService): McpServer {
       inputSchema: executeSchema,
       annotations: writeAnnotations,
     },
-    async (input) => safely(() => service.executeTask({ ...input, result: "refuse" })),
+    async (input) =>
+      safely(() =>
+        service.executeTask({
+          ...input,
+          confirm: input.confirm ?? false,
+          ...(input.dryRun === undefined ? {} : { dryRun: input.dryRun }),
+          result: "refuse",
+        }),
+      ),
   );
 
   server.registerTool(
@@ -184,15 +210,22 @@ export function createApprovalMcpServer(service: ApprovalService): McpServer {
       description:
         "Revoke a running DingTalk OA instance. The template must permit revocation and the operator must be locally authorized.",
       inputSchema: {
-        confirm: z.literal(true).describe("Must be true after the user explicitly confirms revocation"),
+        confirm: z.boolean().optional().describe("Set true only after the user explicitly confirms revocation"),
+        dryRun: z.boolean().optional().describe("Refresh and validate revocability without terminating the instance"),
         processInstanceId,
-        operatingUserId: userId,
-        isSystem: z.boolean().optional(),
+        operatingUserId: userId.optional().describe("Optional compatibility field; must match the server-bound caller"),
         remark: z.string().max(1024).optional(),
       },
       annotations: writeAnnotations,
     },
-    async (input) => safely(() => service.revokeProcessInstance(input)),
+    async (input) =>
+      safely(() =>
+        service.revokeProcessInstance({
+          ...input,
+          confirm: input.confirm ?? false,
+          ...(input.dryRun === undefined ? {} : { dryRun: input.dryRun }),
+        }),
+      ),
   );
 
   server.registerTool(
@@ -216,14 +249,120 @@ export function createApprovalMcpServer(service: ApprovalService): McpServer {
       inputSchema: {
         processInstanceId,
         fileId: z.string().min(1),
+        spaceId: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("Required for form attachments; use the spaceId returned by instance detail"),
         fileName: z.string().min(1).max(255),
+        withCommentAttachment: z
+          .boolean()
+          .optional()
+          .describe("Set true for an operation/comment attachment; translated to DingTalk's official request field"),
       },
       annotations: readAnnotations,
     },
-    async (input) => safely(() => service.downloadApprovalAttachment(input)),
+    async (input) =>
+      safely(() =>
+        service.downloadApprovalAttachment({
+          processInstanceId: input.processInstanceId,
+          fileId: input.fileId,
+          ...(input.spaceId === undefined ? {} : { spaceId: input.spaceId }),
+          fileName: input.fileName,
+          ...(input.withCommentAttachment === undefined
+            ? {}
+            : { withCommentAttachment: input.withCommentAttachment }),
+        }),
+      ),
   );
 
   return server;
+}
+
+function requireOneRequest(
+  input: {
+    request?: Record<string, unknown> | undefined;
+    ProcessForecastPopRequest?: Record<string, unknown> | undefined;
+  },
+  wrapper: "ProcessForecastPopRequest",
+): Record<string, unknown> {
+  const request = input.request ?? input[wrapper];
+  if (request === undefined) {
+    throw new ApprovalMcpError("INVALID_INPUT", `Provide request or ${wrapper}.`);
+  }
+  return request;
+}
+
+function normalizeStartInput(input: {
+  confirm?: boolean | undefined;
+  dryRun?: boolean | undefined;
+  requestId?: string | undefined;
+  ProcessInstanceCreationPopRequest?: Record<string, unknown> | undefined;
+  processCode?: string | undefined;
+  originatorUserId?: string | undefined;
+  deptId?: number | undefined;
+  formComponentValues?: Record<string, unknown>[] | undefined;
+  approvers?: Record<string, unknown>[] | undefined;
+  ccList?: string[] | undefined;
+  ccPosition?: "START" | "FINISH" | "START_FINISH" | undefined;
+  targetSelectActioners?: Record<string, unknown>[] | undefined;
+}) {
+  const request = input.ProcessInstanceCreationPopRequest ?? withoutUndefined({
+    processCode: input.processCode,
+    originatorUserId: input.originatorUserId,
+    deptId: input.deptId,
+    formComponentValues: input.formComponentValues,
+    approvers: input.approvers,
+    ccList: input.ccList,
+    ccPosition: input.ccPosition,
+    targetSelectActioners: input.targetSelectActioners,
+  });
+  const processCode = requiredString(request.processCode, "processCode");
+  const deptId = optionalInteger(request.deptId, "deptId");
+  const formComponentValues = requiredArray(request.formComponentValues, "formComponentValues");
+  return {
+    ...request,
+    confirm: input.confirm ?? false,
+    ...(input.dryRun === undefined ? {} : { dryRun: input.dryRun }),
+    requestId: input.requestId ?? "",
+    processCode,
+    ...(typeof request.originatorUserId === "string" ? { originatorUserId: request.originatorUserId } : {}),
+    ...(deptId === undefined ? {} : { deptId }),
+    formComponentValues,
+    ...(Array.isArray(request.approvers) ? { approvers: request.approvers } : {}),
+    ...(Array.isArray(request.ccList) ? { ccList: request.ccList.filter((value): value is string => typeof value === "string") } : {}),
+    ...(typeof request.ccPosition === "string" ? { ccPosition: request.ccPosition } : {}),
+    ...(Array.isArray(request.targetSelectActioners)
+      ? { targetSelectActioners: request.targetSelectActioners }
+      : {}),
+  } as Parameters<ApprovalService["startProcessInstance"]>[0];
+}
+
+function requiredString(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new ApprovalMcpError("INVALID_INPUT", `${field} is required.`);
+  }
+  return value;
+}
+
+function requiredInteger(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+    throw new ApprovalMcpError("INVALID_INPUT", `${field} must be an integer.`);
+  }
+  return value;
+}
+
+function optionalInteger(value: unknown, field: string): number | undefined {
+  return value === undefined ? undefined : requiredInteger(value, field);
+}
+
+function requiredArray(value: unknown, field: string): unknown[] {
+  if (!Array.isArray(value)) throw new ApprovalMcpError("INVALID_INPUT", `${field} must be an array.`);
+  return value;
+}
+
+function withoutUndefined(input: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined));
 }
 
 async function safely(operation: () => unknown | Promise<unknown>) {

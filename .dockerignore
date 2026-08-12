@@ -3,4 +3,5 @@ dist
 .env
 coverage
 downloads
+data
 *.log

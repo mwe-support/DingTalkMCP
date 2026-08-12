@@ -1,6 +1,8 @@
 import { ApprovalService } from "./approval/service.js";
 import { AttachmentDownloader } from "./approval/attachments.js";
 import type { ApprovalMcpConfig } from "./config.js";
+import { JsonLineAuditSink } from "./core/audit.js";
+import { DirectoryIdempotencyLedger } from "./core/idempotency.js";
 import { DingTalkApiClient } from "./dingtalk/client.js";
 import { DingTalkTokenProvider } from "./dingtalk/token-provider.js";
 
@@ -22,6 +24,9 @@ export function createApprovalService(config: ApprovalMcpConfig): ApprovalServic
     api,
     downloader,
     writeUserIds: config.writeUserIds,
+    ...(config.callerUserId === undefined ? {} : { callerUserId: config.callerUserId }),
     allowedProcessCodes: config.allowedProcessCodes,
+    audit: new JsonLineAuditSink(),
+    idempotencyLedger: new DirectoryIdempotencyLedger(config.idempotencyLedgerPath),
   });
 }

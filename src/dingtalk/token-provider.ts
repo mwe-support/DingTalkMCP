@@ -9,6 +9,7 @@ interface TokenProviderOptions {
   fetch?: FetchLike;
   now?: () => number;
   refreshSkewMs?: number;
+  timeoutMs?: number;
 }
 
 interface TokenResponse {
@@ -27,6 +28,7 @@ export class DingTalkTokenProvider {
   readonly #fetch: FetchLike;
   readonly #now: () => number;
   readonly #refreshSkewMs: number;
+  readonly #timeoutMs: number;
   #cached: { token: string; expiresAt: number } | undefined;
   #inFlight: Promise<string> | undefined;
 
@@ -37,6 +39,7 @@ export class DingTalkTokenProvider {
     this.#fetch = options.fetch ?? fetch;
     this.#now = options.now ?? Date.now;
     this.#refreshSkewMs = options.refreshSkewMs ?? 300_000;
+    this.#timeoutMs = options.timeoutMs ?? 15_000;
   }
 
   async getToken(): Promise<string> {
@@ -63,6 +66,7 @@ export class DingTalkTokenProvider {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ appKey: this.#appKey, appSecret: this.#appSecret }),
+        signal: AbortSignal.timeout(this.#timeoutMs),
       });
     } catch (error) {
       throw new ApprovalMcpError("DINGTALK_AUTH_ERROR", "Unable to reach the DingTalk token endpoint.", {

@@ -21,6 +21,11 @@ describe("extractApprovalAttachments", () => {
             },
           ]),
         },
+        {
+          name: "现场照片",
+          componentType: "DDPhotoField",
+          value: JSON.stringify(["https://static.dingtalk.com/form-image.png"]),
+        },
       ],
       operationRecords: [
         {
@@ -34,6 +39,11 @@ describe("extractApprovalAttachments", () => {
 
     expect(extractApprovalAttachments(detail)).toEqual([
       expect.objectContaining({ source: "form", fileId: "file-form", fileName: "invoice.pdf" }),
+      expect.objectContaining({
+        source: "form-image",
+        componentName: "现场照片",
+        url: "https://static.dingtalk.com/form-image.png",
+      }),
       expect.objectContaining({ source: "operation", fileId: "file-comment", fileSize: 12 }),
       expect.objectContaining({ source: "operation-image", url: "https://static.dingtalk.com/image-1.png" }),
     ]);

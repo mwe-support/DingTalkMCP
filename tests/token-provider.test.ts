@@ -25,6 +25,7 @@ describe("DingTalkTokenProvider", () => {
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({ appKey: "ding-test", appSecret: "secret-test" }),
+        signal: expect.any(AbortSignal),
       }),
     );
   });

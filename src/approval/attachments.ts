@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { ApprovalMcpError } from "../core/errors.js";
 import { array, asRecord, text } from "./normalize.js";
 
-export type ApprovalAttachmentSource = "form" | "operation" | "operation-image";
+export type ApprovalAttachmentSource = "form" | "form-image" | "operation" | "operation-image";
 
 export interface ApprovalAttachment {
   source: ApprovalAttachmentSource;
@@ -40,9 +40,19 @@ export function extractApprovalAttachments(detail: unknown): ApprovalAttachment[
     const componentRecord = asRecord(component);
     if (componentRecord === undefined) continue;
     const componentName = text(componentRecord.name);
+    const componentType = text(componentRecord.componentType)?.toUpperCase();
     for (const candidate of [componentRecord.value, componentRecord.extValue]) {
       for (const item of attachmentObjects(candidate)) {
         output.push(toAttachment(item, "form", componentName));
+      }
+      if (componentType?.includes("PHOTO") || componentType?.includes("IMAGE")) {
+        for (const url of urlStrings(parseMaybeJson(candidate))) {
+          output.push({
+            source: "form-image",
+            ...(componentName === undefined ? {} : { componentName }),
+            url,
+          });
+        }
       }
     }
   }
@@ -198,6 +208,13 @@ function visit(value: unknown, visitor: (value: Record<string, unknown>) => void
   if (record === undefined) return;
   visitor(record);
   for (const item of Object.values(record)) visit(item, visitor);
+}
+
+function urlStrings(value: unknown): string[] {
+  if (typeof value === "string") return isHttpUrl(value) ? [value] : [];
+  if (Array.isArray(value)) return value.flatMap(urlStrings);
+  const record = asRecord(value);
+  return record === undefined ? [] : Object.values(record).flatMap(urlStrings);
 }
 
 function parseMaybeJson(value: unknown): unknown {
