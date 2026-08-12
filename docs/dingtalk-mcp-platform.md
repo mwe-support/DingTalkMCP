@@ -2,25 +2,33 @@
 
 ## 架构结论
 
-`MWE审批MCP` 只使用钉钉 MCP 开发平台托管的对外 MCP 网关：
+`MWE审批MCP` 只使用钉钉 MCP 开发平台托管的对外 MCP 网关。当前工具直接在平台配置，未来工具数量增加、更新频繁时再把普通 HTTP 动作切换到本仓库后端：
 
 ```text
 客户端 --Streamable HTTP--> mcp-gw.dingtalk.com
-       --平台内部转发--> 我们部署的 HTTPS 工具动作
+       --平台当前 HTTP 动作--> api.dingtalk.com
+
+未来代码模式：
+客户端 --Streamable HTTP--> mcp-gw.dingtalk.com
+       --平台 HTTP 动作--> 我们部署的 HTTPS 工具后端
        --OpenAPI--> api.dingtalk.com
 ```
 
 - 对外 MCP Server URL：官方文档说明服务通过钉钉统一网关；2026-08-12 从钉钉官方 MCP 市场实际取得的 `MWE审批MCP` 版本 1 配置使用 `streamable-http`，主机为 `mcp-gw.dingtalk.com`，可确认当前 MCP 网关由钉钉托管。
-- 工具动作 URL：由我们托管。钉钉 MCP 开发平台的 `HTTP` 创建方式要求为每个工具配置普通 HTTP API；该 URL 不是 MCP Server URL，也不会提供给 MCP 客户端。
+- 当前工具动作 URL：直接使用钉钉官方 `api.dingtalk.com`，由平台保存的 Token 鉴权注入访问令牌。
+- 未来代码版工具动作 URL：由我们托管。该 URL 只是平台调用的普通 HTTP API，不是 MCP Server URL，也不会提供给 MCP 客户端。
 - 本项目不暴露 `/mcp`，不使用 Deap 自定义 MCP URL，也没有自托管 MCP 回退。
 - 不提供 stdio。
 
-## 2026-08-12 真实附件验收与当前发布边界
+## 2026-08-12 至 2026-08-13 平台验收与当前发布边界
 
 - 使用当前登录账号最近已处理的一条真实审批实例，经钉钉 MCP 开发平台已保存的 `MWE审批MCP` Token 凭证读取到 1 个 `operationRecords[].attachments[]` 附件。
 - 以官方字段 `withCommentAttatchment=true` 调用 `POST /v1.0/workflow/processInstances/spaces/files/urls/download` 成功获得临时下载地址；实际下载 HTTP 200、122,165 字节。附件为 1 页、未加密 PDF，可提取文本并能正常渲染。
-- 全程未出现 401、403 或权限不足错误，因此本轮不需要再申请权限。临时调试工具已删除，工具列表恢复为 2 条；临时下载地址、PDF、PNG 和剪贴板内容均已清理。
-- 已发布的 `get_approval_instance` 版本 1 仍只调用单个详情 API，所以目前经官方 MCP 网关只能返回附件元数据。仓库 `0.2.0` 的同名组合工具已经实现详情、统一附件清单、选定附件授权与内容返回，但尚未接入正式平台动作。
+- 全程未出现 401、403 或权限不足错误，因此本轮不需要再申请权限。临时下载地址、PDF、PNG 和剪贴板内容均已清理。
+- `get_approval_instance` 已更新为版本 2，工具入参使用顶层 `processInstanceId`，经最近两个真实审批实例验证可返回表单内容、操作记录、表单附件和评论附件元数据；仍不返回附件正文。
+- `start_process_instance` 已发布版本 1，HTTP 动作为 `POST https://api.dingtalk.com/v1.0/workflow/processInstances`。正式 schema 必填 `confirm`、`processCode`、`deptId`、`formComponentValues`；`originatorUserId` 固定映射平台“系统参数.操作用户id”，不暴露给 Agent；不开放 `approvers`，默认复用 OA 后台审批流程。
+- 发起工具使用不存在的 processCode 做负向联调，OA 返回 HTTP 400 `processCodeError`，证明 Token、请求体和当前用户映射已经进入业务校验，且没有创建审批实例。真实发起必须等待用户确认具体模板、部门和全部表单内容。
+- AIHub 重置后官方网关 `tools/list` 返回 3 个工具，并验证上述发起工具 schema；重置会更新 Streamable HTTP URL，旧配置必须替换。
 - 官方 FAAS 文档只说明公开入参映射到 `input`。实测 FAAS 可发网络请求，但不会自动继承已保存的 Token 鉴权；直接请求钉钉 OpenAPI 返回缺少鉴权参数。为避免把 AppSecret 暴露为工具入参或写进脚本，正式组合工具必须使用下方 HTTPS 工具后端方案。
 
 官方说明：
@@ -28,7 +36,19 @@
 - [钉钉 MCP 广场介绍](https://open.dingtalk.com/document/development/mcp-square-introduction)：服务经钉钉统一网关，平台负责升级、替换、监控和 SLA 等治理。
 - [阿里云百炼使用钉钉 MCP 服务](https://open.dingtalk.com/document/development/alibaba-cloud-uses-dingtalk-mcp-services)：客户端配置类型为 Streamable HTTP。
 
-## 本项目后端配置
+## 当前平台直连配置
+
+当前不部署自建服务器。钉钉 MCP 开发平台中的正式工具为：
+
+| 工具 | 平台版本 | HTTP 动作 | 当前边界 |
+|---|---:|---|---|
+| `get_approval_capabilities` | 1 | 钉钉 FaaS | 返回能力说明 |
+| `get_approval_instance` | 2 | `GET /v1.0/workflow/processInstances` | 详情和附件元数据 |
+| `start_process_instance` | 1 | `POST /v1.0/workflow/processInstances` | 当前用户发起，复用 OA 后台流程 |
+
+平台统一使用已保存的企业内部应用 Token 鉴权。发起工具只把公开参数映射到请求体，并把系统操作用户 ID 映射到 `originatorUserId`。`confirm` 是必填的 Agent 安全契约，但平台直连 HTTP 动作无法像代码后端一样实施持久化幂等、allowlist 和服务端二次确认；这些增强能力保留在仓库实现中。
+
+## 未来代码后端配置
 
 部署时注入平台到后端的随机密钥，至少 32 UTF-8 字节：
 
@@ -78,12 +98,9 @@ Body: 工具参数对象
 
 ## 开发者平台操作顺序
 
-1. 部署本项目的 HTTPS 后端，先验证 `GET /healthz`。
-2. 使用后端专用 Bearer Key，逐个验证只读工具动作。
-3. 在钉钉 MCP 开发平台创建或选择 `MWE审批MCP` 服务；不要使用现有“测试MCP”作为生产服务。
-4. 工具创建方式选 `HTTP`，按上表配置 URL、Header、输入参数和输出字段。
-5. 先发布只读工具并执行 MCP 检测；只接受平台生成的 `streamable-http` 配置，并确认 URL 主机严格为 `mcp-gw.dingtalk.com`，否则停止接入。
-6. 再加入写工具。保留 `confirm`、`dryRun`、调用人绑定、userId allowlist、processCode allowlist 和持久化幂等键。
-7. MCP 客户端只保存钉钉平台生成的完整配置；URL 中的 `key` 只放入调用端密钥存储，不复制到工单、截图、日志或 Git。
-
-当前还没有可供平台访问的正式 HTTPS 后端域名，因此本轮没有把仓库 `0.2.0` 的组合工具发布为新版本。平台现有版本 1 与两个正式工具保持不变；待域名与密钥就绪后再升级 `get_approval_instance` 并完成第 4 至第 7 步。
+1. 当前阶段直接在钉钉 MCP 开发平台配置官方 OpenAPI HTTP 动作，优先交付小而稳定的工具。
+2. 写工具必须明确标注真实副作用，使用平台系统身份映射，避免把可伪造的操作者 ID 暴露给 Agent。
+3. 发布后在 AIHub 重置服务以刷新工具清单，并立即更新客户端保存的完整 Streamable HTTP 配置。
+4. 只接受平台生成的 `streamable-http` 配置，并确认 URL 主机严格为 `mcp-gw.dingtalk.com`；URL 中的 `key` 只放入调用端密钥存储。
+5. 当工具数量和变更频率使平台逐项配置难以维护时，部署本项目 HTTPS 后端，先验证 `GET /healthz`，再把对应 HTTP 动作切换到 `/platform/tools/<toolName>`。
+6. 代码后端启用后恢复完整的 `dryRun`、服务端确认、调用人/userId/processCode allowlist、持久化幂等和审计语义；对外 MCP 域名仍保持钉钉官方托管。

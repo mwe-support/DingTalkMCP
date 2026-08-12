@@ -4,7 +4,15 @@
 
 当前版本：`0.2.0`。
 
-当前发布状态：钉钉官方网关中的版本 1 仍是“详情 + 附件元数据”实现；本仓库 `0.2.0` 已完成“详情 + 统一附件清单 + 所选附件内容读取”的组合工具实现，待取得正式 HTTPS 工具后端域名后替换平台动作。2026-08-12 已使用同一应用凭证对近期真实审批记录附件完成接口链路验收：临时下载地址获取成功，PDF 下载 HTTP 200、122,165 字节、1 页且可提取文本；临时调试工具与文件已删除。
+当前发布状态（2026-08-13）：钉钉官方网关已发布 3 个平台直连工具：`get_approval_capabilities` 版本 1、`get_approval_instance` 版本 2 和 `start_process_instance` 版本 1。`start_process_instance` 由钉钉 MCP 开发平台以 HTTP POST 直接调用官方 OA OpenAPI，发起人固定映射为平台的“系统参数.操作用户id”，不向 Agent 暴露 `originatorUserId`，也不开放会覆盖 OA 后台流程的 `approvers`。无效模板负向联调进入 OA 业务校验并返回 `processCodeError`，未创建审批实例；真实模板仍需在用户明确确认具体表单内容后验收。
+
+本仓库 `0.2.0` 的代码实现继续保留，作为工具数量增加、更新频繁后切换到自建 HTTPS 工具后端的基础。代码版已经实现更强的服务端确认、固定调用人、allowlist、持久化幂等、审计和附件正文读取；当前平台直连版不部署自建服务器，也不具备这些服务端增强语义。无论采用平台直连还是代码后端，对外 MCP 地址始终由钉钉官方 `mcp-gw.dingtalk.com` 托管。
+
+当前正式平台工具的边界：
+
+- `get_approval_instance`：读取审批详情和附件元数据，不下载附件正文。
+- `start_process_instance`：发起真实审批；必填 `confirm`、`processCode`、`deptId`、`formComponentValues`，可选抄送和自选节点参数。
+- `get_approval_capabilities`：声明当前能力与托管边界。
 
 ## 已实现能力
 
@@ -16,7 +24,7 @@
 - 表单附件、评论/操作记录附件、图片元数据的统一识别。
 - 表单与评论附件安全下载：下载授权、临时 URL 换取、HTTPS/Host/重定向校验、大小上限、SHA-256 和 Base64 返回。
 - MCP 客户端只使用钉钉官方生成的 Streamable HTTP 配置，MCP 域名必须为 `mcp-gw.dingtalk.com`。
-- 本项目不暴露 MCP 传输端点，也不包含 stdio；只提供钉钉 MCP 开发平台调用的 HTTPS 工具后端。
+- 本项目不暴露 MCP 传输端点，也不包含 stdio；未来启用代码版时只提供钉钉 MCP 开发平台调用的 HTTPS 工具后端。
 
 保留了 DWS 中已经形成用户习惯的工具名：
 
