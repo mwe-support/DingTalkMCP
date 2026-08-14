@@ -221,6 +221,47 @@ describe("createMcpAuthorization", () => {
       expect.objectContaining({ event: "scope_rejected", reasonCode: "REFRESH_SCOPE_EXPANSION" }),
     ]));
   });
+
+  it("audits OAuth requests rejected by SDK validation before provider exchange", async () => {
+    const { baseUrl, securityEvents } = await fixture();
+    const client = await registerPublicClient(baseUrl);
+    const verifier = "correct-verifier-that-is-long-enough-1234567890";
+    const challenge = createHash("sha256").update(verifier).digest("base64url");
+    const authorize = new URL("/authorize", baseUrl);
+    authorize.search = new URLSearchParams({
+      response_type: "code",
+      client_id: client.client_id,
+      redirect_uri: redirectUri,
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+      resource,
+      scope: "approval:read",
+    }).toString();
+    const login = new URL(requiredHeader(await fetch(authorize, { redirect: "manual" }), "location"));
+    const callback = new URL("/oauth/dingtalk/callback", baseUrl);
+    callback.searchParams.set("authCode", "valid-dingtalk-code");
+    callback.searchParams.set("state", requiredParam(login, "state"));
+    const clientCallback = new URL(requiredHeader(await fetch(callback, { redirect: "manual" }), "location"));
+
+    const rejected = await fetch(new URL("/token", baseUrl), {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        client_id: client.client_id,
+        code: requiredParam(clientCallback, "code"),
+        code_verifier: "wrong-verifier-that-is-long-enough-1234567890",
+        redirect_uri: redirectUri,
+        resource,
+      }),
+    });
+
+    expect(rejected.status).toBe(400);
+    expect(securityEvents).toContainEqual(expect.objectContaining({
+      event: "authorization_failed",
+      reasonCode: "TOKEN_REQUEST_REJECTED",
+    }));
+  });
 });
 
 async function fixture(): Promise<{

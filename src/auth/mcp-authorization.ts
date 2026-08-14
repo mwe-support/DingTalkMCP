@@ -229,6 +229,9 @@ export function createMcpAuthorization(options: CreateMcpAuthorizationOptions): 
   const provider = new DingTalkBackedOAuthProvider(options, now, randomToken);
   const router = express.Router();
 
+  router.use("/authorize", auditRejectedOAuthResponse(options.securityAudit, "AUTHORIZATION_REQUEST_REJECTED"));
+  router.use("/token", auditRejectedOAuthResponse(options.securityAudit, "TOKEN_REQUEST_REJECTED"));
+
   router.post("/oauth/consent", express.urlencoded({ extended: false, limit: "8kb" }), async (request, response) => {
     response.setHeader("cache-control", "no-store");
     const token = singleBodyValue(request.body, "consent_token");
@@ -671,6 +674,20 @@ function escapeHtml(value: string): string {
 
 function recordSecurity(sink: SecurityAuditSink | undefined, event: SecurityAuditEventInput): Promise<void> {
   return Promise.resolve(sink?.record(event));
+}
+
+function auditRejectedOAuthResponse(sink: SecurityAuditSink | undefined, reasonCode: string): RequestHandler {
+  return (_request, response, next) => {
+    response.once("finish", () => {
+      if (response.statusCode < 400) return;
+      void recordSecurity(sink, {
+        event: "authorization_failed",
+        outcome: "rejected",
+        reasonCode,
+      }).catch(() => undefined);
+    });
+    next();
+  };
 }
 
 function validateRedirectUri(value: string): void {

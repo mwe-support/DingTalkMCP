@@ -122,6 +122,21 @@ describe("self-hosted Streamable HTTP transport", () => {
     expect((await registerFrom(baseUrl, "198.51.100.10", 20)).status).toBe(429);
     expect((await registerFrom(baseUrl, "198.51.100.11", 21)).status).toBe(201);
   });
+
+  it("returns the stateless MCP method response for authenticated GET and DELETE", async () => {
+    const { baseUrl, accessToken } = await fixture();
+
+    for (const method of ["GET", "DELETE"]) {
+      const response = await fetch(new URL("/mcp", baseUrl), {
+        method,
+        headers: { authorization: `Bearer ${accessToken}` },
+      });
+      expect(response.status).toBe(405);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { message: "Method not allowed for stateless Streamable HTTP." },
+      });
+    }
+  });
 });
 
 async function fixture(): Promise<{
