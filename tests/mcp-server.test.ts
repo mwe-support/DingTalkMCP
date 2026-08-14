@@ -573,7 +573,7 @@ describe("approval MCP public contract", () => {
     });
   });
 
-  it("reads a client-uploaded form attachment without a DingTalk spaceId", async () => {
+  it("reads a client-uploaded form attachment directly even when detail reports a spaceId", async () => {
     const request = vi
       .fn()
       .mockResolvedValueOnce({
@@ -587,6 +587,7 @@ describe("approval MCP public contract", () => {
               value: JSON.stringify([
                 {
                   fileId: "local-file",
+                  spaceId: "space-reported-for-local-file",
                   fileName: "报销凭证.jpg",
                   fileType: "jpg",
                   fileSize: 3,

@@ -485,27 +485,33 @@ export class ApprovalService {
     spaceId?: string;
     downloadUri: string;
   }> {
+    const directFileIdentity =
+      options.fileName !== undefined &&
+      options.fileName !== "" &&
+      options.fileType !== undefined &&
+      options.fileType !== ""
+        ? { fileName: options.fileName, fileType: options.fileType }
+        : undefined;
     if (!options.withCommentAttachment) {
       const callerUserId = this.#requireCallerUserId();
-      if (spaceId !== undefined && spaceId !== "") {
-        await this.#api.request({
-          method: "POST",
-          path: "/v1.0/workflow/processInstances/spaces/files/authDownload",
-          body: {
-            userId: callerUserId,
-            fileInfos: [{ fileId, spaceId }],
-          },
-        });
-      } else if (
-        options.fileName === undefined ||
-        options.fileName === "" ||
-        options.fileType === undefined ||
-        options.fileType === ""
-      ) {
-        throw new ApprovalMcpError(
-          "INVALID_INPUT",
-          "A form attachment without spaceId requires fileName and fileType.",
-        );
+      // Client uploads can report a spaceId even though authDownload rejects
+      // that space. DingTalk accepts their fileName + fileType identity here.
+      if (directFileIdentity === undefined) {
+        if (spaceId !== undefined && spaceId !== "") {
+          await this.#api.request({
+            method: "POST",
+            path: "/v1.0/workflow/processInstances/spaces/files/authDownload",
+            body: {
+              userId: callerUserId,
+              fileInfos: [{ fileId, spaceId }],
+            },
+          });
+        } else {
+          throw new ApprovalMcpError(
+            "INVALID_INPUT",
+            "A form attachment without spaceId requires fileName and fileType.",
+          );
+        }
       }
     } else {
       this.#requireCallerUserId();
@@ -520,11 +526,8 @@ export class ApprovalService {
           ? {
               withCommentAttatchment: true,
             }
-          : spaceId === undefined || spaceId === ""
-            ? {
-                fileName: options.fileName,
-                fileType: options.fileType,
-              }
+          : directFileIdentity !== undefined
+            ? directFileIdentity
           : {}),
       },
     });
