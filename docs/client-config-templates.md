@@ -1,6 +1,6 @@
 # WorkBuddy 与 Codex MCP 配置模板
 
-日期：2026-08-14  
+日期：2026-08-14
 目标 URL：`https://dingtalk.mwexk.com/mcp`
 
 ## 使用前检查

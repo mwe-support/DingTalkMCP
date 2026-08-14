@@ -1,6 +1,6 @@
 # 钉钉 OAuth 作为自托管 Streamable HTTP MCP 客户端鉴权（研究结论）
 
-日期：2026-08-14  
+日期：2026-08-14
 范围：仅依据钉钉开放平台、MCP 官方规范及 IETF RFC；未把“能放进 HTTP Authorization 头”误认为“语义上可用于该资源”。
 
 ## 结论先行
