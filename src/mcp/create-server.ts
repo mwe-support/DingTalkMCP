@@ -362,8 +362,14 @@ export function createApprovalMcpServer(
           .string()
           .min(1)
           .optional()
-          .describe("Required for form attachments; use the spaceId returned by instance detail"),
+          .describe("Use the spaceId returned by instance detail when DingTalk provides one"),
         fileName: z.string().min(1).max(255),
+        fileType: z
+          .string()
+          .min(1)
+          .max(32)
+          .optional()
+          .describe("Required with fileName for client-uploaded form attachments that have no spaceId"),
         withCommentAttachment: z
           .boolean()
           .optional()
@@ -378,6 +384,7 @@ export function createApprovalMcpServer(
           fileId: input.fileId,
           ...(input.spaceId === undefined ? {} : { spaceId: input.spaceId }),
           fileName: input.fileName,
+          ...(input.fileType === undefined ? {} : { fileType: input.fileType }),
           ...(input.withCommentAttachment === undefined
             ? {}
             : { withCommentAttachment: input.withCommentAttachment }),

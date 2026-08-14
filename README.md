@@ -201,7 +201,7 @@ MCP 客户端
 - `operationRecords[].attachments[]`。
 - `operationRecords[].images[]`。
 
-`approval_task(action=view, attachmentAction=read)` 自动根据附件来源选择下载链路。表单附件先以详情返回的 `spaceId + fileId` 为固定调用人授权，再以 `processInstanceId + fileId` 换取临时地址；评论附件自动使用官方 SDK 当前使用的 `withCommentAttatchment` 字段。固定调用人不能由 MCP 参数伪造。通用钉盘列表、搜索、共享和预览接口不进入本工具；OA 审批专用的 `/workflow/processInstances/spaces/files/*` 仍是附件读取的必要底层接口。
+`approval_task(action=view, attachmentAction=read)` 自动根据附件来源和元数据选择下载链路：详情带 `spaceId` 的表单附件先以 `spaceId + fileId` 为固定调用人授权；客户端手选本地文件产生的表单附件没有 `spaceId`，直接以 `processInstanceId + fileId + fileName + fileType` 换取临时地址；评论附件使用官方 SDK 当前使用的 `withCommentAttatchment` 字段。固定调用人不能由 MCP 参数伪造。通用钉盘列表、搜索、共享和预览接口不进入本工具；OA 审批专用的 `/workflow/processInstances/spaces/files/*` 仍是附件读取的必要底层接口。
 
 默认单文件最多下载 10 MiB 解码后字节，组合调用中的 Base64 正文默认总计最多 15 MiB，内容附带 SHA-256。可分别通过 `APPROVAL_DOWNLOAD_MAX_BYTES` 与 `APPROVAL_ATTACHMENT_BATCH_MAX_BYTES` 调整；批次按请求顺序串行下载，超过 Base64 正文预算的文件返回独立 ledger 错误，避免并发大响应造成内存峰值。审批详情与 JSON 字段开销不计入该正文预算。
 

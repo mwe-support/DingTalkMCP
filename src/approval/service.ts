@@ -479,7 +479,7 @@ export class ApprovalService {
     processInstanceId: string,
     fileId: string,
     spaceId: string | undefined,
-    options: { withCommentAttachment?: boolean } = {},
+    options: { fileName?: string; fileType?: string; withCommentAttachment?: boolean } = {},
   ): Promise<{
     fileId?: string;
     spaceId?: string;
@@ -487,20 +487,26 @@ export class ApprovalService {
   }> {
     if (!options.withCommentAttachment) {
       const callerUserId = this.#requireCallerUserId();
-      if (spaceId === undefined || spaceId === "") {
+      if (spaceId !== undefined && spaceId !== "") {
+        await this.#api.request({
+          method: "POST",
+          path: "/v1.0/workflow/processInstances/spaces/files/authDownload",
+          body: {
+            userId: callerUserId,
+            fileInfos: [{ fileId, spaceId }],
+          },
+        });
+      } else if (
+        options.fileName === undefined ||
+        options.fileName === "" ||
+        options.fileType === undefined ||
+        options.fileType === ""
+      ) {
         throw new ApprovalMcpError(
           "INVALID_INPUT",
-          "spaceId is required to authorize a form attachment download.",
+          "A form attachment without spaceId requires fileName and fileType.",
         );
       }
-      await this.#api.request({
-        method: "POST",
-        path: "/v1.0/workflow/processInstances/spaces/files/authDownload",
-        body: {
-          userId: callerUserId,
-          fileInfos: [{ fileId, spaceId }],
-        },
-      });
     } else {
       this.#requireCallerUserId();
     }
@@ -514,6 +520,11 @@ export class ApprovalService {
           ? {
               withCommentAttatchment: true,
             }
+          : spaceId === undefined || spaceId === ""
+            ? {
+                fileName: options.fileName,
+                fileType: options.fileType,
+              }
           : {}),
       },
     });
@@ -535,13 +546,20 @@ export class ApprovalService {
     fileId: string;
     spaceId?: string;
     fileName: string;
+    fileType?: string;
     withCommentAttachment?: boolean;
   }): Promise<Awaited<ReturnType<AttachmentDownloader["downloadToBase64"]>>> {
     const info = await this.getAttachmentDownloadUrl(
       input.processInstanceId,
       input.fileId,
       input.spaceId,
-      input.withCommentAttachment === undefined ? {} : { withCommentAttachment: input.withCommentAttachment },
+      {
+        fileName: input.fileName,
+        ...(input.fileType === undefined ? {} : { fileType: input.fileType }),
+        ...(input.withCommentAttachment === undefined
+          ? {}
+          : { withCommentAttachment: input.withCommentAttachment }),
+      },
     );
     return this.#downloader.downloadToBase64(info.downloadUri, input.fileName);
   }
@@ -606,6 +624,7 @@ export class ApprovalService {
             fileId,
             ...(attachment.spaceId === undefined ? {} : { spaceId: attachment.spaceId }),
             fileName: attachment.fileName,
+            ...(attachment.fileType === undefined ? {} : { fileType: attachment.fileType }),
             withCommentAttachment:
               attachment.source === "operation" || attachment.source === "operation-image",
           });

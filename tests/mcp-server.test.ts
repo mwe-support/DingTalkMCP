@@ -573,6 +573,87 @@ describe("approval MCP public contract", () => {
     });
   });
 
+  it("reads a client-uploaded form attachment without a DingTalk spaceId", async () => {
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce({
+        result: {
+          processInstanceId: "pi-local-form-file",
+          status: "RUNNING",
+          formComponentValues: [
+            {
+              name: "其他附件",
+              componentType: "DDAttachment",
+              value: JSON.stringify([
+                {
+                  fileId: "local-file",
+                  fileName: "报销凭证.jpg",
+                  fileType: "jpg",
+                  fileSize: 3,
+                },
+              ]),
+            },
+          ],
+        },
+      })
+      .mockResolvedValueOnce({
+        result: { fileId: "local-file", downloadUri: "https://files.dingtalk.com/local-file.jpg" },
+      });
+    const downloader = new AttachmentDownloader({
+      fetch: vi.fn<typeof fetch>().mockResolvedValue(
+        new Response(new Uint8Array([1, 2, 3]), {
+          status: 200,
+          headers: { "content-type": "image/jpeg", "content-length": "3" },
+        }),
+      ),
+      allowedHostSuffixes: [".dingtalk.com"],
+    });
+    const service = new ApprovalService({ api: { request }, downloader, callerUserId: "user-1" });
+    const server = createApprovalMcpServer(service);
+    const client = new Client({ name: "approval-local-form-file-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    closeables.push(client, server);
+
+    const result = await client.callTool({
+      name: "approval_task",
+      arguments: {
+        action: "view",
+        processInstanceId: "pi-local-form-file",
+        attachmentAction: "read",
+        attachmentIds: ["local-file"],
+      },
+    });
+
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      result: {
+        data: {
+          attachmentReads: [
+            expect.objectContaining({
+              ok: true,
+              source: "form",
+              fileName: "报销凭证.jpg",
+              content: expect.objectContaining({ mimeType: "image/jpeg", size: 3 }),
+            }),
+          ],
+        },
+      },
+    });
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(request).toHaveBeenNthCalledWith(2, {
+      method: "POST",
+      path: "/v1.0/workflow/processInstances/spaces/files/urls/download",
+      body: {
+        processInstanceId: "pi-local-form-file",
+        fileId: "local-file",
+        fileName: "报销凭证.jpg",
+        fileType: "jpg",
+      },
+    });
+  });
+
   it("keeps detail and attachment reading in one get_approval_instance tool", async () => {
     const request = vi
       .fn()
