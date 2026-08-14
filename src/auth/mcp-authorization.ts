@@ -679,7 +679,7 @@ function recordSecurity(sink: SecurityAuditSink | undefined, event: SecurityAudi
 function auditRejectedOAuthResponse(sink: SecurityAuditSink | undefined, reasonCode: string): RequestHandler {
   return (_request, response, next) => {
     response.once("finish", () => {
-      if (response.statusCode < 400) return;
+      if (response.statusCode < 400 && !hasOAuthErrorRedirect(response)) return;
       void recordSecurity(sink, {
         event: "authorization_failed",
         outcome: "rejected",
@@ -688,6 +688,17 @@ function auditRejectedOAuthResponse(sink: SecurityAuditSink | undefined, reasonC
     });
     next();
   };
+}
+
+function hasOAuthErrorRedirect(response: express.Response): boolean {
+  if (response.statusCode < 300 || response.statusCode >= 400) return false;
+  const location = response.getHeader("location");
+  if (typeof location !== "string") return false;
+  try {
+    return new URL(location).searchParams.has("error");
+  } catch {
+    return false;
+  }
 }
 
 function validateRedirectUri(value: string): void {

@@ -225,6 +225,22 @@ describe("createMcpAuthorization", () => {
   it("audits OAuth requests rejected by SDK validation before provider exchange", async () => {
     const { baseUrl, securityEvents } = await fixture();
     const client = await registerPublicClient(baseUrl);
+    const invalidAuthorize = new URL("/authorize", baseUrl);
+    invalidAuthorize.search = new URLSearchParams({
+      response_type: "code",
+      client_id: client.client_id,
+      redirect_uri: redirectUri,
+      resource,
+      state: "invalid-pkce-state",
+    }).toString();
+    const invalidAuthorizeResponse = await fetch(invalidAuthorize, { redirect: "manual" });
+    expect(invalidAuthorizeResponse.status).toBe(302);
+    expect(new URL(requiredHeader(invalidAuthorizeResponse, "location")).searchParams.get("error")).toBe("invalid_request");
+    expect(securityEvents).toContainEqual(expect.objectContaining({
+      event: "authorization_failed",
+      reasonCode: "AUTHORIZATION_REQUEST_REJECTED",
+    }));
+
     const verifier = "correct-verifier-that-is-long-enough-1234567890";
     const challenge = createHash("sha256").update(verifier).digest("base64url");
     const authorize = new URL("/authorize", baseUrl);
