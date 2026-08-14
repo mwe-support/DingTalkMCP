@@ -5,20 +5,30 @@ services:
     environment:
       DINGTALK_CLIENT_ID: ${DINGTALK_CLIENT_ID}
       DINGTALK_CLIENT_SECRET: ${DINGTALK_CLIENT_SECRET}
-      DINGTALK_CALLER_USER_ID: ${DINGTALK_CALLER_USER_ID}
-      DINGTALK_WRITE_USER_IDS: ${DINGTALK_WRITE_USER_IDS:-}
+      DINGTALK_CORP_ID: ${DINGTALK_CORP_ID}
+      DINGTALK_API_BASE_URL: https://api.dingtalk.com
+      MCP_PUBLIC_URL: https://dingtalk.mwexk.com/mcp
+      MCP_ISSUER_URL: https://dingtalk.mwexk.com/
+      DINGTALK_OAUTH_REDIRECT_URL: https://dingtalk.mwexk.com/oauth/dingtalk/callback
+      MCP_SIGNING_PRIVATE_KEY_FILE: /run/secrets/mcp-signing-private.pem
+      MCP_SIGNING_KEY_ID: ${MCP_SIGNING_KEY_ID:-mwe-approval-mcp-1}
+      MCP_ACCESS_TOKEN_TTL_SECONDS: ${MCP_ACCESS_TOKEN_TTL_SECONDS:-600}
+      MCP_REFRESH_TOKEN_TTL_SECONDS: ${MCP_REFRESH_TOKEN_TTL_SECONDS:-28800}
+      MCP_AUTH_TRANSACTION_TTL_SECONDS: ${MCP_AUTH_TRANSACTION_TTL_SECONDS:-300}
+      MCP_ALLOWED_SCOPES: approval:read,approval:decide
+      MCP_AUTH_STORE_PATH: /app/data/auth
       APPROVAL_ALLOWED_PROCESS_CODES: ${APPROVAL_ALLOWED_PROCESS_CODES:-}
       APPROVAL_IDEMPOTENCY_LEDGER_PATH: /app/data/approval-idempotency
       APPROVAL_AUDIT_LOG_PATH: /app/data/audit
       APPROVAL_DOWNLOAD_HOST_SUFFIXES: ${APPROVAL_DOWNLOAD_HOST_SUFFIXES:-.dingtalk.com,.alicdn.com,.aliyuncs.com}
       APPROVAL_BACKEND_HOST: 0.0.0.0
       APPROVAL_BACKEND_PORT: 3000
-      MCP_PLATFORM_API_KEY: ${MCP_PLATFORM_API_KEY}
-      APPROVAL_BACKEND_ALLOWED_HOSTS: ${APPROVAL_BACKEND_ALLOWED_HOSTS}
+      APPROVAL_BACKEND_ALLOWED_HOSTS: dingtalk.mwexk.com
     ports:
       - "127.0.0.1:3000:3000"
     volumes:
       - approval_mcp_data:/app/data
+      - ./secrets/mcp-signing-private.pem:/run/secrets/mcp-signing-private.pem:ro
 
 volumes:
   approval_mcp_data:

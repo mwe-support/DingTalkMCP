@@ -1,8 +1,8 @@
 {
   "name": "@mwe/dingtalk-approval-mcp",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
-  "description": "HTTP tool backend for the DingTalk-hosted MWE approval MCP.",
+  "description": "Self-hosted OAuth-protected Streamable HTTP MCP for DingTalk OA approvals.",
   "type": "module",
   "engines": {
     "node": ">=20"
@@ -18,9 +18,12 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
+    "express": "5.2.1",
+    "jose": "6.2.8",
     "zod": "3.25.76"
   },
   "devDependencies": {
+    "@types/express": "5.0.6",
     "@types/node": "24.3.0",
     "tsx": "4.20.3",
     "typescript": "5.9.3",

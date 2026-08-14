@@ -1,36 +1,37 @@
-# MWE 审批 MCP
+# MWE审批MCP
 
-`MWE审批MCP` 是一个独立的钉钉 OA 审批 MCP Server。它只使用新建企业内部应用的身份访问钉钉官方 OpenAPI，不复用、也不会修改“金蝶对接”应用。
+`MWE审批MCP` 是部署在 `https://dingtalk.mwexk.com/mcp` 的自托管钉钉 OA 审批 MCP Server。
 
-当前版本：`0.5.0`。
+当前版本：`0.6.0`。
 
-当前发布状态（2026-08-14）：原钉钉 AIHub 平台版本已删除。CVM 代码后端通过 `https://dingtalk.mwexk.com/platform/tools/approval_task` 提供唯一生产工具动作；重新在钉钉 MCP 开发平台创建并发布版本后，Agent 才会重新取得由 `mcp-gw.dingtalk.com` 托管的正式 MCP URL。
+## 当前架构
 
-本仓库 `0.5.0` 是钉钉 MCP 平台调用的 HTTPS 工具后端。正常 Agent 只使用一个审批人工具 `approval_task`，把查看、同意、拒绝以及附件链接换取收敛为 `action=view|approve|reject`。代码后端实现服务端确认、固定调用人、allowlist、持久化幂等和 30 天结构化审计；附件字节下载、文件识别、文档解析与 OCR 全部由 Agent 客户端完成。对外 MCP 地址仍应由钉钉官方 `mcp-gw.dingtalk.com` 托管。
+```text
+WorkBuddy / Codex
+  -> 本服务 OAuth 2.1 + PKCE
+  -> 钉钉 OAuth 验证真实企业用户
+  -> 本服务签发限 audience/scope 的短期 MCP token
+  -> Streamable HTTP /mcp
+  -> MWE审批MCP 企业内部应用 access token
+  -> 钉钉 OA OpenAPI
+```
 
-当前代码后端只暴露 `approval_task`；端点形状的兼容工具仅保留在进程内测试/迁移 catalog，不通过公网 `/platform/tools/*` 路由发布。
+- 只提供自托管 Streamable HTTP；不提供 stdio。
+- 已删除 AIHub 版本，不使用 `mcp-gw.dingtalk.com`。
+- 不提供或兼容 `/platform/tools/*` 旧路由。
+- 钉钉 `userAccessToken` 只用于登录身份验证，不作为 MCP Bearer、不持久化。
+- OA OpenAPI 仍使用 `MWE审批MCP` 企业内部应用的 App ID/App Secret。
+- MCP token 中的 `corpId + unionId + userId` 按请求绑定审批调用者，模型输入不能覆盖身份。
 
-## 已实现能力
+## 公共工具
 
-- 审批人一体化工具 `approval_task`：`view` 读取内容、操作记录、评论、当前任务与附件；`approve`、`reject` 在同一工具内完成审批决策。
-- 审批实例详情：公共 `approval_task` 返回容错后的 `normalized`；原始 `raw` 只保留在内部兼容接口，避免公共响应重复传输同一份内容。
-- 组合审批详情工具：一次调用返回详情、统一附件清单，并可通过可选参数换取所选附件的临时下载链接；不要求 Agent 在多个小工具之间搬运完整附件对象。
-- 实例 ID 查询、操作记录、实例内待处理任务。
-- 用户可见模板、标准表单 Schema、流程预测。
-- 发起、同意、拒绝、撤销；全部写操作绑定服务端固定调用人，并要求显式确认和本地 userId allowlist。
-- 表单附件、评论/操作记录附件、图片元数据的统一识别。
-- 表单与评论附件链接换取：隐藏授权差异，校验临时 URL 的 HTTPS 协议与 Host allowlist，不在服务端下载文件。
-- MCP 客户端只使用钉钉官方生成的 Streamable HTTP 配置，MCP 域名必须为 `mcp-gw.dingtalk.com`。
-- 本项目不暴露 MCP 传输端点，也不包含 stdio；只提供钉钉 MCP 开发平台调用的 HTTPS 工具后端。
-- 所有通过平台 Bearer 鉴权并进入工具执行阶段的调用都写入按 UTC 日期滚动的结构化 JSONL；日志最多保留 30 个 UTC 日历日。
-
-正常 Agent 工具清单只包含：
+正常 `tools/list` 只有一个审批人工具：
 
 ```text
 approval_task
 ```
 
-查看审批及附件元数据：
+读取审批：
 
 ```json
 {
@@ -39,54 +40,66 @@ approval_task
 }
 ```
 
-需要查看附件时仍调用同一工具换取临时链接：
+换取选定附件的临时下载链接：
 
 ```json
 {
   "action": "view",
   "processInstanceId": "审批实例ID",
   "attachmentAction": "download",
-  "attachmentIds": ["从附件清单取得的fileId"],
+  "attachmentIds": ["详情中的fileId"],
   "maxAttachments": 3
 }
 ```
 
-每次最多换取 5 个附件链接，默认上限 3 个；超出上限直接报错，不静默截断。结果按附件返回 ledger：一个链接换取失败不会抹掉其他成功结果。返回中的 `attachmentHandling` 明确要求 Agent 立即使用短期 `downloadUrl` 自行下载，再在客户端识别文件类型、解析正文或按需 OCR；服务端不接收附件字节、不返回 Base64，也不执行解析或 OCR。只有 URL、没有 `fileId` 的图片目前列入元数据清单，但不进入 `attachmentIds` 链路。
+服务端不下载、解析或 OCR 附件。Agent 客户端必须立即下载临时链接，并自行执行大小限制、重定向 Host 校验、文件识别、解析和 OCR。
 
-同意和拒绝使用相同主标识和工具边界：
+同意审批：
 
 ```json
 {
   "action": "approve",
   "processInstanceId": "审批实例ID",
   "taskId": "view返回的当前任务ID",
-  "requestId": "每次业务决策生成并稳定复用的UUID",
+  "requestId": "每次业务决定稳定复用的UUID",
   "confirm": true,
   "remark": "符合要求"
 }
 ```
 
-`reject` 与 `approve` 参数相同，但 `remark` 必须为非空业务理由。所有动作返回统一 envelope：`processInstanceId`、`action`、`currentStatus`、`auditCorrelationId`、`safeNextActions` 和 `data`。混合读写工具按最保守方式标注为可能修改；`action=view` 本身保持无副作用。
+拒绝时把 `action` 改为 `reject`，并提供非空 `remark`。写操作会重新读取当前任务，确认任务仍属于 OAuth 登录用户，并使用持久幂等账本阻止重复决定。
 
-DWS 兼容名、模板查询、发起、撤销、独立详情和附件元数据操作只保留在内部兼容 catalog，不会出现在正常 MCP `tools/list`，也不会通过公网 HTTP 工具路由发布。发起人与审批人属于不同角色和状态机，后续应单独聚合为 `approval_request`，不能塞入 `approval_task`。
+## OAuth 端点
 
-官方公开 OpenAPI 没有与 DWS 私有 `list_pending_approvals` 完全等价的个人收件箱接口，因此当前版本没有伪造这个工具。后续通过 `bpms_instance_change` / `bpms_task_change` 事件建立本地投影后再补齐。
+|端点|用途|
+|---|---|
+|`/.well-known/oauth-protected-resource/mcp`|MCP Protected Resource Metadata|
+|`/.well-known/oauth-authorization-server`|本站 Authorization Server Metadata|
+|`/authorize`|MCP 客户端授权入口|
+|`/oauth/dingtalk/callback`|钉钉 OAuth 回调|
+|`/token`|授权码或 refresh token 换 MCP token|
+|`/register`|受限公共客户端动态注册|
+|`/revoke`|撤销 refresh token family|
+|`/mcp`|OAuth 保护的 Streamable HTTP MCP|
+|`/healthz`|存活检查|
 
-## 应用与权限
+Access token 默认 10 分钟；refresh token 默认 8 小时、每次使用轮换。重放旧 refresh token 会撤销整个 token family。授权事务、客户端注册和 refresh 哈希保存在 `MCP_AUTH_STORE_PATH`，原始 token 不落盘。
 
-本服务对应独立应用 `MWE审批MCP`，最小权限是：
+## 开发者后台
 
-- `Workflow.Instance.Read`
-- `Workflow.Instance.Write`
-- `Workflow.Form.Read`
+在 `MWE审批MCP` 企业内部应用中配置精确 OAuth 回调：
 
-当前版本不需要 `Workflow.Form.Write`。附件上传尚未开放，因此也不要求存储上传权限。
+```text
+https://dingtalk.mwexk.com/oauth/dingtalk/callback
+```
 
-真实审批记录附件下载未返回 401/403 或缺权错误，说明当前 `Workflow.Instance.Read` 与 `Workflow.Instance.Write` 已满足本轮详情、审批记录附件换取下载地址的需要；未额外申请权限。
+并确认应用具备：
 
-## 安装与验证
+- 登录用户身份/个人信息权限。
+- 根据 unionId 映射企业 userId 的通讯录权限。
+- 审批实例读写和审批表单读取权限。
 
-需要 Node.js 20 或更高版本。
+## 本地验证
 
 ```powershell
 cd "D:\codex项目\金蝶领星钉钉三端数据同步开发\approval-mcp"
@@ -96,146 +109,40 @@ npm run typecheck
 npm run build
 ```
 
-`npm audit` 在当前锁文件上应返回零已知漏洞。
+生成 Ed25519 PKCS#8 签名私钥：
 
-## 配置
-
-复制 `.env.example` 了解完整配置，但服务不会自动读取 `.env`。生产环境应通过 Windows 服务、容器 Secret、CI/CD Secret 或密钥管理服务注入环境变量。
-
-必填：
-
-```text
-DINGTALK_CLIENT_ID
-DINGTALK_CLIENT_SECRET
+```bash
+mkdir -p secrets
+openssl genpkey -algorithm Ed25519 -out secrets/mcp-signing-private.pem
+chmod 600 secrets/mcp-signing-private.pem
 ```
 
-附件下载授权和写操作还需要把本服务固定绑定到一个钉钉用户：
+复制 `.env.example` 配置真实环境变量。服务不会自动读取 `.env`；Compose、systemd 或密钥管理器必须显式注入。
 
-```text
-DINGTALK_CALLER_USER_ID=测试人员userId
-```
-
-写操作默认关闭。固定调用人还必须出现在下面的逗号分隔列表中：
-
-```text
-DINGTALK_WRITE_USER_IDS=userId-1,userId-2
-```
-
-建议在正式联调前限制允许使用的审批模板：
-
-```text
-APPROVAL_ALLOWED_PROCESS_CODES=PROC-xxxx,PROC-yyyy
-```
-
-不要把 Client Secret、access token、平台后端 API Key、官方 MCP 配置中的 `key` 或附件临时 URL 提交到 Git。
-
-## 启动平台工具后端
-
-默认只监听 `127.0.0.1:3000`：
+启动：
 
 ```powershell
-$env:DINGTALK_CLIENT_ID = "dingxxxxxxxx"
-$env:DINGTALK_CLIENT_SECRET = "从密钥存储注入"
-$env:MCP_PLATFORM_API_KEY = "至少32字节的随机密钥"
+npm run build
 node .\dist\transports\http.js
 ```
 
-端点：
+## 客户端
 
-- 钉钉 MCP 开发平台工具后端：`POST /platform/tools/<toolName>`
-- 健康检查：`GET /healthz`
+WorkBuddy 与 Codex 的无密钥 OAuth 配置模板和测试顺序见：
 
-本服务不是 MCP Server，客户端不得把它配置为 MCP URL。它只接受钉钉平台到后端的普通 HTTP 调用。非 loopback 监听时，服务强制要求：
+- [`docs/client-config-templates.md`](docs/client-config-templates.md)
 
-- `MCP_PLATFORM_API_KEY`：至少 32 UTF-8 字节，由钉钉平台使用 `Authorization: Bearer ...`。
-- `APPROVAL_BACKEND_ALLOWED_HOSTS`：后端允许的 Host，逗号分隔。
+客户端配置中只出现公开 MCP URL，不填写 App Secret、Bearer token 或钉钉 userAccessToken。
 
-远程部署必须放在 TLS 反向代理之后，不应把 Node.js 明文端口直接暴露到公网。
+## 部署
 
-未配置 `MCP_PLATFORM_API_KEY` 时，整个 `/platform/tools/*` 路由返回 404。平台后端请求体就是该工具的参数对象，成功响应保持 `{ "result": ... }`，工具校验或业务错误返回 HTTP 422 和 `{ "error": ... }`。
+- 使用 [`compose.example.yaml`](compose.example.yaml) 部署应用。
+- 私钥以只读 Secret 文件挂载。
+- `deploy/cvm/edge/dingtalk.conf` 只转发 `/mcp`、OAuth/metadata 端点和 `/healthz`。
+- Node 端口仅监听或映射到 loopback，由公网 TLS 入口代理。
+- OAuth/审批状态、幂等账本和最多 30 天审计日志位于持久卷 `/app/data`。
 
-## 唯一 MCP 发布路径：钉钉官方托管
+详细安全与模块设计见：
 
-`approval_task` 平台版本发布后的唯一生产链路是：
-
-```text
-MCP 客户端
-  -> 钉钉官方 Streamable HTTP 网关（mcp-gw.dingtalk.com）
-  -> 钉钉 MCP 开发平台配置的 HTTP 动作
-  -> CVM HTTPS 工具后端（dingtalk.mwexk.com/platform/tools/approval_task）
-  -> 钉钉官方 OpenAPI（api.dingtalk.com）
-```
-
-钉钉 MCP 开发平台始终负责生成和维护外部 Streamable HTTP MCP 地址；本项目的 HTTPS 动作地址由我们部署和维护，但它是平台的普通 HTTP 后端，不是 MCP 域名。CVM 只把精确路径 `/platform/tools/approval_task` 和 `/healthz` 暴露在 TLS 反向代理之后，Node.js 仅监听 `127.0.0.1:3000`。
-
-2026-08-12 在已登录的钉钉官方 MCP 市场实测，“获取 MCP Server 配置”返回 `type: streamable-http`，URL 主机为钉钉官方域名 `mcp-gw.dingtalk.com`；官方文档同时说明 MCP 服务通过钉钉统一网关。由此可确认当前 `MWE审批MCP` 版本 1 的 MCP 网关由钉钉托管。URL 中的 `key` 是敏感凭据，禁止写入代码、文档、日志或 Git。
-
-不使用 Deap 自定义 MCP URL，也不提供任何自托管 MCP 回退。完整设置步骤和工具端点表见 [`docs/dingtalk-mcp-platform.md`](docs/dingtalk-mcp-platform.md)。
-
-## 代码后端的写操作安全语义
-
-以下保护已经在 CVM 代码后端实现；尚未切换的旧平台直连工具不具备同等语义。代码后端的发起、同意、拒绝和撤销必须同时满足：
-
-1. MCP 参数 `confirm=true`，代表宿主已获得用户明确确认。
-2. 操作者由服务端 `DINGTALK_CALLER_USER_ID` 固定绑定；客户端即使传 userId，也只能与它相同。
-3. 固定调用人在 `DINGTALK_WRITE_USER_IDS` 中。
-4. `processCode` 在可选 allowlist 中；同意、拒绝、撤销也会从最新实例详情反查并校验。
-5. 同意/拒绝前重新读取实例，确认 taskId 仍可处理且属于固定调用人。
-6. 撤销前重新读取实例，确认状态仍为 `RUNNING` 且固定调用人仍是发起人；公共工具不能发起系统撤销。
-
-写工具支持 `dryRun=true`：执行本地权限和最新状态校验，但不调用写接口，也不要求 `confirm=true`。
-
-`start_process_instance.requestId` 和 `approval_task(action=approve|reject).requestId` 是 MCP 侧持久化幂等键，不会作为未知字段传给钉钉 OpenAPI。发起与审批决策使用不同账本命名空间；成功结果写入 `APPROVAL_IDEMPOTENCY_LEDGER_PATH`，重启后仍会复用；同一个 UUID 在同类动作中配不同请求返回 `IDEMPOTENCY_CONFLICT`。若超时或崩溃导致结果不确定，服务返回 `IDEMPOTENCY_OUTCOME_UNKNOWN` 并停止自动重试，要求先刷新钉钉审批状态，避免重复写入。
-
-目录账本为每个 requestId 建立 SHA-256 命名目录，并以原子 `mkdir` 完成“检查并预留”，支持共享同一文件系统的多个 HTTP 并发实例。崩溃留下的 `pending` 记录不会被回收，而是持续失败关闭，要求人工核对钉钉实例后处理；跨主机多副本若不共享该目录，应改用带唯一约束事务的共享数据库。
-
-## 审计日志
-
-生产 HTTP 进程把两类事件写入 `APPROVAL_AUDIT_LOG_PATH`（默认 `./data/audit`，容器中为 `/app/data/audit`）下的 `YYYY-MM-DD.jsonl`：
-
-- `mcp_tool_invocation`：以同一匿名 `invocationId` 写入 `started` 和 `completed` 两阶段事件；完成事件记录工具名、安全动作枚举、结果、HTTP 状态、耗时和安全错误码。响应头 `x-mwe-audit-id` 可用于定位同一调用，`x-mwe-audit-status=recorded|partial|failed` 表示审计落盘状态。
-- `approval_audit`：保留实际审批写操作原有的动作、固定调用人、目标和结果审计；写操作仍使用工具响应中的审批审计关联 ID 做业务审计定位，不把该 ID 复制进最小化的工具调用事件。
-
-工具调用事件不保存请求体、实例/task/request ID、人员、表单、备注、附件元数据、附件正文、临时下载 URL、Client Secret、access token、Bearer Key 或审批业务审计关联 ID。审计文件是唯一持久副本，不再复制到 stderr/Docker 标准日志。每次审计写入最多等待 2 秒：若 `started` 无法落盘或超时，后端返回 503 且不执行工具；若工具已完成但 `completed` 或内部 `approval_audit` 落盘失败/超时，保留已有 `started` 记录、返回原业务结果并仅把当前调用标为 `partial`，同时输出不含业务数据的运维错误提示，避免诱发写操作重试或误伤并发调用。
-
-保留策略固定上限为 30 个 UTC 日历日（当天加前 29 天），不能配置得更长。服务启动时、每次写入后以及运行期间每 6 小时都会清理过期日期文件；非日期命名文件不会被审计清理器误删。容器使用具名卷保存日志，升级或重启不会丢失未到期记录。
-
-## 附件边界
-
-`approval_task(action=view)` 与内部兼容工具会容错解析：
-
-- 表单 `DDAttachment` 数据。
-- `operationRecords[].attachments[]`。
-- `operationRecords[].images[]`。
-
-`approval_task(action=view, attachmentAction=download)` 自动根据附件来源和元数据选择链接换取链路：有完整 `fileName + fileType` 的客户端手选本地附件直接以 `processInstanceId + fileId + fileName + fileType` 换取临时地址，即使详情同时返回了不可授权的 `spaceId`；缺少这组文件标识、但详情带 `spaceId` 的表单附件才先以 `spaceId + fileId` 为固定调用人授权；评论附件使用官方 SDK 当前使用的 `withCommentAttatchment` 字段。固定调用人不能由 MCP 参数伪造。通用钉盘列表、搜索、共享和预览接口不进入本工具；OA 审批专用的 `/workflow/processInstances/spaces/files/*` 仅用于审批附件授权和临时链接换取。
-
-钉钉当前可能为客户端本地附件返回阿里云 OSS 的 `http://*.aliyuncs.com` 签名地址。服务端不会访问它；仅在域名已通过 SSRF 白名单且严格属于 `.aliyuncs.com` 时，把返回给 Agent 的协议原地升级为 HTTPS。其他 HTTP 地址、带用户名/密码的 URL 和非白名单 Host 继续失败关闭。
-
-临时链接视为短期能力凭据：Agent 应立即下载，禁止写入日志或长期保存。MCP 服务端不跟随链接、不检查响应体 MIME、不计算哈希、不做正文脱敏，也不执行 PDF/Office 解包、图片识别或 OCR；这些步骤连同下载大小限制、内容安全扫描和凭证脱敏都属于 Agent 客户端责任。这样公网 CVM 的附件路径只有少量 OpenAPI 请求和小型 JSON 响应，不承担附件带宽与 CPU/内存峰值。
-
-## 目录结构
-
-```text
-src/
-  approval/       审批服务、容错规范化、附件标识解析与临时链接策略
-  core/           错误模型、审计与持久化幂等账本
-  dingtalk/       accessToken 缓存和 OpenAPI client
-  mcp/            MCP 工具注册
-  transports/     钉钉平台普通 HTTP 工具后端
-tests/             OpenAPI、MCP、HTTP 和附件安全测试
-```
-
-## 后续路线
-
-- P1：使用 Stream 订阅 `bpms_instance_change`、`bpms_task_change`，实现待办投影与事件幂等。
-- P1：取得并验证存储上传权限后，实现本机文件到审批钉盘的完整上传链路。
-- 已完成：在真实审批记录附件上验收 `withCommentAttatchment` 下载地址链路；文件下载、PDF 文本提取和渲染由 Agent 客户端完成。
-- 已完成：在 CVM 以 `dingtalk.mwexk.com` 部署正式 HTTPS 工具后端；公网只开放 `/healthz` 和 `/platform/tools/approval_task`，平台到后端使用 Bearer Key。
-- 已完成：通过公网代码后端读取最近两个真实审批并换取 19 个表单附件链接；另以一条真实已完成审批验证评论区 PDF 的链接换取，文件内容由 Agent 客户端下载和查看。
-- 待平台发布：重新编辑并发布钉钉 MCP 开发平台的 `approval_task` 版本，把官方网关的审批人入口切换到 CVM 组合工具。
-- 待完整写验收：使用测试模板和测试人员完成发起、同意、拒绝、撤销的回归测试。
-
-官方能力与开发者平台设置证据见：
-
-[`../artifacts/dingtalk-mcp-research-2026-08-12/自建审批MCP-官方能力与开发者平台设置.md`](../artifacts/dingtalk-mcp-research-2026-08-12/自建审批MCP-官方能力与开发者平台设置.md)
+- [`docs/mcp-auth-module-design.md`](docs/mcp-auth-module-design.md)
+- [`docs/dingtalk-oauth-mcp-client-auth.md`](docs/dingtalk-oauth-mcp-client-auth.md)

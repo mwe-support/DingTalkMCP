@@ -31,7 +31,7 @@ describe("DailyJsonLineAuditStore", () => {
     await sink.record({
       timestamp: "2026-08-14T08:00:00.000Z",
       invocationId: "86d57306-1337-41c6-a87f-4ae201331024",
-      transport: "dingtalk_platform_http",
+      transport: "streamable_http",
       toolName: "approval_task",
       action: "view",
       phase: "completed",
@@ -47,7 +47,7 @@ describe("DailyJsonLineAuditStore", () => {
         type: "mcp_tool_invocation",
         timestamp: "2026-08-14T08:00:00.000Z",
         invocationId: "86d57306-1337-41c6-a87f-4ae201331024",
-        transport: "dingtalk_platform_http",
+        transport: "streamable_http",
         toolName: "approval_task",
         action: "view",
         phase: "completed",
@@ -103,7 +103,7 @@ describe("DailyJsonLineAuditStore", () => {
       sink.record({
         timestamp: "2026-08-14T08:00:00.000Z",
         invocationId: "86d57306-1337-41c6-a87f-4ae201331024",
-        transport: "dingtalk_platform_http",
+        transport: "streamable_http",
         toolName: "approval_task",
         phase: "started",
       }),

@@ -13,7 +13,7 @@ export type ToolInvocationAuditOutcome = "succeeded" | "rejected" | "failed" | "
 export interface ToolInvocationAuditEventBase {
   timestamp: string;
   invocationId: string;
-  transport: "dingtalk_platform_http";
+  transport: "streamable_http";
   toolName: string;
   action?: "view" | "approve" | "reject";
 }
@@ -26,6 +26,7 @@ export type ToolInvocationAuditEvent = ToolInvocationAuditEventBase &
         outcome: ToolInvocationAuditOutcome;
         httpStatus: number;
         durationMs: number;
+        auditStatus?: "complete" | "partial";
         errorCode?: string;
       }
   );

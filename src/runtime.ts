@@ -11,6 +11,13 @@ export interface ApprovalRuntimeOptions {
 }
 
 export function createApprovalService(config: ApprovalMcpConfig, options: ApprovalRuntimeOptions = {}): ApprovalService {
+  return createApprovalRuntime(config, options).service;
+}
+
+export function createApprovalRuntime(
+  config: ApprovalMcpConfig,
+  options: ApprovalRuntimeOptions = {},
+): { service: ApprovalService; api: DingTalkApiClient } {
   const tokenProvider = new DingTalkTokenProvider({
     appKey: config.clientId,
     appSecret: config.clientSecret,
@@ -23,13 +30,12 @@ export function createApprovalService(config: ApprovalMcpConfig, options: Approv
   const attachmentLinkPolicy = new AttachmentLinkPolicy({
     allowedHostSuffixes: config.downloadHostSuffixes,
   });
-  return new ApprovalService({
+  const service = new ApprovalService({
     api,
     attachmentLinkPolicy,
-    writeUserIds: config.writeUserIds,
-    ...(config.callerUserId === undefined ? {} : { callerUserId: config.callerUserId }),
     allowedProcessCodes: config.allowedProcessCodes,
     audit: options.audit ?? new JsonLineAuditSink(),
     idempotencyLedger: new DirectoryIdempotencyLedger(config.idempotencyLedgerPath),
   });
+  return { service, api };
 }

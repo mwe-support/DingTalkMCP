@@ -1,5 +1,10 @@
+import { readFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 
+import { DirectoryAuthorizationStore } from "../auth/authorization-store.js";
+import { DingTalkOAuthIdentityAdapter } from "../auth/dingtalk-identity.js";
+import { JoseMcpTokenCodec } from "../auth/jwt-codec.js";
+import { createMcpAuthorization } from "../auth/mcp-authorization.js";
 import { loadConfig } from "../config.js";
 import {
   BoundedApprovalAuditSink,
@@ -9,14 +14,13 @@ import {
   RetainedToolInvocationAuditSink,
   startAuditRetentionSweep,
 } from "../core/audit-log.js";
-import { createApprovalService } from "../runtime.js";
+import { createApprovalRuntime } from "../runtime.js";
 import { startApprovalHttpServer } from "./http-server.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
   const host = process.env.APPROVAL_BACKEND_HOST?.trim() || "127.0.0.1";
   const port = parsePort(process.env.APPROVAL_BACKEND_PORT);
-  const platformApiKey = process.env.MCP_PLATFORM_API_KEY?.trim() || undefined;
   const allowedHosts = csv(process.env.APPROVAL_BACKEND_ALLOWED_HOSTS);
   const auditStore = new DailyJsonLineAuditStore(config.auditLogPath);
   const auditContext = new AuditInvocationContext();
@@ -25,26 +29,51 @@ async function main(): Promise<void> {
       process.stderr.write("Structured audit retention sweep failed.\n");
     },
   });
-  const running = await startApprovalHttpServer(
-    createApprovalService(config, {
-      audit: new BoundedApprovalAuditSink(new RetainedApprovalAuditSink(auditStore), auditStore, {
-        invocationContext: auditContext,
-      }),
+  const runtime = createApprovalRuntime(config, {
+    audit: new BoundedApprovalAuditSink(new RetainedApprovalAuditSink(auditStore), auditStore, {
+      invocationContext: auditContext,
     }),
-    {
-      host,
-      port,
-      platformApiKey,
-      allowedHosts,
-      auditContext,
-      toolAudit: new RetainedToolInvocationAuditSink(auditStore),
-    },
-  );
+  });
+  const privateKeyPem = await readFile(config.auth.signingPrivateKeyPath, "utf8");
+  const tokenCodec = await JoseMcpTokenCodec.create({
+    privateKeyPem,
+    keyId: config.auth.signingKeyId,
+    issuer: config.auth.issuerUrl,
+    audience: config.auth.publicUrl,
+    accessTokenTtlSeconds: config.auth.accessTokenTtlSeconds,
+  });
+  const identity = new DingTalkOAuthIdentityAdapter({
+    clientId: config.clientId,
+    clientSecret: config.clientSecret,
+    corpId: config.auth.corpId,
+    redirectUrl: config.auth.redirectUrl,
+    apiBaseUrl: config.apiBaseUrl,
+    applicationApi: runtime.api,
+  });
+  const auth = createMcpAuthorization({
+    issuerUrl: new URL(config.auth.issuerUrl),
+    resourceUrl: new URL(config.auth.publicUrl),
+    redirectUrl: new URL(config.auth.redirectUrl),
+    expectedCorpId: config.auth.corpId,
+    allowedScopes: config.auth.allowedScopes,
+    accessTokenTtlSeconds: config.auth.accessTokenTtlSeconds,
+    refreshTokenTtlSeconds: config.auth.refreshTokenTtlSeconds,
+    transactionTtlSeconds: config.auth.transactionTtlSeconds,
+    identity,
+    store: new DirectoryAuthorizationStore(config.auth.authStorePath),
+    tokenCodec,
+  });
+  const running = await startApprovalHttpServer(runtime.service, {
+    host,
+    port,
+    allowedHosts,
+    allowedOrigins: [new URL(config.auth.publicUrl).origin],
+    auth,
+    auditContext,
+    toolAudit: new RetainedToolInvocationAuditSink(auditStore),
+  });
   const address = running.httpServer.address() as AddressInfo;
-  process.stderr.write(`MWE approval tool backend listening on http://${host}:${address.port}\n`);
-  if (platformApiKey !== undefined) {
-    process.stderr.write(`DingTalk MCP Platform backend listening on /platform/tools/<toolName>\n`);
-  }
+  process.stderr.write(`MWE approval MCP listening on http://${host}:${address.port}/mcp\n`);
 
   const shutdown = (): void => {
     retentionSweep.close();
@@ -56,14 +85,14 @@ async function main(): Promise<void> {
 
 main().catch((error: unknown) => {
   const message = error instanceof Error ? error.message : "Unknown startup error";
-  process.stderr.write(`MWE approval tool backend failed to start: ${message}\n`);
+  process.stderr.write(`MWE approval MCP failed to start: ${message}\n`);
   process.exitCode = 1;
 });
 
 function parsePort(value: string | undefined): number {
   if (value === undefined || value.trim() === "") return 3000;
   const parsed = Number(value);
-  if (!Number.isInteger(parsed) || parsed < 0 || parsed > 65535) {
+  if (!Number.isInteger(parsed) || parsed < 0 || parsed > 65_535) {
     throw new Error("APPROVAL_BACKEND_PORT must be an integer between 0 and 65535.");
   }
   return parsed;

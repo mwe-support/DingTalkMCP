@@ -1,0 +1,214 @@
+import { generateKeyPairSync } from "node:crypto";
+import type { AddressInfo } from "node:net";
+
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { ApprovalService } from "../src/approval/service.js";
+import { JoseMcpTokenCodec } from "../src/auth/jwt-codec.js";
+import { createMcpAuthorization, InMemoryAuthorizationStore } from "../src/auth/mcp-authorization.js";
+import type { DingTalkApiClient } from "../src/dingtalk/client.js";
+import { startApprovalHttpServer, type RunningApprovalHttpServer } from "../src/transports/http-server.js";
+
+const resource = "https://dingtalk.mwexk.com/mcp";
+const running: RunningApprovalHttpServer[] = [];
+
+afterEach(async () => {
+  await Promise.all(running.splice(0).map((server) => server.close()));
+});
+
+describe("self-hosted Streamable HTTP transport", () => {
+  it("advertises OAuth metadata and rejects unauthenticated MCP requests", async () => {
+    const { baseUrl } = await fixture();
+
+    const metadata = await fetch(new URL("/.well-known/oauth-protected-resource/mcp", baseUrl));
+    expect(metadata.status).toBe(200);
+    await expect(metadata.json()).resolves.toMatchObject({
+      resource,
+      authorization_servers: ["https://dingtalk.mwexk.com/"],
+      scopes_supported: ["approval:read", "approval:decide"],
+    });
+
+    const response = await mcpRequest(baseUrl, initializeRequest(), undefined);
+    expect(response.status).toBe(401);
+    expect(response.headers.get("www-authenticate")).toContain(
+      'resource_metadata="https://dingtalk.mwexk.com/.well-known/oauth-protected-resource/mcp"',
+    );
+  });
+
+  it("serves initialize, tools/list and an OAuth-bound approval_task call", async () => {
+    const { baseUrl, accessToken, request } = await fixture();
+
+    const initialized = await mcpRequest(baseUrl, initializeRequest(), accessToken);
+    expect(initialized.status).toBe(200);
+    expect(await jsonRpcBody(initialized)).toMatchObject({
+      jsonrpc: "2.0",
+      id: 1,
+      result: { serverInfo: { name: "mwe-dingtalk-approval-mcp" } },
+    });
+
+    const listed = await mcpRequest(
+      baseUrl,
+      { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
+      accessToken,
+    );
+    expect((await jsonRpcBody(listed)) as Record<string, unknown>).toMatchObject({
+      result: { tools: [{ name: "approval_task" }] },
+    });
+
+    const called = await mcpRequest(
+      baseUrl,
+      {
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: {
+          name: "approval_task",
+          arguments: { action: "view", processInstanceId: "pi-oauth-1" },
+        },
+      },
+      accessToken,
+    );
+    const payload = await jsonRpcBody(called) as {
+      result?: { structuredContent?: Record<string, unknown>; isError?: boolean };
+    };
+    expect(payload.result?.isError).not.toBe(true);
+    expect(payload.result?.structuredContent).toMatchObject({
+      result: {
+        processInstanceId: "pi-oauth-1",
+        safeNextActions: ["view", "approve", "reject"],
+      },
+    });
+    expect(request).toHaveBeenCalledWith({
+      method: "GET",
+      path: "/v1.0/workflow/processInstances",
+      query: { processInstanceId: "pi-oauth-1" },
+    });
+  });
+
+  it("does not expose the retired DingTalk platform route", async () => {
+    const { baseUrl, accessToken } = await fixture();
+    const response = await fetch(new URL("/platform/tools/approval_task", baseUrl), {
+      method: "POST",
+      headers: { authorization: `Bearer ${accessToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ action: "view", processInstanceId: "pi-1" }),
+    });
+
+    expect(response.status).toBe(404);
+  });
+
+  it("rejects browser requests from an untrusted Origin", async () => {
+    const { baseUrl, accessToken } = await fixture();
+    const response = await fetch(new URL("/mcp", baseUrl), {
+      method: "POST",
+      headers: {
+        accept: "application/json, text/event-stream",
+        authorization: `Bearer ${accessToken}`,
+        "content-type": "application/json",
+        origin: "https://evil.example",
+      },
+      body: JSON.stringify(initializeRequest()),
+    });
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toEqual({ error: "invalid_origin" });
+  });
+});
+
+async function fixture(): Promise<{
+  baseUrl: URL;
+  accessToken: string;
+  request: ReturnType<typeof vi.fn>;
+}> {
+  const { privateKey } = generateKeyPairSync("ed25519");
+  const codec = await JoseMcpTokenCodec.create({
+    privateKeyPem: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+    keyId: "test-key",
+    issuer: "https://dingtalk.mwexk.com/",
+    audience: resource,
+    accessTokenTtlSeconds: 600,
+  });
+  const auth = createMcpAuthorization({
+    issuerUrl: new URL("https://dingtalk.mwexk.com/"),
+    resourceUrl: new URL(resource),
+    redirectUrl: new URL("https://dingtalk.mwexk.com/oauth/dingtalk/callback"),
+    expectedCorpId: "corp-1",
+    allowedScopes: ["approval:read", "approval:decide"],
+    accessTokenTtlSeconds: 600,
+    refreshTokenTtlSeconds: 28_800,
+    transactionTtlSeconds: 300,
+    identity: {
+      authorizationUrl: (state) => new URL(`https://login.dingtalk.test/oauth?state=${state}`),
+      verifyAuthorizationCode: () => Promise.reject(new Error("not used")),
+    },
+    store: new InMemoryAuthorizationStore(),
+    tokenCodec: codec,
+  });
+  const accessToken = await codec.issue({
+    principal: {
+      subject: "union-1",
+      tenantId: "corp-1",
+      userId: "user-1",
+      authenticatedAt: Math.floor(Date.now() / 1000),
+    },
+    clientId: "real-client-test",
+    scopes: ["approval:read", "approval:decide"],
+  });
+  const request = vi.fn().mockResolvedValue({
+    result: {
+      processInstanceId: "pi-oauth-1",
+      status: "RUNNING",
+      originatorUserId: "originator-1",
+      tasks: [{ taskId: "task-1", userId: "user-1", status: "RUNNING" }],
+      operationRecords: [],
+      formComponentValues: [],
+    },
+  });
+  const server = await startApprovalHttpServer(
+    new ApprovalService({ api: { request } as unknown as Pick<DingTalkApiClient, "request"> }),
+    {
+      host: "127.0.0.1",
+      port: 0,
+      allowedHosts: [],
+      allowedOrigins: ["https://dingtalk.mwexk.com"],
+      auth,
+    },
+  );
+  running.push(server);
+  const address = server.httpServer.address() as AddressInfo;
+  return { baseUrl: new URL(`http://127.0.0.1:${address.port}`), accessToken, request };
+}
+
+function initializeRequest(): Record<string, unknown> {
+  return {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-11-25",
+      capabilities: {},
+      clientInfo: { name: "real-client-test", version: "1.0.0" },
+    },
+  };
+}
+
+function mcpRequest(baseUrl: URL, body: unknown, accessToken: string | undefined): Promise<Response> {
+  return fetch(new URL("/mcp", baseUrl), {
+    method: "POST",
+    headers: {
+      accept: "application/json, text/event-stream",
+      "content-type": "application/json",
+      ...(accessToken === undefined ? {} : { authorization: `Bearer ${accessToken}` }),
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+async function jsonRpcBody(response: Response): Promise<unknown> {
+  const body = await response.text();
+  if (response.headers.get("content-type")?.includes("text/event-stream")) {
+    const data = body.split("\n").find((line) => line.startsWith("data: "))?.slice(6);
+    if (data === undefined) throw new Error(`Missing SSE data: ${body}`);
+    return JSON.parse(data) as unknown;
+  }
+  return JSON.parse(body) as unknown;
+}

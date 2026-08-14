@@ -78,6 +78,80 @@ describe("approval MCP public contract", () => {
     expect(tools.tools[0]?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true });
   });
 
+  it("records bounded structured audit events around Streamable HTTP tool semantics", async () => {
+    const events: Array<Record<string, unknown>> = [];
+    const request = vi.fn().mockResolvedValue({
+      result: {
+        processInstanceId: "pi-audit",
+        status: "RUNNING",
+        tasks: [{ taskId: "task-audit", userId: "user-1", status: "RUNNING" }],
+      },
+    });
+    const service = new ApprovalService({
+      api: { request } as unknown as Pick<DingTalkApiClient, "request">,
+      callerUserId: "user-1",
+      writeUserIds: ["user-1"],
+    });
+    const server = createApprovalMcpServer(service, {
+      toolAudit: { record: (event) => void events.push(event as unknown as Record<string, unknown>) },
+    });
+    const client = new Client({ name: "approval-audit-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    closeables.push(client, server);
+
+    await client.callTool({
+      name: "approval_task",
+      arguments: { action: "view", processInstanceId: "pi-audit" },
+    });
+
+    expect(events).toEqual([
+      expect.objectContaining({
+        transport: "streamable_http",
+        toolName: "approval_task",
+        action: "view",
+        phase: "started",
+      }),
+      expect.objectContaining({
+        transport: "streamable_http",
+        toolName: "approval_task",
+        action: "view",
+        phase: "completed",
+        outcome: "succeeded",
+        auditStatus: "complete",
+      }),
+    ]);
+  });
+
+  it("does not execute approval_task when the required start audit cannot be persisted", async () => {
+    const request = vi.fn();
+    const service = new ApprovalService({
+      api: { request } as unknown as Pick<DingTalkApiClient, "request">,
+      callerUserId: "user-1",
+      writeUserIds: ["user-1"],
+    });
+    const server = createApprovalMcpServer(service, {
+      toolAudit: { record: () => Promise.reject(new Error("disk unavailable")) },
+    });
+    const client = new Client({ name: "approval-audit-failure-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    closeables.push(client, server);
+
+    const result = await client.callTool({
+      name: "approval_task",
+      arguments: { action: "view", processInstanceId: "pi-audit" },
+    });
+
+    expect(result).toMatchObject({
+      isError: true,
+      structuredContent: { error: { code: "AUDIT_LOG_UNAVAILABLE" } },
+    });
+    expect(request).not.toHaveBeenCalled();
+  });
+
   it("returns approval content, actionable state, comments, and attachment metadata through action=view", async () => {
     const { client, request } = await connectedPublicClient({
       result: {

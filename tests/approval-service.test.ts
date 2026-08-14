@@ -483,4 +483,59 @@ describe("ApprovalService OpenAPI contract", () => {
       }),
     ]);
   });
+
+  it("binds an OAuth caller per request and allows only approval participants to view", async () => {
+    const api = apiMock();
+    vi.mocked(api.request).mockResolvedValue({
+      result: {
+        processInstanceId: "pi-oauth-1",
+        status: "RUNNING",
+        originatorUserId: "originator-1",
+        tasks: [{ taskId: "task-1", userId: "user-1", status: "RUNNING" }],
+        operationRecords: [],
+      },
+    });
+    const service = new ApprovalService({ api }).forCaller({
+      subject: "union-1",
+      tenantId: "corp-1",
+      userId: "user-1",
+      scopes: ["approval:read", "approval:decide"],
+    });
+
+    await expect(service.approvalTask({ action: "view", processInstanceId: "pi-oauth-1" })).resolves.toMatchObject({
+      safeNextActions: ["view", "approve", "reject"],
+    });
+
+    const unrelated = new ApprovalService({ api }).forCaller({
+      subject: "union-2",
+      tenantId: "corp-1",
+      userId: "user-2",
+      scopes: ["approval:read"],
+    });
+    await expect(unrelated.approvalTask({ action: "view", processInstanceId: "pi-oauth-1" })).rejects.toMatchObject({
+      code: "APPROVAL_VIEW_FORBIDDEN",
+    });
+  });
+
+  it("requires approval:decide before an OAuth caller can decide its own task", async () => {
+    const api = apiMock();
+    const service = new ApprovalService({ api }).forCaller({
+      subject: "union-1",
+      tenantId: "corp-1",
+      userId: "user-1",
+      scopes: ["approval:read"],
+    });
+
+    await expect(
+      service.approvalTask({
+        action: "approve",
+        processInstanceId: "pi-oauth-1",
+        taskId: "task-1",
+        requestId: "17f7862a-78d7-4dcb-baad-395e013c917a",
+        confirm: true,
+        dryRun: true,
+      }),
+    ).rejects.toMatchObject({ code: "INSUFFICIENT_SCOPE" });
+    expect(api.request).not.toHaveBeenCalled();
+  });
 });

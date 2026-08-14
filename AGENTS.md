@@ -40,8 +40,16 @@ These instructions apply to the entire `approval-mcp` repository.
 
 ## Transport and deployment
 
+- The authoritative production target is a self-hosted Streamable HTTP MCP endpoint at `https://dingtalk.mwexk.com/mcp` on the CVM. The DingTalk AIHub version has been deleted, and the project has abandoned DingTalk-hosted MCP transport. Do not describe `mcp-gw.dingtalk.com`, an AIHub-generated URL, or a platform `key` as the current or target client connection.
+- The codebase implements OAuth-protected `/mcp`, OAuth discovery/authorization endpoints, DingTalk callback, and `/healthz`. Do not claim the public deployment is live until the exact CVM URL passes the protocol checks below.
+- MCP client authentication applies only to the client-facing self-hosted `/mcp` endpoint. Keep it separate from DingTalk OpenAPI authentication.
+- Use DingTalk OAuth only as the upstream identity provider for MCP client login. The self-hosted authorization layer must validate the DingTalk enterprise identity and then issue a short-lived, resource-bound MCP token. Never accept or forward a DingTalk `userAccessToken` as the `/mcp` Bearer token.
+- Bind the verified `corpId + unionId + userId` to each Streamable HTTP request and inject it into the approval domain as an explicit caller context. Production `/mcp` must not derive identity from model input, a fixed `DINGTALK_CALLER_USER_ID`, cookies, query-string tokens, or unverified headers.
+- MCP access tokens must use the canonical issuer and audience for `https://dingtalk.mwexk.com/mcp`, short expiry, explicit approval scopes, PKCE S256, and supported revocation/rotation semantics. Keep OAuth transaction and client-registration state behind a replaceable store Interface so a future multi-replica deployment can adopt a shared Adapter.
+- DingTalk OpenAPI calls must continue to use the dedicated enterprise application's App ID/AppKey and App Secret/AppSecret to obtain and cache the application access token. Do not replace that upstream application identity with MCP client credentials or user OAuth merely because the MCP transport authentication changes.
+- Do not expose or retain `/platform/tools/*`, `MCP_PLATFORM_API_KEY`, AIHub actions, or official-gateway compatibility routes. Requests to retired platform paths must return 404.
 - Support Streamable HTTP only. Do not add or advertise a stdio transport.
-- Keep the distinction explicit: `/platform/tools/*` routes are an HTTPS tool backend for the DingTalk MCP platform; they are not a Streamable HTTP MCP endpoint. A self-hosted MCP URL requires an actual `/mcp` transport, initialization, authentication, session handling, and protocol tests.
+- The only tool transport is the OAuth-protected `/mcp` endpoint. Health and OAuth endpoints are supporting HTTP routes, not alternate tool transports.
 - Bind application containers to loopback unless traffic enters through an authenticated reverse proxy or tunnel. Store production secrets outside the repository with least-readable permissions.
 - Implement the shared Web ingress and domain routing as a separately managed containerized router, rather than accumulating per-domain routing in a host-installed proxy.
 - Put routable Web containers on one dedicated external Docker network. Application containers expose only their internal port to that network; only the router publishes host ports `80` and `443`.

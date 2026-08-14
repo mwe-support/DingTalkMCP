@@ -1,8 +1,18 @@
+import { randomUUID } from "node:crypto";
+
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod/v4";
 
-import type { ApprovalService } from "../approval/service.js";
+import type { ApprovalService, ApprovalTaskInput } from "../approval/service.js";
 import { ApprovalMcpError, errorPayload } from "../core/errors.js";
+import {
+  DEFAULT_AUDIT_WRITE_TIMEOUT_MS,
+  type AuditInvocationContext,
+  runAuditWriteWithinTimeout,
+  type ToolInvocationAuditEventBase,
+  type ToolInvocationAuditOutcome,
+  type ToolInvocationAuditSink,
+} from "../core/audit-log.js";
 import { APPROVAL_MCP_VERSION } from "../version.js";
 
 const readAnnotations = {
@@ -70,6 +80,9 @@ const approvalTaskSchema = z.union([
 
 export interface ApprovalMcpServerOptions {
   includeCompatibilityTools?: boolean;
+  toolAudit?: ToolInvocationAuditSink;
+  auditContext?: AuditInvocationContext;
+  auditWriteTimeoutMs?: number;
 }
 
 export function createApprovalMcpServer(
@@ -90,7 +103,7 @@ export function createApprovalMcpServer(
       inputSchema: approvalTaskSchema,
       annotations: writeAnnotations,
     },
-    async (input) => safely(() => service.approvalTask(input)),
+    async (input) => auditedApprovalTask(options, input, () => service.approvalTask(input)),
   );
 
   if (options.includeCompatibilityTools !== true) return server;
@@ -351,6 +364,89 @@ export function createApprovalMcpServer(
 
   return server;
 }
+
+async function auditedApprovalTask(
+  options: ApprovalMcpServerOptions,
+  input: ApprovalTaskInput,
+  operation: () => Promise<unknown>,
+) {
+  if (options.toolAudit === undefined) return safely(operation);
+  const invocationId = randomUUID();
+  const startedAt = performance.now();
+  const base: ToolInvocationAuditEventBase = {
+    timestamp: new Date().toISOString(),
+    invocationId,
+    transport: "streamable_http",
+    toolName: "approval_task",
+    action: input.action,
+  };
+  const timeoutMs = options.auditWriteTimeoutMs ?? DEFAULT_AUDIT_WRITE_TIMEOUT_MS;
+  try {
+    await runAuditWriteWithinTimeout(
+      () => options.toolAudit?.record({ ...base, phase: "started" }),
+      timeoutMs,
+    );
+  } catch {
+    return safely(() => {
+      throw new ApprovalMcpError(
+        "AUDIT_LOG_UNAVAILABLE",
+        "Structured audit logging is unavailable; the approval tool was not executed.",
+      );
+    });
+  }
+  const invocationState = options.auditContext?.createState();
+  const invoke = () => safely(operation);
+  const result = invocationState === undefined || options.auditContext === undefined
+    ? await invoke()
+    : await options.auditContext.run(invocationState, invoke);
+  const errorCode = toolResultErrorCode(result);
+  const outcome = toolAuditOutcome(errorCode);
+  try {
+    await runAuditWriteWithinTimeout(
+      () => options.toolAudit?.record({
+        ...base,
+        timestamp: new Date().toISOString(),
+        phase: "completed",
+        outcome,
+        httpStatus: 200,
+        durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
+        auditStatus: invocationState?.approvalAuditFailed === true ? "partial" : "complete",
+        ...(errorCode === undefined ? {} : { errorCode }),
+      }),
+      timeoutMs,
+    );
+  } catch {
+    process.stderr.write("Structured MCP tool audit completion write failed.\n");
+  }
+  return result;
+}
+
+function toolResultErrorCode(result: Awaited<ReturnType<typeof safely>>): string | undefined {
+  if (!("isError" in result) || result.isError !== true) return undefined;
+  const payload = isRecord(result.structuredContent) ? result.structuredContent : undefined;
+  const error = isRecord(payload?.error) ? payload.error : undefined;
+  return typeof error?.code === "string" ? error.code : "TOOL_INPUT_OR_EXECUTION_ERROR";
+}
+
+function toolAuditOutcome(errorCode: string | undefined): ToolInvocationAuditOutcome {
+  if (errorCode === undefined) return "succeeded";
+  if (errorCode === "IDEMPOTENCY_OUTCOME_UNKNOWN") return "uncertain";
+  return TOOL_FAILURE_CODES.has(errorCode) ? "failed" : "rejected";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const TOOL_FAILURE_CODES = new Set([
+  "AUDIT_LOG_UNAVAILABLE",
+  "CONFIGURATION_ERROR",
+  "DINGTALK_AUTH_ERROR",
+  "DINGTALK_API_ERROR",
+  "IDEMPOTENCY_LEDGER_ERROR",
+  "INTERNAL_ERROR",
+  "INVALID_RESPONSE",
+]);
 
 function requireOneRequest(
   input: {

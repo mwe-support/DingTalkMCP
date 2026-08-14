@@ -14,6 +14,7 @@ import {
   type ApprovalAttachmentSource,
 } from "./attachments.js";
 import { array, asRecord, normalizeProcessInstance, text, unwrapResult } from "./normalize.js";
+import type { ApprovalCaller, McpScope } from "../auth/types.js";
 
 type ApiPort = Pick<DingTalkApiClient, "request">;
 
@@ -61,6 +62,7 @@ interface ApprovalServiceOptions {
   allowedProcessCodes?: Iterable<string>;
   audit?: ApprovalAuditSink;
   idempotencyLedger?: IdempotencyLedger;
+  callerScopes?: Iterable<McpScope>;
 }
 
 export interface GetApprovalInstanceInput {
@@ -133,6 +135,7 @@ export class ApprovalService {
   readonly #attachmentLinkPolicy: AttachmentLinkPolicy;
   readonly #writeUserIds: Set<string>;
   readonly #callerUserId: string | undefined;
+  readonly #callerScopes: Set<McpScope> | undefined;
   readonly #allowedProcessCodes: Set<string>;
   readonly #audit: ApprovalAuditSink;
   readonly #idempotencyLedger: IdempotencyLedger;
@@ -144,9 +147,23 @@ export class ApprovalService {
     this.#attachmentLinkPolicy = options.attachmentLinkPolicy ?? new AttachmentLinkPolicy();
     this.#writeUserIds = new Set(options.writeUserIds ?? []);
     this.#callerUserId = options.callerUserId;
+    this.#callerScopes = options.callerScopes === undefined ? undefined : new Set(options.callerScopes);
     this.#allowedProcessCodes = new Set(options.allowedProcessCodes ?? []);
     this.#audit = options.audit ?? noopAuditSink;
     this.#idempotencyLedger = options.idempotencyLedger ?? new InMemoryIdempotencyLedger();
+  }
+
+  forCaller(caller: ApprovalCaller): ApprovalService {
+    return new ApprovalService({
+      api: this.#api,
+      attachmentLinkPolicy: this.#attachmentLinkPolicy,
+      callerUserId: caller.userId,
+      callerScopes: caller.scopes,
+      writeUserIds: caller.scopes.includes("approval:decide") ? [caller.userId] : [],
+      allowedProcessCodes: this.#allowedProcessCodes,
+      audit: this.#audit,
+      idempotencyLedger: this.#idempotencyLedger,
+    });
   }
 
   async getProcessInstanceDetail(processInstanceId: string): Promise<{
@@ -170,6 +187,7 @@ export class ApprovalService {
     attachmentDownloads: ApprovalAttachmentDownloadResult[];
   }> {
     const detail = await this.getProcessInstanceDetail(input.processInstanceId);
+    this.#assertCallerCanView(detail.normalized);
     const attachments = extractApprovalAttachments(detail.raw);
     const attachmentDownloads =
       input.attachmentAction === "download"
@@ -192,6 +210,7 @@ export class ApprovalService {
   async approvalTask(input: ApprovalTaskInput): Promise<ApprovalTaskEnvelope> {
     const auditCorrelationId = randomUUID();
     if (input.action === "view") {
+      this.#assertScope("approval:read");
       const approval = await this.getApprovalInstance({
         processInstanceId: input.processInstanceId,
         ...(input.attachmentAction === undefined ? {} : { attachmentAction: input.attachmentAction }),
@@ -228,6 +247,8 @@ export class ApprovalService {
         },
       };
     }
+    this.#assertScope("approval:read");
+    this.#assertScope("approval:decide");
     const upstreamResult = await this.executeTask({
       confirm: input.confirm,
       ...(input.dryRun === undefined ? {} : { dryRun: input.dryRun }),
@@ -673,6 +694,33 @@ export class ApprovalService {
     this.#assertActorAllowed(actorUserId);
   }
 
+  #assertScope(scope: McpScope): void {
+    if (this.#callerScopes !== undefined && !this.#callerScopes.has(scope)) {
+      throw new ApprovalMcpError("INSUFFICIENT_SCOPE", `The authenticated MCP token requires ${scope}.`);
+    }
+  }
+
+  #assertCallerCanView(instance: ReturnType<typeof normalizeProcessInstance>): void {
+    if (this.#callerScopes === undefined) return;
+    const callerUserId = this.#requireCallerUserId();
+    const related =
+      instance.originatorUserId === callerUserId ||
+      instance.tasks.some((task) => {
+        const value = asRecord(task);
+        return text(value?.userId ?? value?.actionerUserId) === callerUserId;
+      }) ||
+      instance.operationRecords.some((operation) => {
+        const value = asRecord(operation);
+        return text(value?.userId ?? value?.actionerUserId ?? value?.operatorUserId) === callerUserId;
+      });
+    if (!related) {
+      throw new ApprovalMcpError(
+        "APPROVAL_VIEW_FORBIDDEN",
+        "The authenticated DingTalk user is not a verifiable participant in this approval instance.",
+      );
+    }
+  }
+
   #assertActorAllowed(actorUserId: string): void {
     if (!this.#writeUserIds.has(actorUserId)) {
       throw new ApprovalMcpError(
@@ -736,7 +784,7 @@ export class ApprovalService {
     if (this.#callerUserId === undefined || this.#callerUserId === "") {
       throw new ApprovalMcpError(
         "CALLER_IDENTITY_NOT_CONFIGURED",
-        "Approval mutations and comment-attachment downloads require DINGTALK_CALLER_USER_ID.",
+        "Approval mutations and comment-attachment downloads require an authenticated caller identity.",
       );
     }
     return this.#callerUserId;
