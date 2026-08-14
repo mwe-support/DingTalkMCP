@@ -112,6 +112,16 @@ describe("self-hosted Streamable HTTP transport", () => {
     expect(response.status).toBe(403);
     await expect(response.json()).resolves.toEqual({ error: "invalid_origin" });
   });
+
+  it("rate-limits dynamic registration per forwarded client IP", async () => {
+    const { baseUrl } = await fixture();
+
+    for (let index = 0; index < 20; index += 1) {
+      expect((await registerFrom(baseUrl, "198.51.100.10", index)).status).toBe(201);
+    }
+    expect((await registerFrom(baseUrl, "198.51.100.10", 20)).status).toBe(429);
+    expect((await registerFrom(baseUrl, "198.51.100.11", 21)).status).toBe(201);
+  });
 });
 
 async function fixture(): Promise<{
@@ -212,4 +222,21 @@ async function jsonRpcBody(response: Response): Promise<unknown> {
     return JSON.parse(data) as unknown;
   }
   return JSON.parse(body) as unknown;
+}
+
+function registerFrom(baseUrl: URL, clientIp: string, index: number): Promise<Response> {
+  return fetch(new URL("/register", baseUrl), {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-forwarded-for": clientIp,
+    },
+    body: JSON.stringify({
+      redirect_uris: [`http://127.0.0.1/callback/${index}`],
+      token_endpoint_auth_method: "none",
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      client_name: `rate-limit-test-${index}`,
+    }),
+  });
 }

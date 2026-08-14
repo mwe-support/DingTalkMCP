@@ -27,6 +27,19 @@ afterEach(async () => {
 });
 
 describe("createMcpAuthorization", () => {
+  it("publishes only the public-client authentication methods it implements", async () => {
+    const { baseUrl } = await fixture();
+
+    const response = await fetch(new URL("/.well-known/oauth-authorization-server", baseUrl));
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      issuer,
+      token_endpoint_auth_methods_supported: ["none"],
+      revocation_endpoint_auth_methods_supported: ["none"],
+    });
+  });
+
   it("completes DingTalk-backed OAuth with PKCE and protects a resource-bound route", async () => {
     const { baseUrl, securityEvents } = await fixture();
     const client = await registerPublicClient(baseUrl);
@@ -149,6 +162,64 @@ describe("createMcpAuthorization", () => {
     expect(familyRevoked.status).toBe(400);
     expect(await familyRevoked.json()).toMatchObject({ error: "invalid_grant" });
     expect(securityEvents).toContainEqual(expect.objectContaining({ event: "refresh_replay", outcome: "rejected" }));
+  });
+
+  it("audits invalid state, authorization code, refresh target and scope expansion", async () => {
+    const { baseUrl, securityEvents } = await fixture();
+    const client = await registerPublicClient(baseUrl);
+
+    const invalidState = new URL("/oauth/dingtalk/callback", baseUrl);
+    invalidState.searchParams.set("authCode", "valid-dingtalk-code");
+    invalidState.searchParams.set("state", "expired-state");
+    expect((await fetch(invalidState)).status).toBe(400);
+
+    const invalidCode = await fetch(new URL("/token", baseUrl), {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        client_id: client.client_id,
+        code: "expired-code",
+        code_verifier: "verifier-that-is-long-enough-1234567890",
+        redirect_uri: redirectUri,
+        resource,
+      }),
+    });
+    expect(invalidCode.status).toBe(400);
+
+    const targetTokens = await completeLogin(baseUrl, client.client_id);
+    const invalidTarget = await fetch(new URL("/token", baseUrl), {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        client_id: client.client_id,
+        refresh_token: targetTokens.refresh_token,
+        resource: "https://dingtalk.mwexk.com/not-mcp",
+      }),
+    });
+    expect(invalidTarget.status).toBe(400);
+
+    const scopeTokens = await completeLogin(baseUrl, client.client_id);
+    const expandedScope = await fetch(new URL("/token", baseUrl), {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        client_id: client.client_id,
+        refresh_token: scopeTokens.refresh_token,
+        resource,
+        scope: "approval:read approval:decide",
+      }),
+    });
+    expect(expandedScope.status).toBe(400);
+
+    expect(securityEvents).toEqual(expect.arrayContaining([
+      expect.objectContaining({ event: "authorization_failed", reasonCode: "OAUTH_STATE_INVALID" }),
+      expect.objectContaining({ event: "authorization_failed", reasonCode: "AUTHORIZATION_CODE_INVALID" }),
+      expect.objectContaining({ event: "authorization_failed", reasonCode: "REFRESH_TARGET_INVALID" }),
+      expect.objectContaining({ event: "scope_rejected", reasonCode: "REFRESH_SCOPE_EXPANSION" }),
+    ]));
   });
 });
 

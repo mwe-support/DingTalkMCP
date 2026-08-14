@@ -7,6 +7,7 @@ import {
 } from "../core/audit-log.js";
 
 export type SecurityAuditEventName =
+  | "authorization_failed"
   | "consent_approved"
   | "consent_denied"
   | "login_succeeded"

@@ -37,6 +37,10 @@ export async function startApprovalHttpServer(
     host: options.host,
     ...(options.allowedHosts.length === 0 ? {} : { allowedHosts: options.allowedHosts }),
   });
+  // The production path is exactly one HTTP reverse proxy (edge-nginx) in
+  // front of this loopback-published container port. This preserves the
+  // original client address for the SDK OAuth endpoint rate limiters.
+  app.set("trust proxy", 1);
 
   app.use(options.auth.router);
   app.get("/healthz", (_request, response) => {

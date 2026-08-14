@@ -13,7 +13,11 @@ import {
 } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import type { AuthorizationParams, OAuthServerProvider } from "@modelcontextprotocol/sdk/server/auth/provider.js";
-import { getOAuthProtectedResourceMetadataUrl, mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
+import {
+  createOAuthMetadata,
+  getOAuthProtectedResourceMetadataUrl,
+  mcpAuthRouter,
+} from "@modelcontextprotocol/sdk/server/auth/router.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import type {
   OAuthClientInformationFull,
@@ -230,6 +234,11 @@ export function createMcpAuthorization(options: CreateMcpAuthorizationOptions): 
     const token = singleBodyValue(request.body, "consent_token");
     const decision = singleBodyValue(request.body, "decision");
     if (token === undefined || (decision !== "approve" && decision !== "deny")) {
+      await recordSecurity(options.securityAudit, {
+        event: "authorization_failed",
+        outcome: "rejected",
+        reasonCode: "CONSENT_RESPONSE_INVALID",
+      }).catch(() => undefined);
       response.status(400).json({ error: "invalid_request", error_description: "Invalid consent response." });
       return;
     }
@@ -241,11 +250,21 @@ export function createMcpAuthorization(options: CreateMcpAuthorizationOptions): 
     const state = singleQueryValue(request.query.state);
     const authCode = singleQueryValue(request.query.authCode);
     if (state === undefined || authCode === undefined) {
+      await recordSecurity(options.securityAudit, {
+        event: "authorization_failed",
+        outcome: "rejected",
+        reasonCode: "OAUTH_CALLBACK_INVALID",
+      }).catch(() => undefined);
       response.status(400).json({ error: "invalid_request", error_description: "Missing DingTalk OAuth callback data." });
       return;
     }
     const transaction = await options.store.consumeTransaction(state);
     if (transaction === undefined) {
+      await recordSecurity(options.securityAudit, {
+        event: "authorization_failed",
+        outcome: "rejected",
+        reasonCode: "OAUTH_STATE_INVALID",
+      }).catch(() => undefined);
       response.status(400).json({ error: "invalid_request", error_description: "OAuth state is invalid or expired." });
       return;
     }
@@ -290,6 +309,20 @@ export function createMcpAuthorization(options: CreateMcpAuthorizationOptions): 
     }
   });
 
+  const oauthMetadata = {
+    ...createOAuthMetadata({
+      provider,
+      issuerUrl: options.issuerUrl,
+      scopesSupported: [...options.allowedScopes],
+    }),
+    token_endpoint_auth_methods_supported: ["none"],
+    revocation_endpoint_auth_methods_supported: ["none"],
+  };
+  router.get("/.well-known/oauth-authorization-server", (_request, response) => {
+    response.setHeader("access-control-allow-origin", "*");
+    response.status(200).json(oauthMetadata);
+  });
+
   router.use(
     mcpAuthRouter({
       provider,
@@ -330,7 +363,18 @@ class DingTalkBackedOAuthProvider implements OAuthServerProvider {
   }
 
   async authorize(client: OAuthClientInformationFull, params: AuthorizationParams, response: express.Response): Promise<void> {
-    const resource = this.#validateResource(params.resource);
+    let resource: string;
+    try {
+      resource = this.#validateResource(params.resource);
+    } catch (error) {
+      await recordSecurity(this.#options.securityAudit, {
+        event: "authorization_failed",
+        outcome: "rejected",
+        clientId: client.client_id,
+        reasonCode: "AUTHORIZATION_TARGET_INVALID",
+      }).catch(() => undefined);
+      throw error;
+    }
     let scopes: McpScope[];
     try {
       scopes = this.#validateScopes(params.scopes);
@@ -367,6 +411,11 @@ class DingTalkBackedOAuthProvider implements OAuthServerProvider {
   ): Promise<void> {
     const transaction = await this.#options.store.consumeTransaction(consentToken);
     if (transaction === undefined) {
+      await recordSecurity(this.#options.securityAudit, {
+        event: "authorization_failed",
+        outcome: "rejected",
+        reasonCode: "CONSENT_TRANSACTION_INVALID",
+      }).catch(() => undefined);
       response.status(400).json({ error: "invalid_request", error_description: "Consent is invalid or expired." });
       return;
     }
@@ -397,6 +446,12 @@ class DingTalkBackedOAuthProvider implements OAuthServerProvider {
   async challengeForAuthorizationCode(client: OAuthClientInformationFull, authorizationCode: string): Promise<string> {
     const record = await this.#options.store.getAuthorizationCode(authorizationCode);
     if (record === undefined || record.clientId !== client.client_id) {
+      await recordSecurity(this.#options.securityAudit, {
+        event: "authorization_failed",
+        outcome: "rejected",
+        clientId: client.client_id,
+        reasonCode: "AUTHORIZATION_CODE_INVALID",
+      }).catch(() => undefined);
       throw new InvalidGrantError("Authorization code is invalid or expired.");
     }
     return record.codeChallenge;
@@ -409,16 +464,26 @@ class DingTalkBackedOAuthProvider implements OAuthServerProvider {
     redirectUri?: string,
     resource?: URL,
   ): Promise<OAuthTokens> {
-    const record = await this.#options.store.consumeAuthorizationCode(authorizationCode);
-    if (
-      record === undefined ||
-      record.clientId !== client.client_id ||
-      redirectUri !== record.redirectUri ||
-      this.#validateResource(resource) !== record.resource
-    ) {
-      throw new InvalidGrantError("Authorization code is invalid, expired, or bound to another request.");
+    try {
+      const record = await this.#options.store.consumeAuthorizationCode(authorizationCode);
+      if (
+        record === undefined ||
+        record.clientId !== client.client_id ||
+        redirectUri !== record.redirectUri ||
+        this.#validateResource(resource) !== record.resource
+      ) {
+        throw new InvalidGrantError("Authorization code is invalid, expired, or bound to another request.");
+      }
+      return this.#issueTokenPair(record.clientId, record.resource, record.scopes, record.principal, randomUUID());
+    } catch (error) {
+      await recordSecurity(this.#options.securityAudit, {
+        event: "authorization_failed",
+        outcome: "rejected",
+        clientId: client.client_id,
+        reasonCode: "AUTHORIZATION_CODE_EXCHANGE_FAILED",
+      }).catch(() => undefined);
+      throw error;
     }
-    return this.#issueTokenPair(record.clientId, record.resource, record.scopes, record.principal, randomUUID());
   }
 
   async exchangeRefreshToken(
@@ -436,20 +501,62 @@ class DingTalkBackedOAuthProvider implements OAuthServerProvider {
           clientId: client.client_id,
           reasonCode: "REFRESH_TOKEN_REPLAY",
         }).catch(() => undefined);
+      } else {
+        await recordSecurity(this.#options.securityAudit, {
+          event: "authorization_failed",
+          outcome: "rejected",
+          clientId: client.client_id,
+          reasonCode: "REFRESH_TOKEN_INVALID",
+        }).catch(() => undefined);
       }
       throw new InvalidGrantError("Refresh token is invalid, expired, revoked, or replayed.");
     }
     const record = consumed.record;
+    let refreshResource: string;
+    try {
+      refreshResource = this.#validateResource(resource);
+    } catch (error) {
+      await recordSecurity(this.#options.securityAudit, {
+        event: "authorization_failed",
+        outcome: "rejected",
+        clientId: client.client_id,
+        reasonCode: "REFRESH_TARGET_INVALID",
+      }).catch(() => undefined);
+      throw error;
+    }
     if (
       record.clientId !== client.client_id ||
-      this.#validateResource(resource) !== record.resource ||
+      refreshResource !== record.resource ||
       await this.#options.store.isRefreshFamilyRevoked(record.familyId)
     ) {
       await this.#options.store.revokeRefreshToken(refreshToken);
+      await recordSecurity(this.#options.securityAudit, {
+        event: "authorization_failed",
+        outcome: "rejected",
+        clientId: client.client_id,
+        reasonCode: "REFRESH_BINDING_INVALID",
+      }).catch(() => undefined);
       throw new InvalidGrantError("Refresh token is not valid for this client or resource.");
     }
-    const requestedScopes = scopes === undefined ? record.scopes : this.#validateScopes(scopes);
+    let requestedScopes: McpScope[];
+    try {
+      requestedScopes = scopes === undefined ? record.scopes : this.#validateScopes(scopes);
+    } catch (error) {
+      await recordSecurity(this.#options.securityAudit, {
+        event: "scope_rejected",
+        outcome: "rejected",
+        clientId: client.client_id,
+        reasonCode: "REFRESH_SCOPE_INVALID",
+      }).catch(() => undefined);
+      throw error;
+    }
     if (requestedScopes.some((scope) => !record.scopes.includes(scope))) {
+      await recordSecurity(this.#options.securityAudit, {
+        event: "scope_rejected",
+        outcome: "rejected",
+        clientId: client.client_id,
+        reasonCode: "REFRESH_SCOPE_EXPANSION",
+      }).catch(() => undefined);
       throw new InvalidScopeError("A refresh request cannot expand the original scope.");
     }
     return this.#issueTokenPair(
