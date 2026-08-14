@@ -2,7 +2,7 @@
 
 ## 架构结论
 
-`MWE审批MCP` 只使用钉钉 MCP 开发平台托管的对外 MCP 网关。审批人组合工具的普通 HTTP 动作由平台转发到本仓库部署在 CVM 的 HTTPS 后端：
+`MWE审批MCP` 只使用钉钉 MCP 开发平台托管的对外 MCP 网关。`approval_task` 新版本发布后，审批人组合工具的普通 HTTP 动作由平台转发到本仓库部署在 CVM 的 HTTPS 后端：
 
 ```text
 客户端 --Streamable HTTP--> mcp-gw.dingtalk.com
@@ -11,7 +11,7 @@
 ```
 
 - 对外 MCP Server URL：官方文档说明服务通过钉钉统一网关；2026-08-12 从钉钉官方 MCP 市场实际取得的 `MWE审批MCP` 版本 1 配置使用 `streamable-http`，主机为 `mcp-gw.dingtalk.com`，可确认当前 MCP 网关由钉钉托管。
-- 组合工具动作 URL：由我们托管。该 URL 只是平台调用的普通 HTTP API，不是 MCP Server URL，也不会提供给 MCP 客户端。
+- 组合工具目标动作 URL：由我们托管。该 URL 只是平台调用的普通 HTTP API，不是 MCP Server URL，也不会提供给 MCP 客户端。
 - 旧的平台直连工具在组合工具版本正式发布前仍直接使用 `api.dingtalk.com`，由平台保存的 Token 鉴权注入访问令牌。
 - 本项目不暴露 `/mcp`，不使用 Deap 自定义 MCP URL，也没有自托管 MCP 回退。
 - 不提供 stdio。
