@@ -15,6 +15,7 @@ export interface ToolInvocationAuditEventBase {
   invocationId: string;
   transport: "streamable_http";
   toolName: string;
+  subjectHash?: string;
   action?: "view" | "approve" | "reject";
 }
 
@@ -123,7 +124,7 @@ export class DailyJsonLineAuditStore implements AuditPersistenceMonitor {
     this.#failureVersion += 1;
   }
 
-  append(type: "approval_audit" | "mcp_tool_invocation", event: object): Promise<void> {
+  append(type: "approval_audit" | "mcp_tool_invocation" | "oauth_security", event: object): Promise<void> {
     return this.#enqueue(async () => {
       const now = this.#now();
       await mkdir(this.#root, { recursive: true, mode: 0o700 });

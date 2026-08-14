@@ -8,6 +8,7 @@ import type { NextFunction, Request, Response } from "express";
 
 import type { ApprovalService } from "../approval/service.js";
 import type { McpAuthorizationModule } from "../auth/mcp-authorization.js";
+import type { AuditPseudonymizer } from "../auth/security-audit.js";
 import { createApprovalMcpServer } from "../mcp/create-server.js";
 import type { AuditInvocationContext, ToolInvocationAuditSink } from "../core/audit-log.js";
 
@@ -19,6 +20,7 @@ export interface ApprovalHttpOptions {
   auth: McpAuthorizationModule;
   toolAudit?: ToolInvocationAuditSink;
   auditContext?: AuditInvocationContext;
+  auditPseudonymizer?: AuditPseudonymizer;
 }
 
 export interface RunningApprovalHttpServer {
@@ -85,6 +87,9 @@ async function handleMcpRequest(
   const server = createApprovalMcpServer(callerService, {
     ...(options.toolAudit === undefined ? {} : { toolAudit: options.toolAudit }),
     ...(options.auditContext === undefined ? {} : { auditContext: options.auditContext }),
+    ...(options.auditPseudonymizer === undefined
+      ? {}
+      : { auditSubjectHash: options.auditPseudonymizer.subject(principal.tenantId, principal.subject) }),
   });
   const transport = new StreamableHTTPServerTransport();
   let closed = false;

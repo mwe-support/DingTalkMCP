@@ -125,6 +125,7 @@ async function fixture(): Promise<{
     keyId: "test-key",
     issuer: "https://dingtalk.mwexk.com/",
     audience: resource,
+    expectedTenantId: "corp-1",
     accessTokenTtlSeconds: 600,
   });
   const auth = createMcpAuthorization({

@@ -12,6 +12,7 @@ const requiredEnvironment = {
   MCP_ISSUER_URL: "https://dingtalk.mwexk.com/",
   DINGTALK_OAUTH_REDIRECT_URL: "https://dingtalk.mwexk.com/oauth/dingtalk/callback",
   MCP_SIGNING_PRIVATE_KEY_FILE: "./secrets/mcp-signing-private.pem",
+  MCP_AUDIT_HMAC_KEY_FILE: "./secrets/mcp-audit-hmac.key",
 };
 
 describe("loadConfig", () => {
@@ -38,6 +39,7 @@ describe("loadConfig", () => {
       corpId: "ding-corp-1",
       signingPrivateKeyPath: resolve("./secrets/mcp-signing-private.pem"),
       signingKeyId: "mwe-approval-mcp-1",
+      auditHmacKeyPath: resolve("./secrets/mcp-audit-hmac.key"),
       authStorePath: resolve("./data/auth"),
       accessTokenTtlSeconds: 600,
       refreshTokenTtlSeconds: 28_800,
@@ -53,5 +55,14 @@ describe("loadConfig", () => {
         MCP_PUBLIC_URL: "https://dingtalk.mwexk.com/platform/tools/approval_task",
       }),
     ).toThrow("MCP_PUBLIC_URL must use the exact /mcp path");
+  });
+
+  it("rejects a DingTalk OAuth callback URL with the wrong path", () => {
+    expect(() =>
+      loadConfig({
+        ...requiredEnvironment,
+        DINGTALK_OAUTH_REDIRECT_URL: "https://dingtalk.mwexk.com/oauth/wrong-callback",
+      }),
+    ).toThrow("DINGTALK_OAUTH_REDIRECT_URL must use the exact /oauth/dingtalk/callback path");
   });
 });

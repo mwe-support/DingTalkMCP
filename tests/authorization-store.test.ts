@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -61,6 +61,33 @@ describe("DirectoryAuthorizationStore", () => {
     const serialized = await readFile(join(root, "authorization-state.json"), "utf8");
     expect(serialized).not.toContain("raw-refresh-1");
     expect(serialized).not.toContain("raw-refresh-2");
+  });
+
+  it("expires dynamically registered clients and removes them during pruning", async () => {
+    const root = await temporaryRoot();
+    let now = 1_800_000_000;
+    const store = new DirectoryAuthorizationStore(root, {
+      now: () => now,
+      clientTtlSeconds: 60,
+    });
+    const client = publicClient();
+    await store.registerClient(client);
+    now += 61;
+
+    await store.prune();
+
+    await expect(store.getClient(client.client_id)).resolves.toBeUndefined();
+  });
+
+  it("rejects oversized client metadata and oversized persisted state", async () => {
+    const root = await temporaryRoot();
+    const store = new DirectoryAuthorizationStore(root, { now: () => 1_800_000_000 });
+    await expect(store.registerClient({ ...publicClient(), client_name: "x".repeat(20_000) })).rejects.toThrow(
+      "metadata",
+    );
+
+    await writeFile(join(root, "authorization-state.json"), "x".repeat(5 * 1024 * 1024));
+    await expect(store.getClient("client-1")).rejects.toThrow("size limit");
   });
 });
 

@@ -66,10 +66,11 @@ codex mcp login mwe_approval_mcp
 
 1. 确认 metadata 两个 URL 返回 200。
 2. 添加客户端配置并触发连接。
-3. 浏览器跳转到 `login.dingtalk.com`，使用公司当前账号授权。
-4. 确认回调最终回到客户端 loopback URI，而不是停留在本站 callback。
-5. `tools/list` 应只显示 `approval_task`。
-6. 先用一个该用户确实参与的实例测试：
+3. 若客户端请求 `approval:decide`，先在本站权限页核对客户端名称与决定权限并明确同意；只读 scope 不显示该页。
+4. 浏览器跳转到 `login.dingtalk.com`，使用公司当前账号授权。
+5. 确认回调最终回到客户端 loopback URI，而不是停留在本站 callback。
+6. `tools/list` 应只显示 `approval_task`。
+7. 先用一个该用户确实参与的实例测试：
 
    ```json
    {
@@ -78,8 +79,8 @@ codex mcp login mwe_approval_mcp
    }
    ```
 
-7. 使用详情返回的 `fileId` 测试 `attachmentAction=download`；Agent 客户端负责下载和识别内容。
-8. 写操作先使用 `dryRun=true`；确认任务仍属于当前 OAuth 用户后，再由用户明确授权 `confirm=true`。
+8. 使用详情返回的 `fileId` 测试 `attachmentAction=download`；Agent 客户端负责下载和识别内容。
+9. 写操作先使用 `dryRun=true`；确认任务仍属于当前 OAuth 用户后，再由用户明确授权 `confirm=true`。
 
 ## 预期失败含义
 

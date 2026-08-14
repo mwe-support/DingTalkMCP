@@ -1,10 +1,11 @@
 import { readFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 
-import { DirectoryAuthorizationStore } from "../auth/authorization-store.js";
+import { DirectoryAuthorizationStore, startAuthorizationStoreSweep } from "../auth/authorization-store.js";
 import { DingTalkOAuthIdentityAdapter } from "../auth/dingtalk-identity.js";
 import { JoseMcpTokenCodec } from "../auth/jwt-codec.js";
 import { createMcpAuthorization } from "../auth/mcp-authorization.js";
+import { AuditPseudonymizer, BoundedSecurityAuditSink, RetainedSecurityAuditSink } from "../auth/security-audit.js";
 import { loadConfig } from "../config.js";
 import {
   BoundedApprovalAuditSink,
@@ -35,11 +36,14 @@ async function main(): Promise<void> {
     }),
   });
   const privateKeyPem = await readFile(config.auth.signingPrivateKeyPath, "utf8");
+  const auditHmacKey = (await readFile(config.auth.auditHmacKeyPath, "utf8")).trim();
+  const auditPseudonymizer = new AuditPseudonymizer(auditHmacKey);
   const tokenCodec = await JoseMcpTokenCodec.create({
     privateKeyPem,
     keyId: config.auth.signingKeyId,
     issuer: config.auth.issuerUrl,
     audience: config.auth.publicUrl,
+    expectedTenantId: config.auth.corpId,
     accessTokenTtlSeconds: config.auth.accessTokenTtlSeconds,
   });
   const identity = new DingTalkOAuthIdentityAdapter({
@@ -49,6 +53,12 @@ async function main(): Promise<void> {
     redirectUrl: config.auth.redirectUrl,
     apiBaseUrl: config.apiBaseUrl,
     applicationApi: runtime.api,
+  });
+  const authorizationStore = new DirectoryAuthorizationStore(config.auth.authStorePath);
+  const authorizationSweep = await startAuthorizationStoreSweep(authorizationStore, {
+    onError: () => {
+      process.stderr.write("Authorization state retention sweep failed.\n");
+    },
   });
   const auth = createMcpAuthorization({
     issuerUrl: new URL(config.auth.issuerUrl),
@@ -60,8 +70,9 @@ async function main(): Promise<void> {
     refreshTokenTtlSeconds: config.auth.refreshTokenTtlSeconds,
     transactionTtlSeconds: config.auth.transactionTtlSeconds,
     identity,
-    store: new DirectoryAuthorizationStore(config.auth.authStorePath),
+    store: authorizationStore,
     tokenCodec,
+    securityAudit: new BoundedSecurityAuditSink(new RetainedSecurityAuditSink(auditStore, auditPseudonymizer)),
   });
   const running = await startApprovalHttpServer(runtime.service, {
     host,
@@ -70,6 +81,7 @@ async function main(): Promise<void> {
     allowedOrigins: [new URL(config.auth.publicUrl).origin],
     auth,
     auditContext,
+    auditPseudonymizer,
     toolAudit: new RetainedToolInvocationAuditSink(auditStore),
   });
   const address = running.httpServer.address() as AddressInfo;
@@ -77,6 +89,7 @@ async function main(): Promise<void> {
 
   const shutdown = (): void => {
     retentionSweep.close();
+    authorizationSweep.close();
     void running.close().finally(() => process.exit(0));
   };
   process.once("SIGINT", shutdown);

@@ -11,6 +11,7 @@ services:
       MCP_ISSUER_URL: https://dingtalk.mwexk.com/
       DINGTALK_OAUTH_REDIRECT_URL: https://dingtalk.mwexk.com/oauth/dingtalk/callback
       MCP_SIGNING_PRIVATE_KEY_FILE: /run/secrets/mcp-signing-private.pem
+      MCP_AUDIT_HMAC_KEY_FILE: /run/secrets/mcp-audit-hmac.key
       MCP_SIGNING_KEY_ID: ${MCP_SIGNING_KEY_ID:-mwe-approval-mcp-1}
       MCP_ACCESS_TOKEN_TTL_SECONDS: ${MCP_ACCESS_TOKEN_TTL_SECONDS:-600}
       MCP_REFRESH_TOKEN_TTL_SECONDS: ${MCP_REFRESH_TOKEN_TTL_SECONDS:-28800}
@@ -25,10 +26,11 @@ services:
       APPROVAL_BACKEND_PORT: 3000
       APPROVAL_BACKEND_ALLOWED_HOSTS: dingtalk.mwexk.com
     ports:
-      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:${APPROVAL_HOST_PORT:-3000}:3000"
     volumes:
       - approval_mcp_data:/app/data
       - ./secrets/mcp-signing-private.pem:/run/secrets/mcp-signing-private.pem:ro
+      - ./secrets/mcp-audit-hmac.key:/run/secrets/mcp-audit-hmac.key:ro
 
 volumes:
   approval_mcp_data:

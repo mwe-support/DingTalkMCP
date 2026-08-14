@@ -3,7 +3,7 @@ import type { AddressInfo } from "node:net";
 
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   createMcpAuthorization,
@@ -11,6 +11,7 @@ import {
   type DingTalkIdentityPort,
 } from "../src/auth/mcp-authorization.js";
 import { JoseMcpTokenCodec } from "../src/auth/jwt-codec.js";
+import type { SecurityAuditEventInput } from "../src/auth/security-audit.js";
 
 const resource = "https://dingtalk.mwexk.com/mcp";
 const issuer = "https://dingtalk.mwexk.com/";
@@ -27,7 +28,7 @@ afterEach(async () => {
 
 describe("createMcpAuthorization", () => {
   it("completes DingTalk-backed OAuth with PKCE and protects a resource-bound route", async () => {
-    const { baseUrl } = await fixture();
+    const { baseUrl, securityEvents } = await fixture();
     const client = await registerPublicClient(baseUrl);
     const verifier = "workbuddy-codex-verifier-that-is-long-enough-1234567890";
     const challenge = createHash("sha256").update(verifier).digest("base64url");
@@ -44,8 +45,11 @@ describe("createMcpAuthorization", () => {
       state: "client-state-1",
     }).toString();
     const start = await fetch(authorize, { redirect: "manual" });
-    expect(start.status).toBe(302);
-    const dingtalkLocation = new URL(requiredHeader(start, "location"));
+    expect(start.status).toBe(200);
+    const consentHtml = await start.text();
+    expect(consentHtml).toContain("OAuth test client");
+    expect(consentHtml).toContain("approval:decide");
+    const dingtalkLocation = await submitConsent(baseUrl, consentHtml, "approve");
     expect(dingtalkLocation.origin).toBe("https://login.dingtalk.test");
 
     const callback = new URL("/oauth/dingtalk/callback", baseUrl);
@@ -82,10 +86,37 @@ describe("createMcpAuthorization", () => {
       scopes: ["approval:read", "approval:decide"],
       authenticatedAt: 1_800_000_000,
     });
+    expect(securityEvents).toEqual(expect.arrayContaining([
+      expect.objectContaining({ event: "consent_approved", outcome: "succeeded" }),
+      expect.objectContaining({ event: "login_succeeded", outcome: "succeeded", subject: "union-1" }),
+    ]));
+  });
+
+  it("does not start DingTalk login when the user denies approval decision scope", async () => {
+    const { baseUrl, identity } = await fixture();
+    const client = await registerPublicClient(baseUrl);
+    const authorize = new URL("/authorize", baseUrl);
+    authorize.search = new URLSearchParams({
+      response_type: "code",
+      client_id: client.client_id,
+      redirect_uri: redirectUri,
+      code_challenge: createHash("sha256").update("verifier-that-is-long-enough-1234567890").digest("base64url"),
+      code_challenge_method: "S256",
+      resource,
+      scope: "approval:read approval:decide",
+      state: "client-denied-state",
+    }).toString();
+    const start = await fetch(authorize, { redirect: "manual" });
+    const denied = await submitConsent(baseUrl, await start.text(), "deny");
+
+    expect(denied.origin + denied.pathname).toBe(redirectUri);
+    expect(denied.searchParams.get("error")).toBe("access_denied");
+    expect(denied.searchParams.get("state")).toBe("client-denied-state");
+    expect(identity.authorizationUrl).not.toHaveBeenCalled();
   });
 
   it("rotates refresh tokens and revokes the family when an old token is replayed", async () => {
-    const { baseUrl } = await fixture();
+    const { baseUrl, securityEvents } = await fixture();
     const client = await registerPublicClient(baseUrl);
     const initial = await completeLogin(baseUrl, client.client_id);
 
@@ -117,21 +148,27 @@ describe("createMcpAuthorization", () => {
     });
     expect(familyRevoked.status).toBe(400);
     expect(await familyRevoked.json()).toMatchObject({ error: "invalid_grant" });
+    expect(securityEvents).toContainEqual(expect.objectContaining({ event: "refresh_replay", outcome: "rejected" }));
   });
 });
 
-async function fixture(): Promise<{ baseUrl: URL }> {
+async function fixture(): Promise<{
+  baseUrl: URL;
+  securityEvents: SecurityAuditEventInput[];
+  identity: { authorizationUrl: ReturnType<typeof vi.fn>; verifyAuthorizationCode: DingTalkIdentityPort["verifyAuthorizationCode"] };
+}> {
   const { privateKey } = generateKeyPairSync("ed25519");
   const tokenCodec = await JoseMcpTokenCodec.create({
     privateKeyPem: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
     keyId: "test-key",
     issuer,
     audience: resource,
+    expectedTenantId: "corp-1",
     accessTokenTtlSeconds: 600,
     now: () => 1_800_000_000,
   });
-  const identity: DingTalkIdentityPort = {
-    authorizationUrl: (state) => new URL(`https://login.dingtalk.test/oauth?state=${encodeURIComponent(state)}`),
+  const identity = {
+    authorizationUrl: vi.fn((state: string) => new URL(`https://login.dingtalk.test/oauth?state=${encodeURIComponent(state)}`)),
     verifyAuthorizationCode: async (code) => {
       if (code !== "valid-dingtalk-code") throw new Error("invalid code");
       return {
@@ -141,7 +178,8 @@ async function fixture(): Promise<{ baseUrl: URL }> {
         authenticatedAt: 1_800_000_000,
       };
     },
-  };
+  } satisfies DingTalkIdentityPort;
+  const securityEvents: SecurityAuditEventInput[] = [];
   const auth = createMcpAuthorization({
     issuerUrl: new URL(issuer),
     resourceUrl: new URL(resource),
@@ -154,6 +192,7 @@ async function fixture(): Promise<{ baseUrl: URL }> {
     identity,
     store: new InMemoryAuthorizationStore({ now: () => 1_800_000_000 }),
     tokenCodec,
+    securityAudit: { record: (event) => { securityEvents.push(event); } },
     now: () => 1_800_000_000,
   });
   const app = createMcpExpressApp({ host: "127.0.0.1" });
@@ -169,7 +208,20 @@ async function fixture(): Promise<{ baseUrl: URL }> {
     server.once("error", reject);
   });
   const address = server.address() as AddressInfo;
-  return { baseUrl: new URL(`http://127.0.0.1:${address.port}`) };
+  return { baseUrl: new URL(`http://127.0.0.1:${address.port}`), securityEvents, identity };
+}
+
+async function submitConsent(baseUrl: URL, html: string, decision: "approve" | "deny"): Promise<URL> {
+  const token = /name="consent_token" value="([^"]+)"/u.exec(html)?.[1];
+  if (token === undefined) throw new Error(`Missing consent token: ${html}`);
+  const response = await fetch(new URL("/oauth/consent", baseUrl), {
+    method: "POST",
+    redirect: "manual",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ consent_token: token, decision }),
+  });
+  expect(response.status).toBe(302);
+  return new URL(requiredHeader(response, "location"));
 }
 
 async function registerPublicClient(baseUrl: URL): Promise<{ client_id: string }> {

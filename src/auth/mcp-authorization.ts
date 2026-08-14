@@ -23,6 +23,7 @@ import type {
 
 import type { JoseMcpTokenCodec, TokenIdentity } from "./jwt-codec.js";
 import { MCP_SCOPES, principalFromAuthInfo, type McpPrincipal, type McpScope } from "./types.js";
+import type { SecurityAuditEventInput, SecurityAuditSink } from "./security-audit.js";
 
 export interface DingTalkIdentityPort {
   authorizationUrl(state: string): URL;
@@ -58,6 +59,7 @@ export type RefreshConsumeResult =
   | { status: "missing" };
 
 export interface AuthorizationStore extends OAuthRegisteredClientsStore {
+  prune(): Promise<void>;
   putTransaction(state: string, transaction: AuthorizationTransaction): Promise<void>;
   consumeTransaction(state: string): Promise<AuthorizationTransaction | undefined>;
   putAuthorizationCode(code: string, record: AuthorizationCodeRecord): Promise<void>;
@@ -72,10 +74,19 @@ export interface AuthorizationStore extends OAuthRegisteredClientsStore {
 export interface InMemoryAuthorizationStoreOptions {
   now?: () => number;
   maximumClients?: number;
+  clientTtlSeconds?: number;
+}
+
+export const DEFAULT_DYNAMIC_CLIENT_TTL_SECONDS = 30 * 24 * 60 * 60;
+export const MAX_DYNAMIC_CLIENT_METADATA_BYTES = 16 * 1024;
+
+interface StoredClient {
+  client: OAuthClientInformationFull;
+  expiresAt: number;
 }
 
 export class InMemoryAuthorizationStore implements AuthorizationStore {
-  readonly #clients = new Map<string, OAuthClientInformationFull>();
+  readonly #clients = new Map<string, StoredClient>();
   readonly #transactions = new Map<string, AuthorizationTransaction>();
   readonly #codes = new Map<string, AuthorizationCodeRecord>();
   readonly #refresh = new Map<string, RefreshTokenRecord>();
@@ -83,14 +94,18 @@ export class InMemoryAuthorizationStore implements AuthorizationStore {
   readonly #revokedFamilies = new Set<string>();
   readonly #now: () => number;
   readonly #maximumClients: number;
+  readonly #clientTtlSeconds: number;
 
   constructor(options: InMemoryAuthorizationStoreOptions = {}) {
     this.#now = options.now ?? (() => Math.floor(Date.now() / 1000));
     this.#maximumClients = options.maximumClients ?? 1000;
+    this.#clientTtlSeconds = options.clientTtlSeconds ?? DEFAULT_DYNAMIC_CLIENT_TTL_SECONDS;
   }
 
   getClient(clientId: string): OAuthClientInformationFull | undefined {
-    return this.#clients.get(clientId);
+    this.#prune();
+    const stored = this.#clients.get(clientId);
+    return stored === undefined ? undefined : structuredClone(stored.client);
   }
 
   registerClient(
@@ -98,11 +113,19 @@ export class InMemoryAuthorizationStore implements AuthorizationStore {
   ): OAuthClientInformationFull {
     const full = client as OAuthClientInformationFull;
     validateDynamicClientRegistration(full);
+    this.#prune();
     if (this.#clients.size >= this.#maximumClients && !this.#clients.has(full.client_id)) {
       throw new InvalidClientMetadataError("The dynamic client registration limit has been reached.");
     }
-    this.#clients.set(full.client_id, structuredClone(full));
+    this.#clients.set(full.client_id, {
+      client: structuredClone(full),
+      expiresAt: this.#now() + this.#clientTtlSeconds,
+    });
     return structuredClone(full);
+  }
+
+  async prune(): Promise<void> {
+    this.#prune();
   }
 
   async putTransaction(state: string, transaction: AuthorizationTransaction): Promise<void> {
@@ -164,6 +187,13 @@ export class InMemoryAuthorizationStore implements AuthorizationStore {
     const familyId = this.#refresh.get(key)?.familyId ?? this.#spentRefresh.get(key);
     if (familyId !== undefined) this.#revokedFamilies.add(familyId);
   }
+
+  #prune(): void {
+    const now = this.#now();
+    for (const [clientId, stored] of this.#clients) {
+      if (stored.expiresAt < now) this.#clients.delete(clientId);
+    }
+  }
 }
 
 export interface CreateMcpAuthorizationOptions {
@@ -178,6 +208,7 @@ export interface CreateMcpAuthorizationOptions {
   identity: DingTalkIdentityPort;
   store: AuthorizationStore;
   tokenCodec: JoseMcpTokenCodec;
+  securityAudit?: SecurityAuditSink;
   now?: () => number;
   randomToken?: () => string;
 }
@@ -193,6 +224,17 @@ export function createMcpAuthorization(options: CreateMcpAuthorizationOptions): 
   const randomToken = options.randomToken ?? (() => randomBytes(32).toString("base64url"));
   const provider = new DingTalkBackedOAuthProvider(options, now, randomToken);
   const router = express.Router();
+
+  router.post("/oauth/consent", express.urlencoded({ extended: false, limit: "8kb" }), async (request, response) => {
+    response.setHeader("cache-control", "no-store");
+    const token = singleBodyValue(request.body, "consent_token");
+    const decision = singleBodyValue(request.body, "decision");
+    if (token === undefined || (decision !== "approve" && decision !== "deny")) {
+      response.status(400).json({ error: "invalid_request", error_description: "Invalid consent response." });
+      return;
+    }
+    await provider.continueAfterConsent(token, decision, response);
+  });
 
   router.get("/oauth/dingtalk/callback", async (request, response) => {
     response.setHeader("cache-control", "no-store");
@@ -210,8 +252,23 @@ export function createMcpAuthorization(options: CreateMcpAuthorizationOptions): 
     try {
       const principal = await options.identity.verifyAuthorizationCode(authCode);
       if (principal.tenantId !== options.expectedCorpId) {
+        await recordSecurity(options.securityAudit, {
+          event: "tenant_mismatch",
+          outcome: "rejected",
+          tenantId: principal.tenantId,
+          subject: principal.subject,
+          clientId: transaction.clientId,
+          reasonCode: "TENANT_MISMATCH",
+        });
         throw new AccessDeniedError("The DingTalk user does not belong to the configured enterprise.");
       }
+      await recordSecurity(options.securityAudit, {
+        event: "login_succeeded",
+        outcome: "succeeded",
+        tenantId: principal.tenantId,
+        subject: principal.subject,
+        clientId: transaction.clientId,
+      });
       const localCode = randomToken();
       await options.store.putAuthorizationCode(localCode, { ...transaction, principal });
       const target = new URL(transaction.redirectUri);
@@ -219,6 +276,12 @@ export function createMcpAuthorization(options: CreateMcpAuthorizationOptions): 
       if (transaction.clientState !== undefined) target.searchParams.set("state", transaction.clientState);
       response.redirect(302, target.href);
     } catch {
+      await recordSecurity(options.securityAudit, {
+        event: "login_failed",
+        outcome: "failed",
+        clientId: transaction.clientId,
+        reasonCode: "DINGTALK_IDENTITY_VERIFICATION_FAILED",
+      }).catch(() => undefined);
       const target = new URL(transaction.redirectUri);
       target.searchParams.set("error", "access_denied");
       target.searchParams.set("error_description", "DingTalk identity verification failed.");
@@ -268,7 +331,18 @@ class DingTalkBackedOAuthProvider implements OAuthServerProvider {
 
   async authorize(client: OAuthClientInformationFull, params: AuthorizationParams, response: express.Response): Promise<void> {
     const resource = this.#validateResource(params.resource);
-    const scopes = this.#validateScopes(params.scopes);
+    let scopes: McpScope[];
+    try {
+      scopes = this.#validateScopes(params.scopes);
+    } catch (error) {
+      await recordSecurity(this.#options.securityAudit, {
+        event: "scope_rejected",
+        outcome: "rejected",
+        clientId: client.client_id,
+        reasonCode: "INVALID_SCOPE",
+      }).catch(() => undefined);
+      throw error;
+    }
     const upstreamState = this.#randomToken();
     await this.#options.store.putTransaction(upstreamState, {
       clientId: client.client_id,
@@ -279,6 +353,44 @@ class DingTalkBackedOAuthProvider implements OAuthServerProvider {
       scopes,
       expiresAt: this.#now() + this.#options.transactionTtlSeconds,
     });
+    if (scopes.includes("approval:decide")) {
+      renderConsent(response, client, upstreamState, scopes);
+      return;
+    }
+    response.redirect(302, this.#options.identity.authorizationUrl(upstreamState).href);
+  }
+
+  async continueAfterConsent(
+    consentToken: string,
+    decision: "approve" | "deny",
+    response: express.Response,
+  ): Promise<void> {
+    const transaction = await this.#options.store.consumeTransaction(consentToken);
+    if (transaction === undefined) {
+      response.status(400).json({ error: "invalid_request", error_description: "Consent is invalid or expired." });
+      return;
+    }
+    if (decision === "deny") {
+      await recordSecurity(this.#options.securityAudit, {
+        event: "consent_denied",
+        outcome: "rejected",
+        clientId: transaction.clientId,
+        reasonCode: "USER_DENIED_DECISION_SCOPE",
+      }).catch(() => undefined);
+      const target = new URL(transaction.redirectUri);
+      target.searchParams.set("error", "access_denied");
+      target.searchParams.set("error_description", "The user denied approval decision access.");
+      if (transaction.clientState !== undefined) target.searchParams.set("state", transaction.clientState);
+      response.redirect(302, target.href);
+      return;
+    }
+    await recordSecurity(this.#options.securityAudit, {
+      event: "consent_approved",
+      outcome: "succeeded",
+      clientId: transaction.clientId,
+    });
+    const upstreamState = this.#randomToken();
+    await this.#options.store.putTransaction(upstreamState, transaction);
     response.redirect(302, this.#options.identity.authorizationUrl(upstreamState).href);
   }
 
@@ -317,6 +429,14 @@ class DingTalkBackedOAuthProvider implements OAuthServerProvider {
   ): Promise<OAuthTokens> {
     const consumed = await this.#options.store.consumeRefreshToken(refreshToken);
     if (consumed.status !== "active") {
+      if (consumed.status === "replayed") {
+        await recordSecurity(this.#options.securityAudit, {
+          event: "refresh_replay",
+          outcome: "rejected",
+          clientId: client.client_id,
+          reasonCode: "REFRESH_TOKEN_REPLAY",
+        }).catch(() => undefined);
+      }
       throw new InvalidGrantError("Refresh token is invalid, expired, revoked, or replayed.");
     }
     const record = consumed.record;
@@ -347,6 +467,11 @@ class DingTalkBackedOAuthProvider implements OAuthServerProvider {
 
   async revokeToken(_client: OAuthClientInformationFull, request: OAuthTokenRevocationRequest): Promise<void> {
     await this.#options.store.revokeRefreshToken(request.token);
+    await recordSecurity(this.#options.securityAudit, {
+      event: "token_revoked",
+      outcome: "succeeded",
+      clientId: _client.client_id,
+    });
   }
 
   #validateResource(resource: URL | undefined): string {
@@ -402,6 +527,45 @@ function singleQueryValue(value: unknown): string | undefined {
   return typeof value === "string" && value !== "" ? value : undefined;
 }
 
+function singleBodyValue(body: unknown, key: string): string | undefined {
+  if (!isPlainRecord(body)) return undefined;
+  const value = body[key];
+  return typeof value === "string" && value !== "" ? value : undefined;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function renderConsent(
+  response: express.Response,
+  client: OAuthClientInformationFull,
+  consentToken: string,
+  scopes: readonly McpScope[],
+): void {
+  response.setHeader("cache-control", "no-store");
+  response.setHeader("content-security-policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
+  response.setHeader("x-frame-options", "DENY");
+  response.setHeader("referrer-policy", "no-referrer");
+  const clientName = escapeHtml(client.client_name ?? client.client_id);
+  const scopeItems = scopes.map((scope) => `<li><code>${escapeHtml(scope)}</code></li>`).join("");
+  response.status(200).type("html").send(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>MWE审批MCP 授权</title></head><body><main><h1>MWE审批MCP 权限确认</h1><p>客户端 <strong>${clientName}</strong> 请求以下权限：</p><ul>${scopeItems}</ul><p><strong>approval:decide</strong> 允许客户端代表你同意或拒绝分配给你的审批任务。</p><form method="post" action="/oauth/consent"><input type="hidden" name="consent_token" value="${escapeHtml(consentToken)}"><button type="submit" name="decision" value="approve">同意并使用钉钉登录</button><button type="submit" name="decision" value="deny">拒绝</button></form></main></body></html>`);
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/gu, (character) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  })[character] ?? character);
+}
+
+function recordSecurity(sink: SecurityAuditSink | undefined, event: SecurityAuditEventInput): Promise<void> {
+  return Promise.resolve(sink?.record(event));
+}
+
 function validateRedirectUri(value: string): void {
   let url: URL;
   try {
@@ -418,6 +582,9 @@ function validateRedirectUri(value: string): void {
 }
 
 export function validateDynamicClientRegistration(client: OAuthClientInformationFull): void {
+  if (Buffer.byteLength(JSON.stringify(client), "utf8") > MAX_DYNAMIC_CLIENT_METADATA_BYTES) {
+    throw new InvalidClientMetadataError("Dynamic client metadata exceeds the size limit.");
+  }
   if (client.client_id === undefined || client.client_id === "") {
     throw new InvalidClientMetadataError("Generated client_id is missing.");
   }

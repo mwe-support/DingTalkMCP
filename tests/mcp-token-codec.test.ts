@@ -54,6 +54,22 @@ describe("JoseMcpTokenCodec", () => {
 
     await expect(verifyingCodec.verifyAccessToken(token)).rejects.toThrow("Invalid MCP access token");
   });
+
+  it("rejects a token carrying another DingTalk enterprise tenant", async () => {
+    const { codec } = await fixture(1_800_000_000);
+    const token = await codec.issue({
+      principal: {
+        subject: "union-attacker",
+        tenantId: "corp-other",
+        userId: "user-attacker",
+        authenticatedAt: 1_799_999_900,
+      },
+      clientId: "client-1",
+      scopes: ["approval:read"],
+    });
+
+    await expect(codec.verifyAccessToken(token)).rejects.toThrow("Invalid MCP access token");
+  });
 });
 
 async function fixture(
@@ -69,6 +85,7 @@ async function fixture(
       keyId: "test-key-1",
       issuer,
       audience,
+      expectedTenantId: "corp-1",
       accessTokenTtlSeconds: 600,
       now: () => nowSeconds,
     }),

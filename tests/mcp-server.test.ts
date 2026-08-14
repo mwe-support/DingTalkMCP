@@ -152,6 +152,69 @@ describe("approval MCP public contract", () => {
     expect(request).not.toHaveBeenCalled();
   });
 
+  it("audits unknown tools and invalid arguments before public dispatch", async () => {
+    const events: Array<Record<string, unknown>> = [];
+    const service = new ApprovalService({ api: { request: vi.fn() } as unknown as Pick<DingTalkApiClient, "request"> });
+    const server = createApprovalMcpServer(service, {
+      toolAudit: { record: (event) => void events.push(event as unknown as Record<string, unknown>) },
+    });
+    const client = new Client({ name: "approval-invalid-audit-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    closeables.push(client, server);
+
+    await client.callTool({ name: "not_a_public_tool", arguments: {} });
+    await client.callTool({ name: "approval_task", arguments: { action: "view" } });
+
+    expect(events).toEqual([
+      expect.objectContaining({ phase: "started", toolName: "unknown" }),
+      expect.objectContaining({ phase: "completed", outcome: "unknown_tool", errorCode: "UNKNOWN_TOOL" }),
+      expect.objectContaining({ phase: "started", toolName: "approval_task", action: "view" }),
+      expect.objectContaining({ phase: "completed", outcome: "rejected", errorCode: "INVALID_INPUT" }),
+    ]);
+  });
+
+  it("preserves a successful business result and marks it partial when completion audit persistence fails", async () => {
+    let writes = 0;
+    const service = new ApprovalService({
+      api: {
+        request: vi.fn().mockResolvedValue({
+          result: {
+            processInstanceId: "pi-partial",
+            status: "RUNNING",
+            tasks: [{ taskId: "task-1", userId: "user-1", status: "RUNNING" }],
+          },
+        }),
+      } as unknown as Pick<DingTalkApiClient, "request">,
+      callerUserId: "user-1",
+    });
+    const server = createApprovalMcpServer(service, {
+      toolAudit: {
+        record: () => {
+          writes += 1;
+          return writes === 1 ? undefined : Promise.reject(new Error("completion unavailable"));
+        },
+      },
+    });
+    const client = new Client({ name: "approval-partial-audit-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    closeables.push(client, server);
+
+    const result = await client.callTool({
+      name: "approval_task",
+      arguments: { action: "view", processInstanceId: "pi-partial" },
+    });
+
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      auditStatus: "partial",
+      result: { processInstanceId: "pi-partial" },
+    });
+  });
+
   it("returns approval content, actionable state, comments, and attachment metadata through action=view", async () => {
     const { client, request } = await connectedPublicClient({
       result: {

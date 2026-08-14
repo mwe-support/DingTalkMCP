@@ -23,6 +23,7 @@ export interface JoseMcpTokenCodecOptions {
   keyId: string;
   issuer: string;
   audience: string;
+  expectedTenantId: string;
   accessTokenTtlSeconds: number;
   now?: () => number;
 }
@@ -33,6 +34,7 @@ export class JoseMcpTokenCodec {
   readonly #keyId: string;
   readonly #issuer: string;
   readonly #audience: string;
+  readonly #expectedTenantId: string;
   readonly #accessTokenTtlSeconds: number;
   readonly #now: () => number;
 
@@ -47,6 +49,7 @@ export class JoseMcpTokenCodec {
     this.#keyId = options.keyId;
     this.#issuer = options.issuer;
     this.#audience = options.audience;
+    this.#expectedTenantId = options.expectedTenantId;
     this.#accessTokenTtlSeconds = options.accessTokenTtlSeconds;
     this.#now = options.now ?? (() => Math.floor(Date.now() / 1000));
   }
@@ -90,13 +93,18 @@ export class JoseMcpTokenCodec {
         currentDate: new Date(this.#now() * 1000),
         clockTolerance: 60,
         typ: "at+jwt",
+        requiredClaims: ["sub", "tid", "uid", "client_id", "scope", "auth_time", "jti", "iat", "nbf", "exp"],
       });
       if (protectedHeader.kid !== this.#keyId) throw new Error("Unknown signing key.");
       const subject = requiredString(payload.sub, "sub");
       const tenantId = requiredString(payload.tid, "tid");
+      if (tenantId !== this.#expectedTenantId) throw new Error("Unexpected tenant claim.");
       const userId = requiredString(payload.uid, "uid");
       const clientId = requiredString(payload.client_id, "client_id");
       const authenticatedAt = requiredInteger(payload.auth_time, "auth_time");
+      requiredString(payload.jti, "jti");
+      requiredInteger(payload.iat, "iat");
+      requiredInteger(payload.nbf, "nbf");
       const expiresAt = requiredInteger(payload.exp, "exp");
       const scopes = parseScopes(payload.scope);
       return {

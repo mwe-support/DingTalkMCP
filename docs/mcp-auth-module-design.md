@@ -250,7 +250,7 @@ DINGTALK_CORP_ID=<目标企业 corpId>
 DINGTALK_OAUTH_REDIRECT_URL=https://dingtalk.mwexk.com/oauth/dingtalk/callback
 MCP_SIGNING_PRIVATE_KEY_FILE=/run/secrets/mcp_signing_private_key.pem
 MCP_SIGNING_KEY_ID=<版本化 kid>
-MCP_AUTH_STORE_ENCRYPTION_KEY_FILE=/run/secrets/mcp_auth_store_key
+MCP_AUDIT_HMAC_KEY_FILE=/run/secrets/mcp_audit_hmac_key
 MCP_ACCESS_TOKEN_TTL_SECONDS=600
 MCP_REFRESH_TOKEN_TTL_SECONDS=28800
 MCP_AUTH_TRANSACTION_TTL_SECONDS=300
@@ -265,7 +265,7 @@ DINGTALK_CLIENT_ID=<MWE审批MCP App ID/AppKey>
 DINGTALK_CLIENT_SECRET=<MWE审批MCP App Secret/AppSecret>
 ```
 
-私钥、App Secret 和任何平台兼容 API key 使用 Docker Secret 或权限严格的宿主机 secret 文件挂载，不进入镜像、Compose 明文、Git、日志或审计。
+签名私钥、审计 HMAC key 与 App Secret 使用 Docker Secret 或权限严格的宿主机 secret 文件挂载，不进入镜像、Compose 明文、Git、日志或审计。当前只接受公共 PKCE 客户端，不生成或存储 confidential client secret。
 
 钉钉开发者后台需要精确配置 OAuth 回调 URI，并确认应用具备“登录用户身份/个人信息”和 unionId 映射 userId 所需权限。审批 OpenAPI 权限继续按已有企业应用配置管理，两者不要混为一个 scope 列表。
 

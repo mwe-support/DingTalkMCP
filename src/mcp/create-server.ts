@@ -1,9 +1,12 @@
 import { randomUUID } from "node:crypto";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import * as z from "zod/v4";
 
-import type { ApprovalService, ApprovalTaskInput } from "../approval/service.js";
+import type { ApprovalService } from "../approval/service.js";
 import { ApprovalMcpError, errorPayload } from "../core/errors.js";
 import {
   DEFAULT_AUDIT_WRITE_TIMEOUT_MS,
@@ -83,12 +86,21 @@ export interface ApprovalMcpServerOptions {
   toolAudit?: ToolInvocationAuditSink;
   auditContext?: AuditInvocationContext;
   auditWriteTimeoutMs?: number;
+  auditSubjectHash?: string;
+}
+
+export interface ApprovalMcpConnectable {
+  connect(transport: Transport): Promise<void>;
+  close(): Promise<void>;
 }
 
 export function createApprovalMcpServer(
   service: ApprovalService,
   options: ApprovalMcpServerOptions = {},
-): McpServer {
+): ApprovalMcpConnectable {
+  if (options.includeCompatibilityTools !== true) {
+    return createPublicApprovalMcpServer(service, options);
+  }
   const server = new McpServer({
     name: "mwe-dingtalk-approval-mcp",
     version: APPROVAL_MCP_VERSION,
@@ -103,10 +115,8 @@ export function createApprovalMcpServer(
       inputSchema: approvalTaskSchema,
       annotations: writeAnnotations,
     },
-    async (input) => auditedApprovalTask(options, input, () => service.approvalTask(input)),
+    async (input) => safely(() => service.approvalTask(input)),
   );
-
-  if (options.includeCompatibilityTools !== true) return server;
 
   server.registerTool(
     "get_approval_capabilities",
@@ -365,20 +375,56 @@ export function createApprovalMcpServer(
   return server;
 }
 
-async function auditedApprovalTask(
+function createPublicApprovalMcpServer(
+  service: ApprovalService,
   options: ApprovalMcpServerOptions,
-  input: ApprovalTaskInput,
+): Server {
+  const server = new Server(
+    { name: "mwe-dingtalk-approval-mcp", version: APPROVAL_MCP_VERSION },
+    { capabilities: { tools: {} } },
+  );
+  server.setRequestHandler(ListToolsRequestSchema, () => ({
+    tools: [{
+      name: "approval_task",
+      title: "View or decide an approval task",
+      description:
+        "One approver-facing tool for reading an approval instance and deciding its active task. For attachments, use action=view with attachmentAction=download to receive short-lived links; the Agent client must download and identify or OCR files itself. The MCP server never downloads, parses, or OCRs attachment content. Use action=view before approve or reject.",
+      inputSchema: { ...z.toJSONSchema(approvalTaskSchema), type: "object" },
+      annotations: writeAnnotations,
+    }],
+  }));
+  server.setRequestHandler(CallToolRequestSchema, async (request) =>
+    auditedPublicToolCall(options, request.params.name, request.params.arguments, async () => {
+      if (request.params.name !== "approval_task") {
+        throw new ApprovalMcpError("INVALID_INPUT", "The requested MCP tool is not published.");
+      }
+      const parsed = await approvalTaskSchema.safeParseAsync(request.params.arguments);
+      if (!parsed.success) {
+        throw new ApprovalMcpError("INVALID_INPUT", "approval_task arguments do not match the action contract.");
+      }
+      return service.approvalTask(parsed.data);
+    }),
+  );
+  return server;
+}
+
+async function auditedPublicToolCall(
+  options: ApprovalMcpServerOptions,
+  requestedToolName: string,
+  rawArguments: Record<string, unknown> | undefined,
   operation: () => Promise<unknown>,
 ) {
   if (options.toolAudit === undefined) return safely(operation);
   const invocationId = randomUUID();
   const startedAt = performance.now();
+  const action = boundedAction(rawArguments);
   const base: ToolInvocationAuditEventBase = {
     timestamp: new Date().toISOString(),
     invocationId,
     transport: "streamable_http",
-    toolName: "approval_task",
-    action: input.action,
+    toolName: requestedToolName === "approval_task" ? "approval_task" : "unknown",
+    ...(options.auditSubjectHash === undefined ? {} : { subjectHash: options.auditSubjectHash }),
+    ...(action === undefined ? {} : { action }),
   };
   const timeoutMs = options.auditWriteTimeoutMs ?? DEFAULT_AUDIT_WRITE_TIMEOUT_MS;
   try {
@@ -399,8 +445,9 @@ async function auditedApprovalTask(
   const result = invocationState === undefined || options.auditContext === undefined
     ? await invoke()
     : await options.auditContext.run(invocationState, invoke);
-  const errorCode = toolResultErrorCode(result);
-  const outcome = toolAuditOutcome(errorCode);
+  const resultErrorCode = toolResultErrorCode(result);
+  const errorCode = requestedToolName === "approval_task" ? resultErrorCode : "UNKNOWN_TOOL";
+  const outcome = requestedToolName === "approval_task" ? toolAuditOutcome(errorCode) : "unknown_tool";
   try {
     await runAuditWriteWithinTimeout(
       () => options.toolAudit?.record({
@@ -416,9 +463,23 @@ async function auditedApprovalTask(
       timeoutMs,
     );
   } catch {
-    process.stderr.write("Structured MCP tool audit completion write failed.\n");
+    return markAuditPartial(result);
   }
   return result;
+}
+
+function boundedAction(rawArguments: Record<string, unknown> | undefined): "view" | "approve" | "reject" | undefined {
+  const action = rawArguments?.action;
+  return action === "view" || action === "approve" || action === "reject" ? action : undefined;
+}
+
+function markAuditPartial<T extends Awaited<ReturnType<typeof safely>>>(result: T): T {
+  const structuredContent = isRecord(result.structuredContent) ? { ...result.structuredContent, auditStatus: "partial" } : { auditStatus: "partial" };
+  return {
+    ...result,
+    structuredContent,
+    content: [{ type: "text" as const, text: JSON.stringify(structuredContent) }],
+  } as T;
 }
 
 function toolResultErrorCode(result: Awaited<ReturnType<typeof safely>>): string | undefined {

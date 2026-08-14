@@ -9,6 +9,7 @@ export interface McpAuthConfig {
   corpId: string;
   signingPrivateKeyPath: string;
   signingKeyId: string;
+  auditHmacKeyPath: string;
   authStorePath: string;
   accessTokenTtlSeconds: number;
   refreshTokenTtlSeconds: number;
@@ -60,6 +61,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApprovalMcpCon
       "MCP_PUBLIC_URL, MCP_ISSUER_URL and DINGTALK_OAUTH_REDIRECT_URL must share one origin.",
     );
   }
+  if (
+    redirectUrl.pathname !== "/oauth/dingtalk/callback" ||
+    redirectUrl.search !== "" ||
+    redirectUrl.hash !== ""
+  ) {
+    throw new ApprovalMcpError(
+      "CONFIGURATION_ERROR",
+      "DINGTALK_OAUTH_REDIRECT_URL must use the exact /oauth/dingtalk/callback path.",
+    );
+  }
 
   const accessTokenTtlSeconds = boundedInteger(env.MCP_ACCESS_TOKEN_TTL_SECONDS, 600, 60, 3600, "MCP_ACCESS_TOKEN_TTL_SECONDS");
   const refreshTokenTtlSeconds = boundedInteger(
@@ -100,6 +111,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApprovalMcpCon
       corpId: required(env, "DINGTALK_CORP_ID"),
       signingPrivateKeyPath: resolve(required(env, "MCP_SIGNING_PRIVATE_KEY_FILE")),
       signingKeyId: optional(env.MCP_SIGNING_KEY_ID) ?? "mwe-approval-mcp-1",
+      auditHmacKeyPath: resolve(required(env, "MCP_AUDIT_HMAC_KEY_FILE")),
       authStorePath: resolve(optional(env.MCP_AUTH_STORE_PATH) ?? "./data/auth"),
       accessTokenTtlSeconds,
       refreshTokenTtlSeconds,
