@@ -76,6 +76,7 @@ Body: 工具参数对象
 
 | 工具 | 后端路径 |
 |---|---|
+| `approval_task`（正常 Agent 唯一审批人工具） | `/platform/tools/approval_task` |
 | `get_approval_capabilities` | `/platform/tools/get_approval_capabilities` |
 | `get_approval_instance`（首选组合工具） | `/platform/tools/get_approval_instance` |
 | `get_processInstance_detail` | `/platform/tools/get_processInstance_detail` |
@@ -94,7 +95,14 @@ Body: 工具参数对象
 
 参数 Schema、说明、读写标注以 `src/mcp/create-server.ts` 为唯一代码事实源。平台动作通过进程内 MCP 调用复用这套 Schema 和处理器，不另写业务分支。
 
-面向 Agent 的首期发布应尽量只保留 `get_approval_capabilities` 与组合工具 `get_approval_instance`。后者默认执行详情+附件清单，`attachmentAction=read` 时在同一调用中完成选定附件的授权、临时地址换取、安全下载和逐文件 ledger；无需再发布独立的附件列表/下载工具。其余路径保留为代码兼容面或后续受控管理面。
+代码后端启用后，正常 Agent 工具清单只发布 `approval_task`：
+
+- `action=view`：一次返回审批内容、操作记录、评论、当前可操作任务和附件元数据；`attachmentAction=read` 时在同一调用中完成选定附件的授权、临时地址换取、安全下载和逐文件 ledger。
+- `action=approve`：要求 `processInstanceId + taskId + confirm`，服务端重新读取任务并校验固定调用人后再同意。
+- `action=reject`：与同意共用状态机，但强制要求非空 `remark`。
+- 三个动作统一返回实例 ID、动作、当前状态、本地审计关联 ID、安全后续动作和数据 envelope。
+
+其余表中的端点仅是钉钉平台迁移期兼容面或内部管理面，不进入正常 MCP `tools/list`。发起、撤销属于申请人角色，不能混入审批人的 `approval_task`；在对外发布代码版申请人能力前应另行聚合为 `approval_request`。
 
 ## 开发者平台操作顺序
 
@@ -102,5 +110,5 @@ Body: 工具参数对象
 2. 写工具必须明确标注真实副作用，使用平台系统身份映射，避免把可伪造的操作者 ID 暴露给 Agent。
 3. 发布后在 AIHub 重置服务以刷新工具清单，并立即更新客户端保存的完整 Streamable HTTP 配置。
 4. 只接受平台生成的 `streamable-http` 配置，并确认 URL 主机严格为 `mcp-gw.dingtalk.com`；URL 中的 `key` 只放入调用端密钥存储。
-5. 当工具数量和变更频率使平台逐项配置难以维护时，部署本项目 HTTPS 后端，先验证 `GET /healthz`，再把对应 HTTP 动作切换到 `/platform/tools/<toolName>`。
+5. 当工具数量和变更频率使平台逐项配置难以维护时，部署本项目 HTTPS 后端，先验证 `GET /healthz`，再把审批人动作统一切换到 `/platform/tools/approval_task`。
 6. 代码后端启用后恢复完整的 `dryRun`、服务端确认、调用人/userId/processCode allowlist、持久化幂等和审计语义；对外 MCP 域名仍保持钉钉官方托管。

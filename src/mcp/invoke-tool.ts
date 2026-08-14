@@ -2,6 +2,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 import type { ApprovalService } from "../approval/service.js";
+import { APPROVAL_MCP_VERSION } from "../version.js";
 import { createApprovalMcpServer } from "./create-server.js";
 
 export type ApprovalToolResult = Awaited<ReturnType<Client["callTool"]>>;
@@ -16,8 +17,8 @@ export async function invokeApprovalTool(
   name: string,
   arguments_: Record<string, unknown>,
 ): Promise<ApprovalToolResult | undefined> {
-  const server = createApprovalMcpServer(service);
-  const client = new Client({ name: "mwe-dingtalk-mcp-platform-adapter", version: "0.2.0" });
+  const server = createApprovalMcpServer(service, { includeCompatibilityTools: true });
+  const client = new Client({ name: "mwe-dingtalk-mcp-platform-adapter", version: APPROVAL_MCP_VERSION });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 
   try {

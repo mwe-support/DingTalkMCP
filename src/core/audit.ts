@@ -4,6 +4,7 @@ export type ApprovalAuditOutcome = "succeeded" | "rejected" | "failed" | "uncert
 export interface ApprovalAuditContext {
   action: ApprovalAuditAction;
   actorUserId: string;
+  correlationId?: string;
   processInstanceId?: string;
   processCode?: string;
   taskId?: string;

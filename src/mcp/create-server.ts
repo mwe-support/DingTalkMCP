@@ -3,6 +3,7 @@ import * as z from "zod/v4";
 
 import type { ApprovalService } from "../approval/service.js";
 import { ApprovalMcpError, errorPayload } from "../core/errors.js";
+import { APPROVAL_MCP_VERSION } from "../version.js";
 
 const readAnnotations = {
   readOnlyHint: true,
@@ -21,12 +22,79 @@ const writeAnnotations = {
 const jsonRecord = z.record(z.string(), z.unknown());
 const processInstanceId = z.string().min(1).describe("DingTalk approval processInstanceId");
 const userId = z.string().min(1).describe("DingTalk userId; write operations must match the server allowlist");
+const taskId = z.union([z.string().min(1), z.number().int().nonnegative()]);
+const approvalTaskViewSchema = z
+  .object({
+    action: z.literal("view"),
+    processInstanceId,
+    attachmentAction: z.enum(["list", "read"]).optional(),
+    attachmentIds: z.array(z.string().min(1)).max(10).optional(),
+    maxAttachments: z.number().int().min(1).max(5).optional(),
+  })
+  .strict();
+const approvalTaskApproveSchema = z
+  .object({
+    action: z.literal("approve"),
+    processInstanceId,
+    taskId,
+    confirm: z.boolean(),
+    dryRun: z.boolean().optional(),
+    remark: z.string().max(1024).optional(),
+  })
+  .strict();
+const approvalTaskRejectSchema = z
+  .object({
+    action: z.literal("reject"),
+    processInstanceId,
+    taskId,
+    confirm: z.boolean(),
+    dryRun: z.boolean().optional(),
+    remark: z.string().trim().min(1).max(1024),
+  })
+  .strict();
+const approvalTaskSchema = z.discriminatedUnion("action", [
+  approvalTaskViewSchema,
+  approvalTaskApproveSchema,
+  approvalTaskRejectSchema,
+]);
 
-export function createApprovalMcpServer(service: ApprovalService): McpServer {
+export interface ApprovalMcpServerOptions {
+  includeCompatibilityTools?: boolean;
+}
+
+export function createApprovalMcpServer(
+  service: ApprovalService,
+  options: ApprovalMcpServerOptions = {},
+): McpServer {
   const server = new McpServer({
     name: "mwe-dingtalk-approval-mcp",
-    version: "0.2.0",
+    version: APPROVAL_MCP_VERSION,
   });
+
+  server.registerTool(
+    "approval_task",
+    {
+      title: "View or decide an approval task",
+      description:
+        "One approver-facing tool for reading an approval instance and deciding its active task. Use action=view before approve or reject.",
+      inputSchema: approvalTaskSchema,
+      annotations: writeAnnotations,
+    },
+    async (input) =>
+      safely(() => {
+        if (input.action === "view" && input.attachmentAction === "read") {
+          if (input.attachmentIds === undefined || input.attachmentIds.length === 0) {
+            throw new ApprovalMcpError(
+              "INVALID_INPUT",
+              "attachmentIds must contain at least one fileId when attachmentAction=read.",
+            );
+          }
+        }
+        return service.approvalTask(input);
+      }),
+  );
+
+  if (options.includeCompatibilityTools !== true) return server;
 
   server.registerTool(
     "get_approval_capabilities",

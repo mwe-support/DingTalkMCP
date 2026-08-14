@@ -2,11 +2,11 @@
 
 `MWE审批MCP` 是一个独立的钉钉 OA 审批 MCP Server。它只使用新建企业内部应用的身份访问钉钉官方 OpenAPI，不复用、也不会修改“金蝶对接”应用。
 
-当前版本：`0.2.0`。
+当前版本：`0.3.0`。
 
 当前发布状态（2026-08-13）：钉钉官方网关已发布 3 个平台直连工具：`get_approval_capabilities` 版本 1、`get_approval_instance` 版本 2 和 `start_process_instance` 版本 1。`start_process_instance` 由钉钉 MCP 开发平台以 HTTP POST 直接调用官方 OA OpenAPI，发起人固定映射为平台的“系统参数.操作用户id”，不向 Agent 暴露 `originatorUserId`，也不开放会覆盖 OA 后台流程的 `approvers`。无效模板负向联调进入 OA 业务校验并返回 `processCodeError`，未创建审批实例；真实模板仍需在用户明确确认具体表单内容后验收。
 
-本仓库 `0.2.0` 的代码实现继续保留，作为工具数量增加、更新频繁后切换到自建 HTTPS 工具后端的基础。代码版已经实现更强的服务端确认、固定调用人、allowlist、持久化幂等、审计和附件正文读取；当前平台直连版不部署自建服务器，也不具备这些服务端增强语义。无论采用平台直连还是代码后端，对外 MCP 地址始终由钉钉官方 `mcp-gw.dingtalk.com` 托管。
+本仓库 `0.3.0` 的代码实现继续保留，作为工具数量增加、更新频繁后切换到自建 HTTPS 工具后端的基础。代码版只向正常 Agent 工具清单发布一个审批人工具 `approval_task`，把查看、同意、拒绝以及附件读取收敛为 `action=view|approve|reject`；端点形状的旧工具仅保留为平台迁移期兼容入口。代码版同时实现服务端确认、固定调用人、allowlist、持久化幂等、审计和附件正文读取；当前平台直连版不部署自建服务器，也不具备这些服务端增强语义。无论采用平台直连还是代码后端，对外 MCP 地址始终由钉钉官方 `mcp-gw.dingtalk.com` 托管。
 
 当前正式平台工具的边界：
 
@@ -16,6 +16,7 @@
 
 ## 已实现能力
 
+- 审批人一体化工具 `approval_task`：`view` 读取内容、操作记录、评论、当前任务与附件；`approve`、`reject` 在同一工具内完成审批决策。
 - 审批实例详情：同时返回容错后的 `normalized` 和不丢字段的 `raw`。
 - 组合审批详情工具 `get_approval_instance`：一次调用返回详情、统一附件清单，并可通过可选参数读取所选附件正文；不要求 Agent 在多个小工具之间搬运完整附件对象。
 - 实例 ID 查询、操作记录、实例内待处理任务。
@@ -26,31 +27,26 @@
 - MCP 客户端只使用钉钉官方生成的 Streamable HTTP 配置，MCP 域名必须为 `mcp-gw.dingtalk.com`。
 - 本项目不暴露 MCP 传输端点，也不包含 stdio；未来启用代码版时只提供钉钉 MCP 开发平台调用的 HTTPS 工具后端。
 
-保留了 DWS 中已经形成用户习惯的工具名：
+正常 Agent 工具清单只包含：
 
 ```text
-get_processInstance_detail
-get_processInstance_records
-list_pending_tasks
-list_user_visible_process
-get_process_schema
-forecast_process
-start_process_instance
-approve_processInstance
-reject_processInstance
-revoke_processInstance
+approval_task
 ```
 
-主要组合工具：
-
-```text
-get_approval_instance
-```
-
-默认传 `processInstanceId` 即返回审批详情以及表单附件、操作记录附件和图片的统一清单。需要正文时仍调用同一工具：
+查看审批及附件元数据：
 
 ```json
 {
+  "action": "view",
+  "processInstanceId": "审批实例ID"
+}
+```
+
+需要附件正文时仍调用同一工具：
+
+```json
+{
+  "action": "view",
   "processInstanceId": "审批实例ID",
   "attachmentAction": "read",
   "attachmentIds": ["从附件清单取得的fileId"],
@@ -60,16 +56,21 @@ get_approval_instance
 
 每次最多读取 5 个附件，默认上限 3 个；超出上限直接报错，不静默截断。批量读取按附件返回 ledger：一个附件失败不会抹掉其他成功结果。内容同时受单文件大小、批次总字节数、HTTPS 主机和重定向校验约束。只有 URL、没有 `fileId` 的图片目前列入元数据清单，但不进入 `attachmentIds` 内容读取链路。
 
-兼容/管理工具：
+同意和拒绝使用相同主标识和工具边界：
 
-```text
-query_process_instance_ids
-list_approval_attachments
-download_approval_attachment
-get_approval_capabilities
+```json
+{
+  "action": "approve",
+  "processInstanceId": "审批实例ID",
+  "taskId": "view返回的当前任务ID",
+  "confirm": true,
+  "remark": "符合要求"
+}
 ```
 
-读取工具可直接使用现有参数；`forecast_process` 同时接受 DWS 的 `ProcessForecastPopRequest` 包装。`start_process_instance` 刻意不接受任意请求包装、`originatorUserId` 或 `approvers`，只公开与平台版一致的受控顶层字段；写工具增加 `confirm`，代码版发起还增加 `requestId`，因此是“必要兼容 + 更严格安全扩展”，不是对钉钉官方 OA MCP 的无保护替身。
+`reject` 与 `approve` 参数相同，但 `remark` 必须为非空业务理由。所有动作返回统一 envelope：`processInstanceId`、`action`、`currentStatus`、`auditCorrelationId`、`safeNextActions` 和 `data`。混合读写工具按最保守方式标注为可能修改；`action=view` 本身保持无副作用。
+
+DWS 兼容名、模板查询、发起、撤销、独立详情和附件端点继续由内部兼容 catalog 提供给平台迁移路径，但不会出现在正常 MCP `tools/list`。发起人与审批人属于不同角色和状态机，后续应单独聚合为 `approval_request`，不能塞入 `approval_task`。
 
 官方公开 OpenAPI 没有与 DWS 私有 `list_pending_approvals` 完全等价的个人收件箱接口，因此当前版本没有伪造这个工具。后续通过 `bpms_instance_change` / `bpms_task_change` 事件建立本地投影后再补齐。
 
@@ -193,13 +194,13 @@ MCP 客户端
 
 ## 附件边界
 
-`get_approval_instance` 与兼容工具 `list_approval_attachments` 会容错解析：
+`approval_task(action=view)` 与内部兼容工具会容错解析：
 
 - 表单 `DDAttachment` 数据。
 - `operationRecords[].attachments[]`。
 - `operationRecords[].images[]`。
 
-组合工具在 `attachmentAction=read` 时自动根据附件来源选择下载链路。表单附件先以详情返回的 `spaceId + fileId` 为固定调用人授权，再以 `processInstanceId + fileId` 换取临时地址；评论附件自动使用官方 SDK 当前使用的 `withCommentAttatchment` 字段。固定调用人不能由 MCP 参数伪造。`download_approval_attachment` 仅作为兼容底层能力保留，不建议优先发布为独立 Agent 工具。
+`approval_task(action=view, attachmentAction=read)` 自动根据附件来源选择下载链路。表单附件先以详情返回的 `spaceId + fileId` 为固定调用人授权，再以 `processInstanceId + fileId` 换取临时地址；评论附件自动使用官方 SDK 当前使用的 `withCommentAttatchment` 字段。固定调用人不能由 MCP 参数伪造。通用钉盘列表、搜索、共享和预览接口不进入本工具；OA 审批专用的 `/workflow/processInstances/spaces/files/*` 仍是附件读取的必要底层接口。
 
 默认单文件最多下载 10 MiB 解码后字节，组合调用中的 Base64 正文默认总计最多 15 MiB，内容附带 SHA-256。可分别通过 `APPROVAL_DOWNLOAD_MAX_BYTES` 与 `APPROVAL_ATTACHMENT_BATCH_MAX_BYTES` 调整；批次按请求顺序串行下载，超过 Base64 正文预算的文件返回独立 ledger 错误，避免并发大响应造成内存峰值。审批详情与 JSON 字段开销不计入该正文预算。
 
@@ -220,7 +221,7 @@ tests/             OpenAPI、MCP、HTTP 和附件安全测试
 - P1：使用 Stream 订阅 `bpms_instance_change`、`bpms_task_change`，实现待办投影与事件幂等。
 - P1：取得并验证存储上传权限后，实现本机文件到审批钉盘的完整上传链路。
 - 已完成：在真实审批记录附件上验收 `withCommentAttatchment` 下载地址链路，并验证 PDF 字节、文本与渲染均可读取。
-- 部署前：为钉钉 MCP 平台提供正式 HTTPS 工具后端域名和平台到后端的 Bearer Key，再把已发布的元数据版 `get_approval_instance` 升级为本仓库组合实现。
+- 部署前：为钉钉 MCP 平台提供正式 HTTPS 工具后端域名和平台到后端的 Bearer Key，再把平台分散的详情/同意/拒绝动作收敛为 `/platform/tools/approval_task`。
 - 部署前：使用测试模板和测试人员完成真实的详情、表单附件下载、发起、同意、拒绝、撤销验收。
 
 官方能力与开发者平台设置证据见：

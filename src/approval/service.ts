@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { noopAuditSink, type ApprovalAuditContext, type ApprovalAuditSink } from "../core/audit.js";
 import { ApprovalMcpError, type ApprovalMcpErrorCode } from "../core/errors.js";
@@ -35,6 +35,7 @@ export interface StartProcessInstanceInput {
 export interface ExecuteTaskInput {
   confirm: boolean;
   dryRun?: boolean | undefined;
+  correlationId?: string | undefined;
   processInstanceId: string;
   taskId: string | number;
   actionerUserId?: string | undefined;
@@ -80,6 +81,32 @@ export interface ApprovalAttachmentReadResult {
     message: string;
     retryable: boolean;
   };
+}
+
+export type ApprovalTaskInput =
+  | {
+      action: "view";
+      processInstanceId: string;
+      attachmentAction?: "list" | "read" | undefined;
+      attachmentIds?: string[] | undefined;
+      maxAttachments?: number | undefined;
+    }
+  | {
+      action: "approve" | "reject";
+      processInstanceId: string;
+      taskId: string | number;
+      confirm: boolean;
+      dryRun?: boolean | undefined;
+      remark?: string | undefined;
+    };
+
+export interface ApprovalTaskEnvelope {
+  processInstanceId: string;
+  action: "view" | "approve" | "reject";
+  currentStatus: string;
+  auditCorrelationId: string;
+  safeNextActions: Array<"view" | "approve" | "reject">;
+  data: unknown;
 }
 
 const ACTIVE_TASK_STATUSES = new Set(["NEW", "PENDING", "RUNNING", "TODO"]);
@@ -143,6 +170,66 @@ export class ApprovalService {
       raw: detail.raw,
       attachments,
       attachmentReads,
+    };
+  }
+
+  async approvalTask(input: ApprovalTaskInput): Promise<ApprovalTaskEnvelope> {
+    const auditCorrelationId = randomUUID();
+    if (input.action === "view") {
+      const approval = await this.getApprovalInstance({
+        processInstanceId: input.processInstanceId,
+        ...(input.attachmentAction === undefined ? {} : { attachmentAction: input.attachmentAction }),
+        ...(input.attachmentIds === undefined ? {} : { attachmentIds: input.attachmentIds }),
+        ...(input.maxAttachments === undefined ? {} : { maxAttachments: input.maxAttachments }),
+      });
+      const actionableTasks = approval.normalized.tasks.filter((task) => {
+        const status = text(asRecord(task)?.status)?.toUpperCase();
+        return status !== undefined && ACTIVE_TASK_STATUSES.has(status);
+      });
+      const callerCanDecide =
+        this.#callerUserId !== undefined &&
+        this.#writeUserIds.has(this.#callerUserId) &&
+        actionableTasks.some((task) => {
+          const record = asRecord(task);
+          return text(record?.userId ?? record?.actionerUserId) === this.#callerUserId;
+        });
+      return {
+        processInstanceId: input.processInstanceId,
+        action: input.action,
+        currentStatus: approval.normalized.status?.toUpperCase() ?? "UNKNOWN",
+        auditCorrelationId,
+        safeNextActions: callerCanDecide ? ["view", "approve", "reject"] : ["view"],
+        data: {
+          normalized: approval.normalized,
+          raw: approval.raw,
+          attachments: approval.attachments,
+          attachmentReads: approval.attachmentReads,
+          actionableTasks,
+        },
+      };
+    }
+    const upstreamResult = await this.executeTask({
+      confirm: input.confirm,
+      ...(input.dryRun === undefined ? {} : { dryRun: input.dryRun }),
+      correlationId: auditCorrelationId,
+      processInstanceId: input.processInstanceId,
+      taskId: input.taskId,
+      result: input.action === "approve" ? "agree" : "refuse",
+      ...(input.remark === undefined ? {} : { remark: input.remark }),
+    });
+    const current = await this.getProcessInstanceDetail(input.processInstanceId);
+    return {
+      processInstanceId: input.processInstanceId,
+      action: input.action,
+      currentStatus: current.normalized.status?.toUpperCase() ?? "UNKNOWN",
+      auditCorrelationId,
+      safeNextActions: input.dryRun === true ? ["view", input.action] : ["view"],
+      data: {
+        taskId: String(input.taskId),
+        dryRun: input.dryRun === true,
+        upstreamResult,
+        normalized: current.normalized,
+      },
     };
   }
 
@@ -277,6 +364,7 @@ export class ApprovalService {
       {
         action: input.result === "agree" ? "approve" : "reject",
         actorUserId,
+        ...(input.correlationId === undefined ? {} : { correlationId: input.correlationId }),
         processInstanceId: input.processInstanceId,
         taskId: String(input.taskId),
       },
@@ -286,7 +374,10 @@ export class ApprovalService {
         return this.#api.request({
           method: "POST",
           path: "/v1.0/workflow/processInstances/execute",
-          body: { ...omit(input, ["confirm", "dryRun", "actionerUserId"]), actionerUserId: actorUserId },
+          body: {
+            ...omit(input, ["confirm", "dryRun", "correlationId", "actionerUserId"]),
+            actionerUserId: actorUserId,
+          },
         });
       },
     );

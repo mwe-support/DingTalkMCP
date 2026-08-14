@@ -23,7 +23,7 @@ async function connectedClient(apiResponse: unknown = {}): Promise<{
     writeUserIds: ["user-1"],
     callerUserId: "user-1",
   });
-  const server = createApprovalMcpServer(service);
+  const server = createApprovalMcpServer(service, { includeCompatibilityTools: true });
   const client = new Client({ name: "approval-mcp-test", version: "1.0.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
@@ -43,7 +43,7 @@ async function connectedClientWithDownloader(
     callerUserId: "user-1",
     ...options,
   });
-  const server = createApprovalMcpServer(service);
+  const server = createApprovalMcpServer(service, { includeCompatibilityTools: true });
   const client = new Client({ name: "approval-mcp-test", version: "1.0.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
@@ -52,7 +52,328 @@ async function connectedClientWithDownloader(
   return client;
 }
 
+async function connectedPublicClient(apiResponse: unknown = {}): Promise<{
+  client: Client;
+  request: ReturnType<typeof vi.fn>;
+}> {
+  const request = vi.fn().mockResolvedValue(apiResponse);
+  const service = new ApprovalService({
+    api: { request } as unknown as Pick<DingTalkApiClient, "request">,
+    writeUserIds: ["user-1"],
+    callerUserId: "user-1",
+  });
+  const server = createApprovalMcpServer(service);
+  const client = new Client({ name: "approval-mcp-public-contract-test", version: "1.0.0" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  closeables.push(client, server);
+  return { client, request };
+}
+
 describe("approval MCP public contract", () => {
+  it("publishes one role-cohesive approval_task tool instead of endpoint-shaped tools", async () => {
+    const { client } = await connectedPublicClient();
+
+    const tools = await client.listTools();
+
+    expect(tools.tools.map((tool) => tool.name)).toEqual(["approval_task"]);
+    expect(tools.tools[0]?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true });
+  });
+
+  it("returns approval content, actionable state, comments, and attachment metadata through action=view", async () => {
+    const { client, request } = await connectedPublicClient({
+      result: {
+        processInstanceId: "pi-view",
+        status: "RUNNING",
+        title: "加班审批",
+        tasks: [{ taskId: "task-1", userId: "user-1", status: "RUNNING" }],
+        operationRecords: [
+          {
+            remark: "补充材料",
+            attachments: [{ fileId: "comment-file", fileName: "proof.pdf", fileType: "pdf" }],
+          },
+        ],
+        formComponentValues: [{ name: "加班原因", value: "项目交付" }],
+      },
+    });
+
+    const result = await client.callTool({
+      name: "approval_task",
+      arguments: { action: "view", processInstanceId: "pi-view" },
+    });
+
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      result: {
+        processInstanceId: "pi-view",
+        action: "view",
+        currentStatus: "RUNNING",
+        auditCorrelationId: expect.stringMatching(/^[0-9a-f-]{36}$/u),
+        safeNextActions: ["view", "approve", "reject"],
+        data: {
+          normalized: {
+            title: "加班审批",
+            operationRecords: [expect.objectContaining({ remark: "补充材料" })],
+            formComponentValues: [expect.objectContaining({ name: "加班原因" })],
+          },
+          attachments: [
+            expect.objectContaining({ source: "operation", fileId: "comment-file", fileName: "proof.pdf" }),
+          ],
+          attachmentReads: [],
+          actionableTasks: [expect.objectContaining({ taskId: "task-1", userId: "user-1" })],
+        },
+      },
+    });
+    expect(request).toHaveBeenCalledOnce();
+  });
+
+  it("does not advertise decision actions when DingTalk omits the task status", async () => {
+    const { client } = await connectedPublicClient({
+      result: {
+        processInstanceId: "pi-unknown-task",
+        status: "RUNNING",
+        tasks: [{ taskId: "task-unknown", userId: "user-1" }],
+      },
+    });
+
+    const result = await client.callTool({
+      name: "approval_task",
+      arguments: { action: "view", processInstanceId: "pi-unknown-task" },
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      result: {
+        safeNextActions: ["view"],
+        data: { actionableTasks: [] },
+      },
+    });
+  });
+
+  it("approves through the same approval_task tool after refreshing task ownership and state", async () => {
+    const { client, request } = await connectedClient();
+    request
+      .mockResolvedValueOnce({
+        result: {
+          processInstanceId: "pi-approve",
+          status: "RUNNING",
+          tasks: [{ taskId: "task-approve", userId: "user-1", status: "RUNNING" }],
+        },
+      })
+      .mockResolvedValueOnce({ success: true })
+      .mockResolvedValueOnce({
+        result: {
+          processInstanceId: "pi-approve",
+          status: "COMPLETED",
+          result: "agree",
+          tasks: [{ taskId: "task-approve", userId: "user-1", status: "COMPLETED" }],
+        },
+      });
+
+    const result = await client.callTool({
+      name: "approval_task",
+      arguments: {
+        action: "approve",
+        processInstanceId: "pi-approve",
+        taskId: "task-approve",
+        confirm: true,
+        remark: "符合要求",
+      },
+    });
+
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      result: {
+        processInstanceId: "pi-approve",
+        action: "approve",
+        currentStatus: "COMPLETED",
+        auditCorrelationId: expect.stringMatching(/^[0-9a-f-]{36}$/u),
+        safeNextActions: ["view"],
+        data: {
+          taskId: "task-approve",
+          dryRun: false,
+          upstreamResult: { success: true },
+          normalized: { status: "COMPLETED", result: "agree" },
+        },
+      },
+    });
+    expect(request).toHaveBeenNthCalledWith(1, {
+      method: "GET",
+      path: "/v1.0/workflow/processInstances",
+      query: { processInstanceId: "pi-approve" },
+    });
+    expect(request).toHaveBeenNthCalledWith(2, {
+      method: "POST",
+      path: "/v1.0/workflow/processInstances/execute",
+      body: {
+        processInstanceId: "pi-approve",
+        taskId: "task-approve",
+        result: "agree",
+        remark: "符合要求",
+        actionerUserId: "user-1",
+      },
+    });
+    expect(request).toHaveBeenNthCalledWith(3, {
+      method: "GET",
+      path: "/v1.0/workflow/processInstances",
+      query: { processInstanceId: "pi-approve" },
+    });
+  });
+
+  it("requires a non-empty business reason for action=reject", async () => {
+    const { client, request } = await connectedPublicClient();
+
+    const result = await client.callTool({
+      name: "approval_task",
+      arguments: {
+        action: "reject",
+        processInstanceId: "pi-reject",
+        taskId: "task-reject",
+        confirm: true,
+        remark: "   ",
+      },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("rejects through approval_task with the bound caller and required reason", async () => {
+    const { client, request } = await connectedClient();
+    request
+      .mockResolvedValueOnce({
+        result: {
+          processInstanceId: "pi-reject",
+          status: "RUNNING",
+          tasks: [{ taskId: "task-reject", userId: "user-1", status: "RUNNING" }],
+        },
+      })
+      .mockResolvedValueOnce({ success: true })
+      .mockResolvedValueOnce({
+        result: { processInstanceId: "pi-reject", status: "COMPLETED", result: "refuse" },
+      });
+
+    const result = await client.callTool({
+      name: "approval_task",
+      arguments: {
+        action: "reject",
+        processInstanceId: "pi-reject",
+        taskId: "task-reject",
+        confirm: true,
+        remark: "附件内容不符合报销标准",
+      },
+    });
+
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      result: {
+        action: "reject",
+        currentStatus: "COMPLETED",
+        safeNextActions: ["view"],
+      },
+    });
+    expect(request).toHaveBeenNthCalledWith(2, {
+      method: "POST",
+      path: "/v1.0/workflow/processInstances/execute",
+      body: {
+        processInstanceId: "pi-reject",
+        taskId: "task-reject",
+        result: "refuse",
+        remark: "附件内容不符合报销标准",
+        actionerUserId: "user-1",
+      },
+    });
+  });
+
+  it("forbids decision-only fields on action=view", async () => {
+    const { client, request } = await connectedPublicClient();
+
+    const result = await client.callTool({
+      name: "approval_task",
+      arguments: {
+        action: "view",
+        processInstanceId: "pi-view",
+        taskId: "task-should-not-be-accepted",
+        confirm: true,
+      },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("reads a selected comment attachment inside action=view with DingTalk's comment flag", async () => {
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce({
+        result: {
+          processInstanceId: "pi-comment",
+          status: "RUNNING",
+          operationRecords: [
+            {
+              attachments: [
+                { fileId: "comment-file", fileName: "补充证明.pdf", fileType: "pdf", fileSize: 3 },
+              ],
+            },
+          ],
+        },
+      })
+      .mockResolvedValueOnce({
+        result: { fileId: "comment-file", downloadUri: "https://files.dingtalk.com/comment.pdf" },
+      });
+    const downloader = new AttachmentDownloader({
+      fetch: vi.fn<typeof fetch>().mockResolvedValue(
+        new Response(new Uint8Array([1, 2, 3]), {
+          status: 200,
+          headers: { "content-type": "application/pdf", "content-length": "3" },
+        }),
+      ),
+      allowedHostSuffixes: [".dingtalk.com"],
+    });
+    const service = new ApprovalService({ api: { request }, downloader, callerUserId: "user-1" });
+    const server = createApprovalMcpServer(service);
+    const client = new Client({ name: "approval-comment-read-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    closeables.push(client, server);
+
+    const result = await client.callTool({
+      name: "approval_task",
+      arguments: {
+        action: "view",
+        processInstanceId: "pi-comment",
+        attachmentAction: "read",
+        attachmentIds: ["comment-file"],
+      },
+    });
+
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      result: {
+        data: {
+          attachmentReads: [
+            expect.objectContaining({
+              ok: true,
+              source: "operation",
+              fileName: "补充证明.pdf",
+              content: expect.objectContaining({ mimeType: "application/pdf", size: 3 }),
+            }),
+          ],
+        },
+      },
+    });
+    expect(request).toHaveBeenNthCalledWith(2, {
+      method: "POST",
+      path: "/v1.0/workflow/processInstances/spaces/files/urls/download",
+      body: {
+        processInstanceId: "pi-comment",
+        fileId: "comment-file",
+        withCommentAttatchment: true,
+      },
+    });
+  });
+
   it("keeps detail and attachment reading in one get_approval_instance tool", async () => {
     const request = vi
       .fn()
