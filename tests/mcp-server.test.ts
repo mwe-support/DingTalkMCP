@@ -3,7 +3,6 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ApprovalService } from "../src/approval/service.js";
-import { AttachmentDownloader } from "../src/approval/attachments.js";
 import { InMemoryIdempotencyLedger } from "../src/core/idempotency.js";
 import type { DingTalkApiClient } from "../src/dingtalk/client.js";
 import { createApprovalMcpServer } from "../src/mcp/create-server.js";
@@ -33,16 +32,10 @@ async function connectedClient(apiResponse: unknown = {}): Promise<{
   return { client, request };
 }
 
-async function connectedClientWithDownloader(
-  request: ReturnType<typeof vi.fn>,
-  downloader: AttachmentDownloader,
-  options: { attachmentBatchMaxBytes?: number } = {},
-): Promise<Client> {
+async function connectedClientWithRequest(request: ReturnType<typeof vi.fn>): Promise<Client> {
   const service = new ApprovalService({
     api: { request } as unknown as Pick<DingTalkApiClient, "request">,
-    downloader,
     callerUserId: "user-1",
-    ...options,
   });
   const server = createApprovalMcpServer(service, { includeCompatibilityTools: true });
   const client = new Client({ name: "approval-mcp-test", version: "1.0.0" });
@@ -124,12 +117,22 @@ describe("approval MCP public contract", () => {
           attachments: [
             expect.objectContaining({ source: "operation", fileId: "comment-file", fileName: "proof.pdf" }),
           ],
-          attachmentReads: [],
+          attachmentHandling: expect.objectContaining({
+            mode: "agent_client",
+            serverDownloadsFiles: false,
+            serverParsesFiles: false,
+            serverPerformsOcr: false,
+            agentMustValidateRedirects: true,
+          }),
+          attachmentDownloads: [],
           actionableTasks: [expect.objectContaining({ taskId: "task-1", userId: "user-1" })],
         },
       },
     });
     expect(request).toHaveBeenCalledOnce();
+    expect((result.structuredContent as { result: { data: Record<string, unknown> } }).result.data).not.toHaveProperty(
+      "raw",
+    );
   });
 
   it("does not advertise decision actions when DingTalk omits the task status", async () => {
@@ -309,7 +312,7 @@ describe("approval MCP public contract", () => {
     expect(request).not.toHaveBeenCalled();
   });
 
-  it("forbids attachment read fields unless action=view explicitly selects read mode", async () => {
+  it("forbids attachment download fields unless action=view explicitly selects download mode", async () => {
     const { client, request } = await connectedPublicClient();
 
     const implicit = await client.callTool({
@@ -490,7 +493,7 @@ describe("approval MCP public contract", () => {
       arguments: {
         action: "view",
         processInstanceId: "pi-public-limit",
-        attachmentAction: "read",
+        attachmentAction: "download",
         attachmentIds: ["one", "two"],
         maxAttachments: 1,
       },
@@ -501,7 +504,7 @@ describe("approval MCP public contract", () => {
     expect(request).toHaveBeenCalledTimes(1);
   });
 
-  it("reads a selected comment attachment inside action=view with DingTalk's comment flag", async () => {
+  it("returns a selected comment attachment link and delegates download and identification to the Agent client", async () => {
     const request = vi
       .fn()
       .mockResolvedValueOnce({
@@ -520,16 +523,7 @@ describe("approval MCP public contract", () => {
       .mockResolvedValueOnce({
         result: { fileId: "comment-file", downloadUri: "https://files.dingtalk.com/comment.pdf" },
       });
-    const downloader = new AttachmentDownloader({
-      fetch: vi.fn<typeof fetch>().mockResolvedValue(
-        new Response(new Uint8Array([1, 2, 3]), {
-          status: 200,
-          headers: { "content-type": "application/pdf", "content-length": "3" },
-        }),
-      ),
-      allowedHostSuffixes: [".dingtalk.com"],
-    });
-    const service = new ApprovalService({ api: { request }, downloader, callerUserId: "user-1" });
+    const service = new ApprovalService({ api: { request }, callerUserId: "user-1" });
     const server = createApprovalMcpServer(service);
     const client = new Client({ name: "approval-comment-read-test", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -542,7 +536,7 @@ describe("approval MCP public contract", () => {
       arguments: {
         action: "view",
         processInstanceId: "pi-comment",
-        attachmentAction: "read",
+        attachmentAction: "download",
         attachmentIds: ["comment-file"],
       },
     });
@@ -551,12 +545,28 @@ describe("approval MCP public contract", () => {
     expect(result.structuredContent).toMatchObject({
       result: {
         data: {
-          attachmentReads: [
+          attachmentHandling: {
+            mode: "agent_client",
+            agentMustDownload: true,
+            agentMustIdentify: true,
+            agentMustValidateRedirects: true,
+            serverDownloadsFiles: false,
+            serverParsesFiles: false,
+            serverPerformsOcr: false,
+          },
+          attachmentDownloads: [
             expect.objectContaining({
               ok: true,
               source: "operation",
               fileName: "补充证明.pdf",
-              content: expect.objectContaining({ mimeType: "application/pdf", size: 3 }),
+              download: {
+                downloadUrl: "https://files.dingtalk.com/comment.pdf",
+                fileName: "补充证明.pdf",
+                mimeType: "application/pdf",
+                fileSize: 3,
+                temporary: true,
+                agentActionRequired: "download_and_identify",
+              },
             }),
           ],
         },
@@ -571,9 +581,10 @@ describe("approval MCP public contract", () => {
         withCommentAttatchment: true,
       },
     });
+    expect(JSON.stringify(result.structuredContent)).not.toContain("contentBase64");
   });
 
-  it("reads a client-uploaded form attachment directly even when detail reports a spaceId", async () => {
+  it("returns a client-uploaded form attachment link even when detail reports a spaceId", async () => {
     const request = vi
       .fn()
       .mockResolvedValueOnce({
@@ -603,17 +614,7 @@ describe("approval MCP public contract", () => {
           downloadUri: "http://lippi-space-zjk.oss-cn-zhangjiakou.aliyuncs.com/local-file.jpg",
         },
       });
-    const fetchAttachment = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response(new Uint8Array([1, 2, 3]), {
-        status: 200,
-        headers: { "content-type": "image/jpeg", "content-length": "3" },
-      }),
-    );
-    const downloader = new AttachmentDownloader({
-      fetch: fetchAttachment,
-      allowedHostSuffixes: [".aliyuncs.com"],
-    });
-    const service = new ApprovalService({ api: { request }, downloader, callerUserId: "user-1" });
+    const service = new ApprovalService({ api: { request }, callerUserId: "user-1" });
     const server = createApprovalMcpServer(service);
     const client = new Client({ name: "approval-local-form-file-test", version: "1.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -626,7 +627,7 @@ describe("approval MCP public contract", () => {
       arguments: {
         action: "view",
         processInstanceId: "pi-local-form-file",
-        attachmentAction: "read",
+        attachmentAction: "download",
         attachmentIds: ["local-file"],
       },
     });
@@ -635,12 +636,17 @@ describe("approval MCP public contract", () => {
     expect(result.structuredContent).toMatchObject({
       result: {
         data: {
-          attachmentReads: [
+          attachmentDownloads: [
             expect.objectContaining({
               ok: true,
               source: "form",
               fileName: "报销凭证.jpg",
-              content: expect.objectContaining({ mimeType: "image/jpeg", size: 3 }),
+              download: expect.objectContaining({
+                downloadUrl: "https://lippi-space-zjk.oss-cn-zhangjiakou.aliyuncs.com/local-file.jpg",
+                mimeType: "image/jpeg",
+                fileSize: 3,
+                agentActionRequired: "download_and_identify",
+              }),
             }),
           ],
         },
@@ -657,15 +663,9 @@ describe("approval MCP public contract", () => {
         fileType: "jpg",
       },
     });
-    expect(fetchAttachment.mock.calls[0]?.[0].toString()).toBe(
-      "https://lippi-space-zjk.oss-cn-zhangjiakou.aliyuncs.com/local-file.jpg",
-    );
-    expect(fetchAttachment.mock.calls[0]?.[1]).toEqual(
-      expect.objectContaining({ method: "GET", redirect: "manual" }),
-    );
   });
 
-  it("keeps detail and attachment reading in one get_approval_instance tool", async () => {
+  it("keeps detail and attachment-link preparation in one compatibility tool", async () => {
     const request = vi
       .fn()
       .mockResolvedValueOnce({
@@ -692,23 +692,13 @@ describe("approval MCP public contract", () => {
           downloadUri: "https://files.dingtalk.com/comment.txt",
         },
       });
-    const bytes = new TextEncoder().encode("approval attachment");
-    const downloader = new AttachmentDownloader({
-      fetch: vi.fn<typeof fetch>().mockResolvedValue(
-        new Response(bytes, {
-          status: 200,
-          headers: { "content-type": "text/plain", "content-length": String(bytes.byteLength) },
-        }),
-      ),
-      allowedHostSuffixes: [".dingtalk.com"],
-    });
-    const client = await connectedClientWithDownloader(request, downloader);
+    const client = await connectedClientWithRequest(request);
 
     const result = await client.callTool({
       name: "get_approval_instance",
       arguments: {
         processInstanceId: "pi-1",
-        attachmentAction: "read",
+        attachmentAction: "download",
         attachmentIds: ["file-comment"],
       },
     });
@@ -720,15 +710,16 @@ describe("approval MCP public contract", () => {
         attachments: [
           expect.objectContaining({ source: "operation", fileId: "file-comment", fileName: "comment.txt" }),
         ],
-        attachmentReads: [
+        attachmentDownloads: [
           expect.objectContaining({
             ok: true,
             fileId: "file-comment",
-            content: expect.objectContaining({
+            download: expect.objectContaining({
+              downloadUrl: "https://files.dingtalk.com/comment.txt",
               fileName: "comment.txt",
               mimeType: "text/plain",
-              size: bytes.byteLength,
-              contentBase64: Buffer.from(bytes).toString("base64"),
+              fileSize: 19,
+              agentActionRequired: "download_and_identify",
             }),
           }),
         ],
@@ -767,22 +758,13 @@ describe("approval MCP public contract", () => {
           downloadUri: "https://files.dingtalk.com/comment.png",
         },
       });
-    const downloader = new AttachmentDownloader({
-      fetch: vi.fn<typeof fetch>().mockResolvedValue(
-        new Response(new Uint8Array([1, 2, 3]), {
-          status: 200,
-          headers: { "content-type": "image/png", "content-length": "3" },
-        }),
-      ),
-      allowedHostSuffixes: [".dingtalk.com"],
-    });
-    const client = await connectedClientWithDownloader(request, downloader);
+    const client = await connectedClientWithRequest(request);
 
     const result = await client.callTool({
       name: "get_approval_instance",
       arguments: {
         processInstanceId: "pi-image",
-        attachmentAction: "read",
+        attachmentAction: "download",
         attachmentIds: ["image-comment"],
       },
     });
@@ -790,7 +772,16 @@ describe("approval MCP public contract", () => {
     expect(result.isError).not.toBe(true);
     expect(result.structuredContent).toMatchObject({
       result: {
-        attachmentReads: [expect.objectContaining({ ok: true, source: "operation-image" })],
+        attachmentDownloads: [
+          expect.objectContaining({
+            ok: true,
+            source: "operation-image",
+            download: expect.objectContaining({
+              downloadUrl: "https://files.dingtalk.com/comment.png",
+              agentActionRequired: "download_and_identify",
+            }),
+          }),
+        ],
       },
     });
     expect(request).toHaveBeenNthCalledWith(2, {
@@ -800,7 +791,7 @@ describe("approval MCP public contract", () => {
     });
   });
 
-  it("keeps the combined attachment response within one aggregate byte budget", async () => {
+  it("prepares multiple links without downloading attachment bytes on the server", async () => {
     const request = vi
       .fn()
       .mockResolvedValueOnce({
@@ -817,25 +808,18 @@ describe("approval MCP public contract", () => {
         },
       })
       .mockResolvedValueOnce({
-        result: { fileId: "file-1", downloadUri: "https://files.dingtalk.com/one.bin" },
+        result: { fileId: "file-1", downloadUri: "https://files.dingtalk.com/one.pdf" },
+      })
+      .mockResolvedValueOnce({
+        result: { fileId: "file-2", downloadUri: "https://files.dingtalk.com/two.pdf" },
       });
-    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response(new Uint8Array([1, 2, 3]), {
-        status: 200,
-        headers: { "content-type": "application/pdf", "content-length": "3" },
-      }),
-    );
-    const client = await connectedClientWithDownloader(
-      request,
-      new AttachmentDownloader({ fetch: fetchMock, allowedHostSuffixes: [".dingtalk.com"] }),
-      { attachmentBatchMaxBytes: 4 },
-    );
+    const client = await connectedClientWithRequest(request);
 
     const result = await client.callTool({
       name: "get_approval_instance",
       arguments: {
         processInstanceId: "pi-budget",
-        attachmentAction: "read",
+        attachmentAction: "download",
         attachmentIds: ["file-1", "file-2"],
       },
     });
@@ -843,18 +827,14 @@ describe("approval MCP public contract", () => {
     expect(result.isError).not.toBe(true);
     expect(result.structuredContent).toMatchObject({
       result: {
-        attachmentReads: [
+        attachmentDownloads: [
           expect.objectContaining({ ok: true, fileId: "file-1" }),
-          expect.objectContaining({
-            ok: false,
-            fileId: "file-2",
-            error: expect.objectContaining({ code: "ATTACHMENT_BATCH_TOO_LARGE" }),
-          }),
+          expect.objectContaining({ ok: true, fileId: "file-2" }),
         ],
       },
     });
-    expect(request).toHaveBeenCalledTimes(2);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(request).toHaveBeenCalledTimes(3);
+    expect(JSON.stringify(result.structuredContent)).not.toContain("contentBase64");
   });
 
   it("returns one ledger entry per requested attachment instead of failing the whole tool", async () => {
@@ -871,23 +851,22 @@ describe("approval MCP public contract", () => {
         ],
       },
     });
-    const downloader = new AttachmentDownloader({ fetch: vi.fn<typeof fetch>() });
-    const client = await connectedClientWithDownloader(request, downloader);
+    const client = await connectedClientWithRequest(request);
 
     const result = await client.callTool({
       name: "get_approval_instance",
       arguments: {
         processInstanceId: "pi-1",
-        attachmentAction: "read",
+        attachmentAction: "download",
         attachmentIds: ["file-1", "missing-file"],
       },
     });
 
     expect(result.isError).not.toBe(true);
     const payload = result.structuredContent as {
-      result: { attachmentReads: Array<{ ok: boolean; fileId: string; error?: { code: string } }> };
+      result: { attachmentDownloads: Array<{ ok: boolean; fileId: string; error?: { code: string } }> };
     };
-    expect(payload.result.attachmentReads).toEqual(
+    expect(payload.result.attachmentDownloads).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ ok: false, fileId: "file-1", error: expect.objectContaining({ code: "INVALID_RESPONSE" }) }),
         expect.objectContaining({ ok: false, fileId: "missing-file", error: expect.objectContaining({ code: "ATTACHMENT_NOT_FOUND" }) }),
@@ -895,12 +874,12 @@ describe("approval MCP public contract", () => {
     );
   });
 
-  it("rejects attachment read mode without explicit attachment IDs", async () => {
+  it("rejects attachment download mode without explicit attachment IDs", async () => {
     const { client, request } = await connectedClient({ result: { processInstanceId: "pi-1" } });
 
     const result = await client.callTool({
       name: "get_approval_instance",
-      arguments: { processInstanceId: "pi-1", attachmentAction: "read" },
+      arguments: { processInstanceId: "pi-1", attachmentAction: "download" },
     });
 
     expect(result.isError).toBe(true);
@@ -915,7 +894,7 @@ describe("approval MCP public contract", () => {
       name: "get_approval_instance",
       arguments: {
         processInstanceId: "pi-1",
-        attachmentAction: "read",
+        attachmentAction: "download",
         attachmentIds: ["one", "two"],
         maxAttachments: 1,
       },
@@ -926,7 +905,7 @@ describe("approval MCP public contract", () => {
     expect(request).toHaveBeenCalledTimes(1);
   });
 
-  it("publishes DWS-compatible approval names plus dedicated attachment tools", async () => {
+  it("does not publish a server-side attachment download tool", async () => {
     const { client } = await connectedClient();
 
     const tools = await client.listTools();
@@ -946,10 +925,10 @@ describe("approval MCP public contract", () => {
         "revoke_processInstance",
         "query_process_instance_ids",
         "list_approval_attachments",
-        "download_approval_attachment",
         "get_approval_capabilities",
       ]),
     );
+    expect(names).not.toContain("download_approval_attachment");
   });
 
   it("publishes a guarded start schema without caller-controlled identity or routing overrides", async () => {

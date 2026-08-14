@@ -8,8 +8,6 @@ export interface ApprovalMcpConfig {
   callerUserId?: string;
   writeUserIds: string[];
   allowedProcessCodes: string[];
-  downloadMaxBytes: number;
-  attachmentBatchMaxBytes: number;
   downloadHostSuffixes: string[];
   idempotencyLedgerPath: string;
 }
@@ -38,16 +36,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApprovalMcpCon
     ...(callerUserId === undefined ? {} : { callerUserId }),
     writeUserIds: csv(env.DINGTALK_WRITE_USER_IDS),
     allowedProcessCodes: csv(env.APPROVAL_ALLOWED_PROCESS_CODES),
-    downloadMaxBytes: positiveInteger(
-      env.APPROVAL_DOWNLOAD_MAX_BYTES,
-      10 * 1024 * 1024,
-      "APPROVAL_DOWNLOAD_MAX_BYTES",
-    ),
-    attachmentBatchMaxBytes: positiveInteger(
-      env.APPROVAL_ATTACHMENT_BATCH_MAX_BYTES,
-      15 * 1024 * 1024,
-      "APPROVAL_ATTACHMENT_BATCH_MAX_BYTES",
-    ),
     downloadHostSuffixes: csv(env.APPROVAL_DOWNLOAD_HOST_SUFFIXES, [
       ".dingtalk.com",
       ".alicdn.com",
@@ -73,13 +61,4 @@ function required(env: NodeJS.ProcessEnv, key: string): string {
 function csv(value: string | undefined, fallback: string[] = []): string[] {
   if (value === undefined || value.trim() === "") return fallback;
   return [...new Set(value.split(",").map((item) => item.trim()).filter(Boolean))];
-}
-
-function positiveInteger(value: string | undefined, fallback: number, key: string): number {
-  if (value === undefined || value.trim() === "") return fallback;
-  const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
-    throw new ApprovalMcpError("CONFIGURATION_ERROR", `${key} must be a positive integer.`);
-  }
-  return parsed;
 }

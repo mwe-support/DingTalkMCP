@@ -2,28 +2,24 @@
 
 `MWE审批MCP` 是一个独立的钉钉 OA 审批 MCP Server。它只使用新建企业内部应用的身份访问钉钉官方 OpenAPI，不复用、也不会修改“金蝶对接”应用。
 
-当前版本：`0.3.1`。
+当前版本：`0.4.0`。
 
-当前发布状态（2026-08-14）：钉钉官方网关仍发布 3 个平台直连工具：`get_approval_capabilities` 版本 1、`get_approval_instance` 版本 2 和 `start_process_instance` 版本 1。CVM 上的代码后端已经通过 `https://dingtalk.mwexk.com/platform/tools/approval_task` 生产部署并完成真实审批和附件验收；在钉钉 MCP 开发平台重新编辑并发布 `approval_task` 版本前，官方网关工具清单仍以现有平台直连版本为准。
+当前发布状态（2026-08-14）：原钉钉 AIHub 平台版本已删除。CVM 代码后端通过 `https://dingtalk.mwexk.com/platform/tools/approval_task` 提供唯一生产工具动作；重新在钉钉 MCP 开发平台创建并发布版本后，Agent 才会重新取得由 `mcp-gw.dingtalk.com` 托管的正式 MCP URL。
 
-本仓库 `0.3.1` 已部署为钉钉 MCP 平台调用的 HTTPS 工具后端。正常 Agent 只使用一个审批人工具 `approval_task`，把查看、同意、拒绝以及附件读取收敛为 `action=view|approve|reject`；端点形状的旧工具仅保留为平台迁移期兼容入口。代码后端实现服务端确认、固定调用人、allowlist、持久化幂等、审计和附件正文读取。无论平台动作直连 OpenAPI 还是调用代码后端，对外 MCP 地址始终由钉钉官方 `mcp-gw.dingtalk.com` 托管。
+本仓库 `0.4.0` 是钉钉 MCP 平台调用的 HTTPS 工具后端。正常 Agent 只使用一个审批人工具 `approval_task`，把查看、同意、拒绝以及附件链接换取收敛为 `action=view|approve|reject`。代码后端实现服务端确认、固定调用人、allowlist、持久化幂等和审计；附件字节下载、文件识别、文档解析与 OCR 全部由 Agent 客户端完成。对外 MCP 地址仍应由钉钉官方 `mcp-gw.dingtalk.com` 托管。
 
-当前正式平台工具的边界：
-
-- `get_approval_instance`：读取审批详情和附件元数据，不下载附件正文。
-- `start_process_instance`：发起真实审批；必填 `confirm`、`processCode`、`deptId`、`formComponentValues`，可选抄送和自选节点参数。
-- `get_approval_capabilities`：声明当前能力与托管边界。
+当前代码后端只暴露 `approval_task`；端点形状的兼容工具仅保留在进程内测试/迁移 catalog，不通过公网 `/platform/tools/*` 路由发布。
 
 ## 已实现能力
 
 - 审批人一体化工具 `approval_task`：`view` 读取内容、操作记录、评论、当前任务与附件；`approve`、`reject` 在同一工具内完成审批决策。
-- 审批实例详情：同时返回容错后的 `normalized` 和不丢字段的 `raw`。
-- 组合审批详情工具 `get_approval_instance`：一次调用返回详情、统一附件清单，并可通过可选参数读取所选附件正文；不要求 Agent 在多个小工具之间搬运完整附件对象。
+- 审批实例详情：公共 `approval_task` 返回容错后的 `normalized`；原始 `raw` 只保留在内部兼容接口，避免公共响应重复传输同一份内容。
+- 组合审批详情工具：一次调用返回详情、统一附件清单，并可通过可选参数换取所选附件的临时下载链接；不要求 Agent 在多个小工具之间搬运完整附件对象。
 - 实例 ID 查询、操作记录、实例内待处理任务。
 - 用户可见模板、标准表单 Schema、流程预测。
 - 发起、同意、拒绝、撤销；全部写操作绑定服务端固定调用人，并要求显式确认和本地 userId allowlist。
 - 表单附件、评论/操作记录附件、图片元数据的统一识别。
-- 表单与评论附件安全下载：下载授权、临时 URL 换取、HTTPS/Host/重定向校验、大小上限、SHA-256 和 Base64 返回。
+- 表单与评论附件链接换取：隐藏授权差异，校验临时 URL 的 HTTPS 协议与 Host allowlist，不在服务端下载文件。
 - MCP 客户端只使用钉钉官方生成的 Streamable HTTP 配置，MCP 域名必须为 `mcp-gw.dingtalk.com`。
 - 本项目不暴露 MCP 传输端点，也不包含 stdio；只提供钉钉 MCP 开发平台调用的 HTTPS 工具后端。
 
@@ -42,19 +38,19 @@ approval_task
 }
 ```
 
-需要附件正文时仍调用同一工具：
+需要查看附件时仍调用同一工具换取临时链接：
 
 ```json
 {
   "action": "view",
   "processInstanceId": "审批实例ID",
-  "attachmentAction": "read",
+  "attachmentAction": "download",
   "attachmentIds": ["从附件清单取得的fileId"],
   "maxAttachments": 3
 }
 ```
 
-每次最多读取 5 个附件，默认上限 3 个；超出上限直接报错，不静默截断。批量读取按附件返回 ledger：一个附件失败不会抹掉其他成功结果。内容同时受单文件大小、批次总字节数、MIME allowlist、HTTPS 主机、重定向和文本凭证脱敏规则约束。只有 URL、没有 `fileId` 的图片目前列入元数据清单，但不进入 `attachmentIds` 内容读取链路。
+每次最多换取 5 个附件链接，默认上限 3 个；超出上限直接报错，不静默截断。结果按附件返回 ledger：一个链接换取失败不会抹掉其他成功结果。返回中的 `attachmentHandling` 明确要求 Agent 立即使用短期 `downloadUrl` 自行下载，再在客户端识别文件类型、解析正文或按需 OCR；服务端不接收附件字节、不返回 Base64，也不执行解析或 OCR。只有 URL、没有 `fileId` 的图片目前列入元数据清单，但不进入 `attachmentIds` 链路。
 
 同意和拒绝使用相同主标识和工具边界：
 
@@ -71,7 +67,7 @@ approval_task
 
 `reject` 与 `approve` 参数相同，但 `remark` 必须为非空业务理由。所有动作返回统一 envelope：`processInstanceId`、`action`、`currentStatus`、`auditCorrelationId`、`safeNextActions` 和 `data`。混合读写工具按最保守方式标注为可能修改；`action=view` 本身保持无副作用。
 
-DWS 兼容名、模板查询、发起、撤销、独立详情和附件端点继续由内部兼容 catalog 提供给平台迁移路径，但不会出现在正常 MCP `tools/list`。发起人与审批人属于不同角色和状态机，后续应单独聚合为 `approval_request`，不能塞入 `approval_task`。
+DWS 兼容名、模板查询、发起、撤销、独立详情和附件元数据操作只保留在内部兼容 catalog，不会出现在正常 MCP `tools/list`，也不会通过公网 HTTP 工具路由发布。发起人与审批人属于不同角色和状态机，后续应单独聚合为 `approval_request`，不能塞入 `approval_task`。
 
 官方公开 OpenAPI 没有与 DWS 私有 `list_pending_approvals` 完全等价的个人收件箱接口，因此当前版本没有伪造这个工具。后续通过 `bpms_instance_change` / `bpms_task_change` 事件建立本地投影后再补齐。
 
@@ -202,19 +198,17 @@ MCP 客户端
 - `operationRecords[].attachments[]`。
 - `operationRecords[].images[]`。
 
-`approval_task(action=view, attachmentAction=read)` 自动根据附件来源和元数据选择下载链路：有完整 `fileName + fileType` 的客户端手选本地附件直接以 `processInstanceId + fileId + fileName + fileType` 换取临时地址，即使详情同时返回了不可授权的 `spaceId`；缺少这组文件标识、但详情带 `spaceId` 的表单附件才先以 `spaceId + fileId` 为固定调用人授权；评论附件使用官方 SDK 当前使用的 `withCommentAttatchment` 字段。固定调用人不能由 MCP 参数伪造。通用钉盘列表、搜索、共享和预览接口不进入本工具；OA 审批专用的 `/workflow/processInstances/spaces/files/*` 仍是附件读取的必要底层接口。
+`approval_task(action=view, attachmentAction=download)` 自动根据附件来源和元数据选择链接换取链路：有完整 `fileName + fileType` 的客户端手选本地附件直接以 `processInstanceId + fileId + fileName + fileType` 换取临时地址，即使详情同时返回了不可授权的 `spaceId`；缺少这组文件标识、但详情带 `spaceId` 的表单附件才先以 `spaceId + fileId` 为固定调用人授权；评论附件使用官方 SDK 当前使用的 `withCommentAttatchment` 字段。固定调用人不能由 MCP 参数伪造。通用钉盘列表、搜索、共享和预览接口不进入本工具；OA 审批专用的 `/workflow/processInstances/spaces/files/*` 仅用于审批附件授权和临时链接换取。
 
-钉钉当前可能为客户端本地附件返回阿里云 OSS 的 `http://*.aliyuncs.com` 签名地址。下载器不会明文访问它；仅在域名已通过 SSRF 白名单且严格属于 `.aliyuncs.com` 时，把协议原地升级为 HTTPS，之后仍执行逐跳域名、协议、重定向、大小和 MIME 校验。其他 HTTP 地址继续失败关闭。
+钉钉当前可能为客户端本地附件返回阿里云 OSS 的 `http://*.aliyuncs.com` 签名地址。服务端不会访问它；仅在域名已通过 SSRF 白名单且严格属于 `.aliyuncs.com` 时，把返回给 Agent 的协议原地升级为 HTTPS。其他 HTTP 地址、带用户名/密码的 URL 和非白名单 Host 继续失败关闭。
 
-默认单文件最多下载 10 MiB 解码后字节，组合调用中的 Base64 正文默认总计最多 15 MiB，内容附带 SHA-256。可分别通过 `APPROVAL_DOWNLOAD_MAX_BYTES` 与 `APPROVAL_ATTACHMENT_BATCH_MAX_BYTES` 调整；批次按请求顺序串行下载，超过 Base64 正文预算的文件返回独立 ledger 错误，避免并发大响应造成内存峰值。审批详情与 JSON 字段开销不计入该正文预算。
-
-正文只允许常用 PDF、Office、文本、JSON/XML 和图片 MIME；服务端返回 `application/octet-stream` 时必须能由白名单文件扩展名推断类型，未知二进制和可执行类型失败关闭。UTF-8 文本会在转 Base64 前按 `credentials-v1` 规则替换 access token、API key、App Secret、Authorization、client secret 和 password 等凭证值，并返回是否执行/命中的脱敏元数据。PDF、Office 和图片等二进制不做会破坏原文件的语义改写，`redaction.evaluated=false` 明确标识该边界；附件正文不会进入审计日志。
+临时链接视为短期能力凭据：Agent 应立即下载，禁止写入日志或长期保存。MCP 服务端不跟随链接、不检查响应体 MIME、不计算哈希、不做正文脱敏，也不执行 PDF/Office 解包、图片识别或 OCR；这些步骤连同下载大小限制、内容安全扫描和凭证脱敏都属于 Agent 客户端责任。这样公网 CVM 的附件路径只有少量 OpenAPI 请求和小型 JSON 响应，不承担附件带宽与 CPU/内存峰值。
 
 ## 目录结构
 
 ```text
 src/
-  approval/       审批服务、容错规范化、附件解析与下载
+  approval/       审批服务、容错规范化、附件标识解析与临时链接策略
   core/           错误模型、审计与持久化幂等账本
   dingtalk/       accessToken 缓存和 OpenAPI client
   mcp/            MCP 工具注册
@@ -226,9 +220,9 @@ tests/             OpenAPI、MCP、HTTP 和附件安全测试
 
 - P1：使用 Stream 订阅 `bpms_instance_change`、`bpms_task_change`，实现待办投影与事件幂等。
 - P1：取得并验证存储上传权限后，实现本机文件到审批钉盘的完整上传链路。
-- 已完成：在真实审批记录附件上验收 `withCommentAttatchment` 下载地址链路，并验证 PDF 字节、文本与渲染均可读取。
+- 已完成：在真实审批记录附件上验收 `withCommentAttatchment` 下载地址链路；文件下载、PDF 文本提取和渲染由 Agent 客户端完成。
 - 已完成：在 CVM 以 `dingtalk.mwexk.com` 部署正式 HTTPS 工具后端；公网只开放 `/healthz` 和 `/platform/tools/approval_task`，平台到后端使用 Bearer Key。
-- 已完成：通过公网代码后端读取最近两个真实审批并下载、解码和查看 19 个表单附件；另以一条真实已完成审批验证评论区 PDF 附件下载与渲染。
+- 已完成：通过公网代码后端读取最近两个真实审批并换取 19 个表单附件链接；另以一条真实已完成审批验证评论区 PDF 的链接换取，文件内容由 Agent 客户端下载和查看。
 - 待平台发布：重新编辑并发布钉钉 MCP 开发平台的 `approval_task` 版本，把官方网关的审批人入口切换到 CVM 组合工具。
 - 待完整写验收：使用测试模板和测试人员完成发起、同意、拒绝、撤销的回归测试。
 

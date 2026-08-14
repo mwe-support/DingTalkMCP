@@ -8,16 +8,16 @@ import { createApprovalMcpServer } from "./create-server.js";
 export type ApprovalToolResult = Awaited<ReturnType<Client["callTool"]>>;
 
 /**
- * Reuses the MCP tool catalog for DingTalk MCP Platform's ordinary HTTP actions.
- * This keeps validation, write confirmations, and error payloads identical on
- * every platform-managed tool action without exposing a self-hosted MCP route.
+ * Reuses the public MCP tool catalog for the HTTP backend. Endpoint-shaped
+ * compatibility tools stay local to tests and migration work; production only
+ * exposes the role-cohesive approval_task contract.
  */
 export async function invokeApprovalTool(
   service: ApprovalService,
   name: string,
   arguments_: Record<string, unknown>,
 ): Promise<ApprovalToolResult | undefined> {
-  const server = createApprovalMcpServer(service, { includeCompatibilityTools: true });
+  const server = createApprovalMcpServer(service);
   const client = new Client({ name: "mwe-dingtalk-mcp-platform-adapter", version: APPROVAL_MCP_VERSION });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 

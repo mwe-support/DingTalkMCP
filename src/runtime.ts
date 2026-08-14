@@ -1,5 +1,5 @@
 import { ApprovalService } from "./approval/service.js";
-import { AttachmentDownloader } from "./approval/attachments.js";
+import { AttachmentLinkPolicy } from "./approval/attachments.js";
 import type { ApprovalMcpConfig } from "./config.js";
 import { JsonLineAuditSink } from "./core/audit.js";
 import { DirectoryIdempotencyLedger } from "./core/idempotency.js";
@@ -16,14 +16,12 @@ export function createApprovalService(config: ApprovalMcpConfig): ApprovalServic
     tokenProvider,
     baseUrl: config.apiBaseUrl,
   });
-  const downloader = new AttachmentDownloader({
-    maxBytes: config.downloadMaxBytes,
+  const attachmentLinkPolicy = new AttachmentLinkPolicy({
     allowedHostSuffixes: config.downloadHostSuffixes,
   });
   return new ApprovalService({
     api,
-    downloader,
-    attachmentBatchMaxBytes: config.attachmentBatchMaxBytes,
+    attachmentLinkPolicy,
     writeUserIds: config.writeUserIds,
     ...(config.callerUserId === undefined ? {} : { callerUserId: config.callerUserId }),
     allowedProcessCodes: config.allowedProcessCodes,

@@ -31,11 +31,11 @@ const approvalTaskViewMetadataSchema = z
     attachmentAction: z.literal("list").optional(),
   })
   .strict();
-const approvalTaskViewReadSchema = z
+const approvalTaskViewDownloadSchema = z
   .object({
     action: z.literal("view"),
     processInstanceId,
-    attachmentAction: z.literal("read"),
+    attachmentAction: z.literal("download"),
     attachmentIds: z.array(z.string().min(1)).min(1).max(10),
     maxAttachments: z.number().int().min(1).max(5).optional(),
   })
@@ -63,7 +63,7 @@ const approvalTaskRejectSchema = z
   .strict();
 const approvalTaskSchema = z.union([
   approvalTaskViewMetadataSchema,
-  approvalTaskViewReadSchema,
+  approvalTaskViewDownloadSchema,
   approvalTaskApproveSchema,
   approvalTaskRejectSchema,
 ]);
@@ -86,7 +86,7 @@ export function createApprovalMcpServer(
     {
       title: "View or decide an approval task",
       description:
-        "One approver-facing tool for reading an approval instance and deciding its active task. Use action=view before approve or reject.",
+        "One approver-facing tool for reading an approval instance and deciding its active task. For attachments, use action=view with attachmentAction=download to receive short-lived links; the Agent client must download and identify or OCR files itself. The MCP server never downloads, parses, or OCRs attachment content. Use action=view before approve or reject.",
       inputSchema: approvalTaskSchema,
       annotations: writeAnnotations,
     },
@@ -123,34 +123,34 @@ export function createApprovalMcpServer(
     {
       title: "Get approval instance with attachments",
       description:
-        "Read one DingTalk OA approval instance, normalize all form/operation attachments and images, and optionally return bounded base64 content for selected fileIds in the same call. Use attachmentAction=read only when the user asks to read attachment content; obtain attachmentIds from a metadata call or the same approval context.",
+        "Read one DingTalk OA approval instance, normalize all form/operation attachments and images, and optionally return validated temporary download links for selected fileIds. The Agent client must download and identify or OCR files itself; the MCP server never downloads attachment content.",
       inputSchema: {
         processInstanceId,
         attachmentAction: z
-          .enum(["list", "read"])
+          .enum(["list", "download"])
           .optional()
-          .describe("list (default) returns metadata; read also retrieves selected attachmentIds"),
+          .describe("list (default) returns metadata; download also returns temporary links for selected attachmentIds"),
         attachmentIds: z
           .array(z.string().min(1))
           .max(10)
           .optional()
-          .describe("fileIds from this instance to read when attachmentAction=read"),
+          .describe("fileIds from this instance to prepare when attachmentAction=download"),
         maxAttachments: z
           .number()
           .int()
           .min(1)
           .max(5)
           .optional()
-          .describe("Maximum attachments read in one call; default 3, hard limit 5"),
+          .describe("Maximum temporary links prepared in one call; default 3, hard limit 5"),
       },
       annotations: readAnnotations,
     },
     async (input) =>
       safely(() => {
-        if (input.attachmentAction === "read" && (input.attachmentIds === undefined || input.attachmentIds.length === 0)) {
+        if (input.attachmentAction === "download" && (input.attachmentIds === undefined || input.attachmentIds.length === 0)) {
           throw new ApprovalMcpError(
             "INVALID_INPUT",
-            "attachmentIds must contain at least one fileId when attachmentAction=read.",
+            "attachmentIds must contain at least one fileId when attachmentAction=download.",
           );
         }
         return service.getApprovalInstance({
@@ -347,49 +347,6 @@ export function createApprovalMcpServer(
       annotations: readAnnotations,
     },
     async ({ processInstanceId: id }) => safely(() => service.listApprovalAttachments(id)),
-  );
-
-  server.registerTool(
-    "download_approval_attachment",
-    {
-      title: "Download an approval attachment",
-      description:
-        "Exchange processInstanceId + fileId for a temporary URL, validate every HTTPS host/redirect, and return bounded base64 with SHA-256.",
-      inputSchema: {
-        processInstanceId,
-        fileId: z.string().min(1),
-        spaceId: z
-          .string()
-          .min(1)
-          .optional()
-          .describe("Use the spaceId returned by instance detail when DingTalk provides one"),
-        fileName: z.string().min(1).max(255),
-        fileType: z
-          .string()
-          .min(1)
-          .max(32)
-          .optional()
-          .describe("Required with fileName for client-uploaded form attachments that have no spaceId"),
-        withCommentAttachment: z
-          .boolean()
-          .optional()
-          .describe("Set true for an operation/comment attachment; translated to DingTalk's official request field"),
-      },
-      annotations: readAnnotations,
-    },
-    async (input) =>
-      safely(() =>
-        service.downloadApprovalAttachment({
-          processInstanceId: input.processInstanceId,
-          fileId: input.fileId,
-          ...(input.spaceId === undefined ? {} : { spaceId: input.spaceId }),
-          fileName: input.fileName,
-          ...(input.fileType === undefined ? {} : { fileType: input.fileType }),
-          ...(input.withCommentAttachment === undefined
-            ? {}
-            : { withCommentAttachment: input.withCommentAttachment }),
-        }),
-      ),
   );
 
   return server;

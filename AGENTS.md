@@ -7,10 +7,10 @@ These instructions apply to the entire `approval-mcp` repository.
 ## Agent-facing tool design
 
 - Design public MCP tools around a business role and one coherent state machine, not around DingTalk OpenAPI endpoints.
-- Prefer a deep tool with a small, stable interface. Keep OpenAPI calls, attachment authorization/download steps, compatibility aliases, and HTTP action routes behind that interface as internal adapters.
+- Prefer a deep tool with a small, stable interface. Keep OpenAPI calls, attachment authorization/link-exchange steps, compatibility aliases, and HTTP action routes behind that interface as internal adapters.
 - Operations that share the same actor, authorization boundary, primary identifier, and lifecycle belong in one tool. Use a discriminated `action` field and action-specific validation instead of publishing one tool per verb.
 - For the approver role, the target public interface is one `approval_task` tool with `action: "view" | "approve" | "reject"`:
-  - `view` returns normalized approval content, current actionable task state, operation records, attachment metadata, and bounded optional attachment content.
+  - `view` returns normalized approval content, current actionable task state, operation records, attachment metadata, and bounded optional temporary download links.
   - `approve` and `reject` perform the corresponding transition only after rereading and validating the current task.
   - Do not publish raw `get detail`, `list attachments`, `download attachment`, `approve`, and `reject` operations as separate primary tools.
 - Keep applicant operations in a separate business tool, such as `approval_request`, because template selection, preparation, submission, and revocation use a different actor and lifecycle from approver actions.
@@ -24,7 +24,8 @@ These instructions apply to the entire `approval-mcp` repository.
 - Inject caller and actor identity on the server. Never accept `actionerUserId`, applicant identity, or equivalent authority-bearing identifiers from untrusted model input.
 - Return a consistent result envelope across actions, including the business object ID, action performed, current status, audit correlation ID, and safe next actions.
 - Because MCP annotations are static, a tool that contains both read and write actions must be described and annotated conservatively as potentially mutating. The `view` action itself must remain side-effect-free.
-- Attachment reads must be explicit and bounded by count, decoded-byte budget, allowed MIME types, and redaction rules. Default to metadata rather than bulk Base64 content.
+- Attachment link preparation must be explicit and bounded by count, HTTPS protocol, and an approved host suffix list. Default to metadata rather than preparing links in bulk.
+- The MCP server must not download attachment bytes, return Base64 attachment content, parse documents, or run OCR. Its attachment responsibility ends after it exchanges DingTalk identifiers for validated temporary links. The Agent client must download, identify, parse, and OCR files as needed.
 
 ## Mutation safety
 

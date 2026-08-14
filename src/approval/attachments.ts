@@ -1,5 +1,3 @@
-import { createHash } from "node:crypto";
-
 import { ApprovalMcpError } from "../core/errors.js";
 import { array, asRecord, text } from "./normalize.js";
 
@@ -16,50 +14,43 @@ export interface ApprovalAttachment {
   url?: string;
 }
 
-export interface DownloadedAttachment {
-  fileName: string;
-  mimeType: string;
-  size: number;
-  sha256: string;
-  contentBase64: string;
-  redaction: {
-    policy: "credentials-v1";
-    evaluated: boolean;
-    applied: boolean;
-    replacements: number;
-  };
-}
-
-interface AttachmentDownloaderOptions {
-  fetch?: typeof fetch;
-  maxBytes?: number;
+interface AttachmentLinkPolicyOptions {
   allowedHostSuffixes?: string[];
-  timeoutMs?: number;
-  maxRedirects?: number;
-  allowedMimeTypes?: string[];
 }
 
-const DEFAULT_ALLOWED_MIME_TYPES = [
-  "application/json",
-  "application/msword",
-  "application/pdf",
-  "application/rtf",
-  "application/vnd.ms-excel",
-  "application/vnd.ms-powerpoint",
-  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  "application/xml",
-  "image/gif",
-  "image/jpeg",
-  "image/png",
-  "image/webp",
-  "text/csv",
-  "text/plain",
-  "text/xml",
-] as const;
+export interface AttachmentClientDownload {
+  downloadUrl: string;
+  fileName: string;
+  mimeType?: string;
+  fileSize?: number;
+  temporary: true;
+  agentActionRequired: "download_and_identify";
+}
 
 const OFFICIAL_HTTPS_UPGRADE_HOST_SUFFIXES = [".aliyuncs.com"] as const;
+
+export class AttachmentLinkPolicy {
+  readonly #allowedHostSuffixes: string[];
+
+  constructor(options: AttachmentLinkPolicyOptions = {}) {
+    this.#allowedHostSuffixes = normalizeAllowedHostSuffixes(options.allowedHostSuffixes);
+  }
+
+  createClientDownload(downloadUrl: string, fileName: string, fileSize?: number): AttachmentClientDownload {
+    const safeUrl = validateAttachmentUrl(downloadUrl, this.#allowedHostSuffixes);
+    const safeFileName = sanitizeFileName(fileName);
+    const extension = /\.[a-z0-9]+$/iu.exec(safeFileName)?.[0]?.toLowerCase();
+    const mimeType = extension === undefined ? undefined : MIME_BY_EXTENSION[extension];
+    return {
+      downloadUrl: safeUrl.toString(),
+      fileName: safeFileName,
+      ...(mimeType === undefined ? {} : { mimeType }),
+      ...(fileSize === undefined ? {} : { fileSize }),
+      temporary: true,
+      agentActionRequired: "download_and_identify",
+    };
+  }
+}
 
 export function extractApprovalAttachments(detail: unknown): ApprovalAttachment[] {
   const root = asRecord(detail) ?? {};
@@ -119,129 +110,44 @@ export function extractApprovalAttachments(detail: unknown): ApprovalAttachment[
   });
 }
 
-export class AttachmentDownloader {
-  readonly #fetch: typeof fetch;
-  readonly #maxBytes: number;
-  readonly #allowedHostSuffixes: string[];
-  readonly #timeoutMs: number;
-  readonly #maxRedirects: number;
-  readonly #allowedMimeTypes: Set<string>;
+function normalizeAllowedHostSuffixes(values?: string[]): string[] {
+  return (values ?? [".dingtalk.com", ".alicdn.com", ".aliyuncs.com"]).map((value) => value.toLowerCase());
+}
 
-  constructor(options: AttachmentDownloaderOptions = {}) {
-    this.#fetch = options.fetch ?? fetch;
-    this.#maxBytes = options.maxBytes ?? 10 * 1024 * 1024;
-    this.#allowedHostSuffixes = (options.allowedHostSuffixes ?? [
-      ".dingtalk.com",
-      ".alicdn.com",
-      ".aliyuncs.com",
-    ]).map((value) => value.toLowerCase());
-    this.#timeoutMs = options.timeoutMs ?? 30_000;
-    this.#maxRedirects = options.maxRedirects ?? 3;
-    this.#allowedMimeTypes = new Set(
-      (options.allowedMimeTypes ?? [...DEFAULT_ALLOWED_MIME_TYPES]).map((value) => value.toLowerCase()),
+function validateAttachmentUrl(input: string, allowedHostSuffixes: readonly string[]): URL {
+  let url: URL;
+  try {
+    url = new URL(input);
+  } catch (error) {
+    throw new ApprovalMcpError("ATTACHMENT_URL_REJECTED", "The approval attachment URL is invalid.", {
+      cause: error,
+    });
+  }
+  const host = url.hostname.toLowerCase();
+  const allowed = allowedHostSuffixes.some((suffix) =>
+    suffix.startsWith(".") ? host.endsWith(suffix) : host === suffix || host.endsWith(`.${suffix}`),
+  );
+  if (!allowed || url.username !== "" || url.password !== "") {
+    throw new ApprovalMcpError(
+      "ATTACHMENT_URL_REJECTED",
+      "The approval attachment URL is outside the configured HTTPS allowlist.",
+      { details: { host } },
     );
   }
-
-  async downloadToBase64(downloadUrl: string, fileName: string): Promise<DownloadedAttachment> {
-    const response = await this.#fetchValidated(downloadUrl, 0);
-    if (!response.ok) {
-      throw new ApprovalMcpError("ATTACHMENT_DOWNLOAD_FAILED", "The approval attachment download failed.", {
-        details: { status: response.status },
-        retryable: response.status === 429 || response.status >= 500,
-      });
-    }
-
-    const declaredLength = parseLength(response.headers.get("content-length"));
-    if (declaredLength !== undefined && declaredLength > this.#maxBytes) {
-      throw new ApprovalMcpError("ATTACHMENT_TOO_LARGE", "The approval attachment exceeds the configured limit.", {
-        details: { maxBytes: this.#maxBytes, declaredBytes: declaredLength },
-      });
-    }
-
-    const mimeType = resolveAllowedMimeType(response.headers.get("content-type"), fileName, this.#allowedMimeTypes);
-    const sourceBytes = await readBounded(response, this.#maxBytes);
-    const { bytes, redaction } = redactCredentialText(sourceBytes, mimeType);
-    if (bytes.byteLength > this.#maxBytes) {
-      throw new ApprovalMcpError("ATTACHMENT_TOO_LARGE", "The redacted approval attachment exceeds the configured limit.", {
-        details: { maxBytes: this.#maxBytes },
-      });
-    }
-    return {
-      fileName: sanitizeFileName(fileName),
-      mimeType,
-      size: bytes.byteLength,
-      sha256: createHash("sha256").update(bytes).digest("hex"),
-      contentBase64: Buffer.from(bytes).toString("base64"),
-      redaction,
-    };
+  if (
+    url.protocol === "http:" &&
+    OFFICIAL_HTTPS_UPGRADE_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix))
+  ) {
+    url.protocol = "https:";
   }
-
-  async #fetchValidated(input: string, redirects: number): Promise<Response> {
-    const url = this.#validateUrl(input);
-    let response: Response;
-    try {
-      response = await this.#fetch(url, {
-        method: "GET",
-        redirect: "manual",
-        signal: AbortSignal.timeout(this.#timeoutMs),
-        headers: { accept: "application/octet-stream,*/*" },
-      });
-    } catch (error) {
-      throw new ApprovalMcpError("ATTACHMENT_DOWNLOAD_FAILED", "Unable to reach the approval attachment host.", {
-        cause: error,
-        retryable: true,
-      });
-    }
-
-    if (response.status >= 300 && response.status < 400) {
-      if (redirects >= this.#maxRedirects) {
-        throw new ApprovalMcpError("ATTACHMENT_URL_REJECTED", "Too many attachment download redirects.");
-      }
-      const location = response.headers.get("location");
-      if (location === null) {
-        throw new ApprovalMcpError("ATTACHMENT_DOWNLOAD_FAILED", "The attachment redirect did not include a target.");
-      }
-      return this.#fetchValidated(new URL(location, url).toString(), redirects + 1);
-    }
-
-    return response;
-  }
-
-  #validateUrl(input: string): URL {
-    let url: URL;
-    try {
-      url = new URL(input);
-    } catch (error) {
-      throw new ApprovalMcpError("ATTACHMENT_URL_REJECTED", "The approval attachment URL is invalid.", {
-        cause: error,
-      });
-    }
-    const host = url.hostname.toLowerCase();
-    const allowed = this.#allowedHostSuffixes.some((suffix) =>
-      suffix.startsWith(".") ? host.endsWith(suffix) : host === suffix || host.endsWith(`.${suffix}`),
+  if (url.protocol !== "https:") {
+    throw new ApprovalMcpError(
+      "ATTACHMENT_URL_REJECTED",
+      "The approval attachment URL is outside the configured HTTPS allowlist.",
+      { details: { host } },
     );
-    if (!allowed || url.username !== "" || url.password !== "") {
-      throw new ApprovalMcpError(
-        "ATTACHMENT_URL_REJECTED",
-        "The approval attachment URL is outside the configured HTTPS allowlist.",
-        { details: { host } },
-      );
-    }
-    if (
-      url.protocol === "http:" &&
-      OFFICIAL_HTTPS_UPGRADE_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix))
-    ) {
-      url.protocol = "https:";
-    }
-    if (url.protocol !== "https:") {
-      throw new ApprovalMcpError(
-        "ATTACHMENT_URL_REJECTED",
-        "The approval attachment URL is outside the configured HTTPS allowlist.",
-        { details: { host } },
-      );
-    }
-    return url;
   }
+  return url;
 }
 
 const MIME_BY_EXTENSION: Readonly<Record<string, string>> = {
@@ -263,121 +169,6 @@ const MIME_BY_EXTENSION: Readonly<Record<string, string>> = {
   ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   ".xml": "application/xml",
 };
-
-function resolveAllowedMimeType(
-  contentType: string | null,
-  fileName: string,
-  allowedMimeTypes: ReadonlySet<string>,
-): string {
-  const declared = contentType?.split(";", 1)[0]?.trim().toLowerCase();
-  const extension = /\.[a-z0-9]+$/iu.exec(fileName)?.[0]?.toLowerCase();
-  const inferred = extension === undefined ? undefined : MIME_BY_EXTENSION[extension];
-  if (extension !== undefined && inferred === undefined) {
-    throw new ApprovalMcpError(
-      "ATTACHMENT_TYPE_NOT_ALLOWED",
-      "The approval attachment file extension is outside the configured allowlist.",
-      { details: { declaredMimeType: declared ?? "missing", fileExtension: extension } },
-    );
-  }
-  if (
-    declared !== undefined &&
-    declared !== "" &&
-    declared !== "application/octet-stream" &&
-    inferred !== undefined &&
-    declared !== inferred &&
-    !(declared === "text/xml" && inferred === "application/xml")
-  ) {
-    throw new ApprovalMcpError(
-      "ATTACHMENT_TYPE_NOT_ALLOWED",
-      "The approval attachment MIME type does not match its allowlisted file extension.",
-      { details: { declaredMimeType: declared, inferredMimeType: inferred, fileExtension: extension } },
-    );
-  }
-  const mimeType = declared === undefined || declared === "" || declared === "application/octet-stream"
-    ? inferred
-    : declared;
-  if (mimeType === undefined || !allowedMimeTypes.has(mimeType)) {
-    throw new ApprovalMcpError(
-      "ATTACHMENT_TYPE_NOT_ALLOWED",
-      "The approval attachment MIME type is outside the configured allowlist.",
-      { details: { declaredMimeType: declared ?? "missing", fileExtension: extension ?? "missing" } },
-    );
-  }
-  return mimeType;
-}
-
-function redactCredentialText(
-  sourceBytes: Uint8Array,
-  mimeType: string,
-): { bytes: Uint8Array; redaction: DownloadedAttachment["redaction"] } {
-  const textLike = mimeType.startsWith("text/") || mimeType === "application/json" || mimeType === "application/xml";
-  if (!textLike) {
-    return {
-      bytes: sourceBytes,
-      redaction: { policy: "credentials-v1", evaluated: false, applied: false, replacements: 0 },
-    };
-  }
-  let decoded: string;
-  try {
-    decoded = new TextDecoder("utf-8", { fatal: true }).decode(sourceBytes);
-  } catch {
-    return {
-      bytes: sourceBytes,
-      redaction: { policy: "credentials-v1", evaluated: false, applied: false, replacements: 0 },
-    };
-  }
-  if (mimeType === "application/json") {
-    try {
-      const parsed = JSON.parse(decoded) as unknown;
-      const replacements = redactJsonCredentials(parsed);
-      if (replacements > 0) {
-        return {
-          bytes: new TextEncoder().encode(JSON.stringify(parsed)),
-          redaction: { policy: "credentials-v1", evaluated: true, applied: true, replacements },
-        };
-      }
-    } catch {
-      // Invalid JSON is still scanned as UTF-8 text below.
-    }
-  }
-  let replacements = 0;
-  const redacted = decoded.replace(
-    /((?:access[_-]?token|api[_-]?key|app[_-]?secret|authorization|client[_-]?secret|password)\s*[:=]\s*)(?:bearer\s+)?([^\s,;]+)/giu,
-    (_match, prefix: string) => {
-      replacements += 1;
-      return `${prefix}[REDACTED]`;
-    },
-  );
-  return {
-    bytes: new TextEncoder().encode(redacted),
-    redaction: {
-      policy: "credentials-v1",
-      evaluated: true,
-      applied: replacements > 0,
-      replacements,
-    },
-  };
-}
-
-const CREDENTIAL_FIELD_NAME = /^(?:access[_-]?token|api[_-]?key|app[_-]?secret|authorization|client[_-]?secret|password)$/iu;
-
-function redactJsonCredentials(value: unknown): number {
-  if (Array.isArray(value)) return value.reduce((count, item) => count + redactJsonCredentials(item), 0);
-  const record = asRecord(value);
-  if (record === undefined) return 0;
-  let replacements = 0;
-  for (const [key, item] of Object.entries(record)) {
-    if (CREDENTIAL_FIELD_NAME.test(key)) {
-      if (item !== "[REDACTED]") {
-        record[key] = "[REDACTED]";
-        replacements += 1;
-      }
-      continue;
-    }
-    replacements += redactJsonCredentials(item);
-  }
-  return replacements;
-}
 
 function attachmentObjects(value: unknown): Record<string, unknown>[] {
   const parsed = parseMaybeJson(value);
@@ -444,46 +235,9 @@ function toAttachment(
   };
 }
 
-async function readBounded(response: Response, maxBytes: number): Promise<Uint8Array> {
-  if (response.body === null) return new Uint8Array();
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      if (value === undefined) continue;
-      total += value.byteLength;
-      if (total > maxBytes) {
-        await reader.cancel();
-        throw new ApprovalMcpError("ATTACHMENT_TOO_LARGE", "The approval attachment exceeds the configured limit.", {
-          details: { maxBytes },
-        });
-      }
-      chunks.push(value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  const output = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    output.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return output;
-}
-
 function sanitizeFileName(value: string): string {
   const sanitized = value.replace(/[<>:"/\\|?*\u0000-\u001F]/gu, "_").replace(/[. ]+$/u, "").slice(0, 180);
   return sanitized || "attachment.bin";
-}
-
-function parseLength(value: string | null): number | undefined {
-  if (value === null) return undefined;
-  const parsed = Number(value);
-  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
 function numeric(value: unknown): number | undefined {

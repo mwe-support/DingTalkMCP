@@ -48,13 +48,13 @@ describe("DingTalk MCP Platform HTTP tool backend", () => {
 
   it("exposes authenticated ordinary HTTP tool actions for DingTalk's hosted MCP platform", async () => {
     const { baseUrl } = await fixture();
-    const endpoint = `${baseUrl}/platform/tools/get_processInstance_detail`;
+    const endpoint = `${baseUrl}/platform/tools/approval_task`;
 
     await expect(
       fetch(endpoint, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ processInstanceId: "pi-platform-1" }),
+        body: JSON.stringify({ action: "view", processInstanceId: "pi-platform-1" }),
       }).then((response) => response.status),
     ).resolves.toBe(401);
 
@@ -64,19 +64,19 @@ describe("DingTalk MCP Platform HTTP tool backend", () => {
         authorization: "Bearer abcdef0123456789abcdef0123456789",
         "content-type": "application/json",
       },
-      body: JSON.stringify({ processInstanceId: "pi-platform-1" }),
+      body: JSON.stringify({ action: "view", processInstanceId: "pi-platform-1" }),
     });
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
       result: {
-        normalized: { processInstanceId: "pi-platform-1", title: "Platform result" },
-        raw: { processInstanceId: "pi-platform-1", title: "Platform result" },
+        action: "view",
+        processInstanceId: "pi-platform-1",
       },
     });
   });
 
-  it("exposes the combined get_approval_instance action for the hosted platform", async () => {
+  it("does not expose endpoint-shaped compatibility tools through the hosted platform backend", async () => {
     const { baseUrl } = await fixture();
     const response = await fetch(`${baseUrl}/platform/tools/get_approval_instance`, {
       method: "POST",
@@ -87,14 +87,8 @@ describe("DingTalk MCP Platform HTTP tool backend", () => {
       body: JSON.stringify({ processInstanceId: "pi-platform-1" }),
     });
 
-    expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toMatchObject({
-      result: {
-        processInstanceId: "pi-platform-1",
-        attachments: [],
-        attachmentReads: [],
-      },
-    });
+    expect(response.status).toBe(404);
+    await expect(response.json()).resolves.toEqual({ error: "Unknown approval tool" });
   });
 
   it("exposes the role-cohesive approval_task action for the hosted platform", async () => {
@@ -118,7 +112,13 @@ describe("DingTalk MCP Platform HTTP tool backend", () => {
         data: {
           normalized: { processInstanceId: "pi-platform-1", title: "Platform result" },
           attachments: [],
-          attachmentReads: [],
+          attachmentHandling: expect.objectContaining({
+            mode: "agent_client",
+            serverDownloadsFiles: false,
+            serverParsesFiles: false,
+            serverPerformsOcr: false,
+          }),
+          attachmentDownloads: [],
           actionableTasks: [],
         },
       },
@@ -142,7 +142,7 @@ describe("DingTalk MCP Platform HTTP tool backend", () => {
 
   it("maps MCP input validation failures to the platform error contract", async () => {
     const { baseUrl } = await fixture();
-    const response = await fetch(`${baseUrl}/platform/tools/get_processInstance_detail`, {
+    const response = await fetch(`${baseUrl}/platform/tools/approval_task`, {
       method: "POST",
       headers: {
         authorization: "Bearer abcdef0123456789abcdef0123456789",
