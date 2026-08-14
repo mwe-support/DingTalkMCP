@@ -141,7 +141,7 @@ WorkBuddy 与 Codex 的无密钥 OAuth 配置模板和测试顺序见：
 - MCP 签名私钥和独立审计 HMAC key 均以只读 Secret 文件挂载。
 - `deploy/cvm/edge/dingtalk.conf` 只转发 `/mcp`、OAuth/metadata 端点和 `/healthz`。
 - 当前 CVM 入口以 `/public/cvm-web-edge/README.md` 为准：应用只发布一个唯一的 loopback 后端端口，由 `edge-nginx` 转发；不得绑定 `0.0.0.0`。
-- `127.0.0.1:3000` 已登记给正式 DingTalk 服务。并行灰度时通过 `APPROVAL_HOST_PORT` 选择并登记一个经 `ss -lntp` 验证为空闲的临时端口（当前候选为 3001）。
+- `127.0.0.1:3001` 已登记给当前正式 DingTalk 服务；OAuth 切换期间，`127.0.0.1:3000` 仅保留为旧版快速回滚实例。后续并行灰度须通过 `APPROVAL_HOST_PORT` 选择并登记另一个经 `ss -lntp` 验证为空闲的临时端口。
 - 容器 Router 与共享外部 Docker 网络是后续全站入口迁移目标，不在本次 MCP 鉴权升级中单点切换。
 - OAuth/审批状态、幂等账本和最多 30 天审计日志位于持久卷 `/app/data`。
 

@@ -26,7 +26,7 @@ services:
       APPROVAL_BACKEND_PORT: 3000
       APPROVAL_BACKEND_ALLOWED_HOSTS: dingtalk.mwexk.com
     ports:
-      - "127.0.0.1:${APPROVAL_HOST_PORT:-3000}:3000"
+      - "127.0.0.1:${APPROVAL_HOST_PORT:-3001}:3000"
     volumes:
       - approval_mcp_data:/app/data
       - ./secrets/mcp-signing-private.pem:/run/secrets/mcp-signing-private.pem:ro
