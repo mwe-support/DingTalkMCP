@@ -25,6 +25,7 @@
 - 使用当前登录账号最近已处理的一条真实审批实例，经钉钉 MCP 开发平台已保存的 `MWE审批MCP` Token 凭证读取到 1 个 `operationRecords[].attachments[]` 附件。
 - 以官方字段 `withCommentAttatchment=true` 调用 `POST /v1.0/workflow/processInstances/spaces/files/urls/download` 成功获得临时下载地址；实际下载 HTTP 200、122,165 字节。附件为 1 页、未加密 PDF，可提取文本并能正常渲染。
 - 2026-08-14 实测客户端手选本地文件形成的表单附件虽然也会返回 `spaceId`，但以该空间调用 `authDownload` 会返回 `noPermission`；直接向下载地址接口提交 `processInstanceId + fileId + fileName + fileType` 则成功。服务端因此优先采用完整文件标识直取，仅在缺少这组标识时保留 `spaceId` 授权链路。
+- 同轮实测下载接口返回 `http://*.aliyuncs.com` 签名地址；同主机改用 HTTPS 后下载成功。代码只对已通过白名单的 `.aliyuncs.com` 初始地址强制升级 HTTPS，绝不执行明文下载，其他 HTTP 域名仍被拒绝。
 - 全程未出现 401、403 或权限不足错误，因此本轮不需要再申请权限。临时下载地址、PDF、PNG 和剪贴板内容均已清理。
 - `get_approval_instance` 已更新为版本 2，工具入参使用顶层 `processInstanceId`，经最近两个真实审批实例验证可返回表单内容、操作记录、表单附件和评论附件元数据；仍不返回附件正文。
 - `start_process_instance` 已发布版本 1，HTTP 动作为 `POST https://api.dingtalk.com/v1.0/workflow/processInstances`。正式 schema 必填 `confirm`、`processCode`、`deptId`、`formComponentValues`；`originatorUserId` 固定映射平台“系统参数.操作用户id”，不暴露给 Agent；不开放 `approvers`，默认复用 OA 后台审批流程。

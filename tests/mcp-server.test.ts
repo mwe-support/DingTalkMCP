@@ -598,16 +598,20 @@ describe("approval MCP public contract", () => {
         },
       })
       .mockResolvedValueOnce({
-        result: { fileId: "local-file", downloadUri: "https://files.dingtalk.com/local-file.jpg" },
+        result: {
+          fileId: "local-file",
+          downloadUri: "http://lippi-space-zjk.oss-cn-zhangjiakou.aliyuncs.com/local-file.jpg",
+        },
       });
+    const fetchAttachment = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(new Uint8Array([1, 2, 3]), {
+        status: 200,
+        headers: { "content-type": "image/jpeg", "content-length": "3" },
+      }),
+    );
     const downloader = new AttachmentDownloader({
-      fetch: vi.fn<typeof fetch>().mockResolvedValue(
-        new Response(new Uint8Array([1, 2, 3]), {
-          status: 200,
-          headers: { "content-type": "image/jpeg", "content-length": "3" },
-        }),
-      ),
-      allowedHostSuffixes: [".dingtalk.com"],
+      fetch: fetchAttachment,
+      allowedHostSuffixes: [".aliyuncs.com"],
     });
     const service = new ApprovalService({ api: { request }, downloader, callerUserId: "user-1" });
     const server = createApprovalMcpServer(service);
@@ -653,6 +657,12 @@ describe("approval MCP public contract", () => {
         fileType: "jpg",
       },
     });
+    expect(fetchAttachment.mock.calls[0]?.[0].toString()).toBe(
+      "https://lippi-space-zjk.oss-cn-zhangjiakou.aliyuncs.com/local-file.jpg",
+    );
+    expect(fetchAttachment.mock.calls[0]?.[1]).toEqual(
+      expect.objectContaining({ method: "GET", redirect: "manual" }),
+    );
   });
 
   it("keeps detail and attachment reading in one get_approval_instance tool", async () => {

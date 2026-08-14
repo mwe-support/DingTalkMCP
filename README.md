@@ -203,6 +203,8 @@ MCP 客户端
 
 `approval_task(action=view, attachmentAction=read)` 自动根据附件来源和元数据选择下载链路：有完整 `fileName + fileType` 的客户端手选本地附件直接以 `processInstanceId + fileId + fileName + fileType` 换取临时地址，即使详情同时返回了不可授权的 `spaceId`；缺少这组文件标识、但详情带 `spaceId` 的表单附件才先以 `spaceId + fileId` 为固定调用人授权；评论附件使用官方 SDK 当前使用的 `withCommentAttatchment` 字段。固定调用人不能由 MCP 参数伪造。通用钉盘列表、搜索、共享和预览接口不进入本工具；OA 审批专用的 `/workflow/processInstances/spaces/files/*` 仍是附件读取的必要底层接口。
 
+钉钉当前可能为客户端本地附件返回阿里云 OSS 的 `http://*.aliyuncs.com` 签名地址。下载器不会明文访问它；仅在域名已通过 SSRF 白名单且严格属于 `.aliyuncs.com` 时，把协议原地升级为 HTTPS，之后仍执行逐跳域名、协议、重定向、大小和 MIME 校验。其他 HTTP 地址继续失败关闭。
+
 默认单文件最多下载 10 MiB 解码后字节，组合调用中的 Base64 正文默认总计最多 15 MiB，内容附带 SHA-256。可分别通过 `APPROVAL_DOWNLOAD_MAX_BYTES` 与 `APPROVAL_ATTACHMENT_BATCH_MAX_BYTES` 调整；批次按请求顺序串行下载，超过 Base64 正文预算的文件返回独立 ledger 错误，避免并发大响应造成内存峰值。审批详情与 JSON 字段开销不计入该正文预算。
 
 正文只允许常用 PDF、Office、文本、JSON/XML 和图片 MIME；服务端返回 `application/octet-stream` 时必须能由白名单文件扩展名推断类型，未知二进制和可执行类型失败关闭。UTF-8 文本会在转 Base64 前按 `credentials-v1` 规则替换 access token、API key、App Secret、Authorization、client secret 和 password 等凭证值，并返回是否执行/命中的脱敏元数据。PDF、Office 和图片等二进制不做会破坏原文件的语义改写，`redaction.evaluated=false` 明确标识该边界；附件正文不会进入审计日志。

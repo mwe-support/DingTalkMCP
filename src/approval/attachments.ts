@@ -59,6 +59,8 @@ const DEFAULT_ALLOWED_MIME_TYPES = [
   "text/xml",
 ] as const;
 
+const OFFICIAL_HTTPS_UPGRADE_HOST_SUFFIXES = [".aliyuncs.com"] as const;
+
 export function extractApprovalAttachments(detail: unknown): ApprovalAttachment[] {
   const root = asRecord(detail) ?? {};
   const output: ApprovalAttachment[] = [];
@@ -218,7 +220,20 @@ export class AttachmentDownloader {
     const allowed = this.#allowedHostSuffixes.some((suffix) =>
       suffix.startsWith(".") ? host.endsWith(suffix) : host === suffix || host.endsWith(`.${suffix}`),
     );
-    if (url.protocol !== "https:" || !allowed || url.username !== "" || url.password !== "") {
+    if (!allowed || url.username !== "" || url.password !== "") {
+      throw new ApprovalMcpError(
+        "ATTACHMENT_URL_REJECTED",
+        "The approval attachment URL is outside the configured HTTPS allowlist.",
+        { details: { host } },
+      );
+    }
+    if (
+      url.protocol === "http:" &&
+      OFFICIAL_HTTPS_UPGRADE_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix))
+    ) {
+      url.protocol = "https:";
+    }
+    if (url.protocol !== "https:") {
       throw new ApprovalMcpError(
         "ATTACHMENT_URL_REJECTED",
         "The approval attachment URL is outside the configured HTTPS allowlist.",
