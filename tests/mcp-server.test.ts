@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ApprovalService } from "../src/approval/service.js";
 import { AttachmentDownloader } from "../src/approval/attachments.js";
+import { InMemoryIdempotencyLedger } from "../src/core/idempotency.js";
 import type { DingTalkApiClient } from "../src/dingtalk/client.js";
 import { createApprovalMcpServer } from "../src/mcp/create-server.js";
 
@@ -70,6 +71,9 @@ async function connectedPublicClient(apiResponse: unknown = {}): Promise<{
   closeables.push(client, server);
   return { client, request };
 }
+
+const APPROVE_REQUEST_ID = "11111111-1111-4111-8111-111111111111";
+const REJECT_REQUEST_ID = "22222222-2222-4222-8222-222222222222";
 
 describe("approval MCP public contract", () => {
   it("publishes one role-cohesive approval_task tool instead of endpoint-shaped tools", async () => {
@@ -176,6 +180,7 @@ describe("approval MCP public contract", () => {
         action: "approve",
         processInstanceId: "pi-approve",
         taskId: "task-approve",
+        requestId: APPROVE_REQUEST_ID,
         confirm: true,
         remark: "符合要求",
       },
@@ -229,6 +234,7 @@ describe("approval MCP public contract", () => {
         action: "reject",
         processInstanceId: "pi-reject",
         taskId: "task-reject",
+        requestId: REJECT_REQUEST_ID,
         confirm: true,
         remark: "   ",
       },
@@ -259,6 +265,7 @@ describe("approval MCP public contract", () => {
         action: "reject",
         processInstanceId: "pi-reject",
         taskId: "task-reject",
+        requestId: REJECT_REQUEST_ID,
         confirm: true,
         remark: "附件内容不符合报销标准",
       },
@@ -300,6 +307,172 @@ describe("approval MCP public contract", () => {
 
     expect(result.isError).toBe(true);
     expect(request).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the active task belongs to another DingTalk user", async () => {
+    const { client, request } = await connectedPublicClient({
+      result: {
+        processInstanceId: "pi-other-user",
+        status: "RUNNING",
+        tasks: [{ taskId: "task-other", userId: "user-2", status: "RUNNING" }],
+      },
+    });
+
+    const result = await client.callTool({
+      name: "approval_task",
+      arguments: {
+        action: "approve",
+        processInstanceId: "pi-other-user",
+        taskId: "task-other",
+        requestId: "33333333-3333-4333-8333-333333333333",
+        confirm: true,
+      },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({ error: { code: "TASK_ACTOR_MISMATCH" } });
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed when the selected task is no longer actionable", async () => {
+    const { client, request } = await connectedPublicClient({
+      result: {
+        processInstanceId: "pi-stale",
+        status: "COMPLETED",
+        tasks: [{ taskId: "task-stale", userId: "user-1", status: "COMPLETED" }],
+      },
+    });
+
+    const result = await client.callTool({
+      name: "approval_task",
+      arguments: {
+        action: "approve",
+        processInstanceId: "pi-stale",
+        taskId: "task-stale",
+        requestId: "44444444-4444-4444-8444-444444444444",
+        confirm: true,
+      },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({ error: { code: "TASK_NOT_ACTIONABLE" } });
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it("deduplicates approval decisions by requestId and rejects conflicting reuse", async () => {
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce({
+        result: {
+          processInstanceId: "pi-idempotent",
+          status: "RUNNING",
+          tasks: [{ taskId: "task-idempotent", userId: "user-1", status: "RUNNING" }],
+        },
+      })
+      .mockResolvedValueOnce({ success: true })
+      .mockResolvedValueOnce({ result: { processInstanceId: "pi-idempotent", status: "COMPLETED" } })
+      .mockResolvedValueOnce({ result: { processInstanceId: "pi-idempotent", status: "COMPLETED" } });
+    const service = new ApprovalService({
+      api: { request } as unknown as Pick<DingTalkApiClient, "request">,
+      writeUserIds: ["user-1"],
+      callerUserId: "user-1",
+      idempotencyLedger: new InMemoryIdempotencyLedger(),
+    });
+    const server = createApprovalMcpServer(service);
+    const client = new Client({ name: "approval-idempotency-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    closeables.push(client, server);
+    const arguments_ = {
+      action: "approve" as const,
+      processInstanceId: "pi-idempotent",
+      taskId: "task-idempotent",
+      requestId: "55555555-5555-4555-8555-555555555555",
+      confirm: true,
+      remark: "approved once",
+    };
+
+    const first = await client.callTool({ name: "approval_task", arguments: arguments_ });
+    const repeated = await client.callTool({ name: "approval_task", arguments: arguments_ });
+    const conflict = await client.callTool({
+      name: "approval_task",
+      arguments: { ...arguments_, remark: "different decision payload" },
+    });
+
+    expect(first.isError).not.toBe(true);
+    expect(repeated.structuredContent).toMatchObject({
+      result: {
+        action: "approve",
+        currentStatus: "COMPLETED",
+        data: { upstreamResult: { success: true } },
+      },
+    });
+    expect(request).toHaveBeenCalledTimes(4);
+    expect(conflict.isError).toBe(true);
+    expect(conflict.structuredContent).toMatchObject({ error: { code: "IDEMPOTENCY_CONFLICT" } });
+  });
+
+  it("does not report a successful decision as failed when the post-write refresh is unavailable", async () => {
+    const { client, request } = await connectedPublicClient();
+    request
+      .mockResolvedValueOnce({
+        result: {
+          processInstanceId: "pi-refresh",
+          status: "RUNNING",
+          tasks: [{ taskId: "task-refresh", userId: "user-1", status: "RUNNING" }],
+        },
+      })
+      .mockResolvedValueOnce({ success: true })
+      .mockRejectedValueOnce(new Error("detail endpoint unavailable"));
+
+    const result = await client.callTool({
+      name: "approval_task",
+      arguments: {
+        action: "approve",
+        processInstanceId: "pi-refresh",
+        taskId: "task-refresh",
+        requestId: "66666666-6666-4666-8666-666666666666",
+        confirm: true,
+      },
+    });
+
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      result: {
+        action: "approve",
+        currentStatus: "UNKNOWN",
+        safeNextActions: ["view"],
+        data: {
+          upstreamResult: { success: true },
+          postActionRefresh: { ok: false },
+        },
+      },
+    });
+  });
+
+  it("enforces attachment selection limits through approval_task itself", async () => {
+    const { client, request } = await connectedPublicClient({
+      result: {
+        processInstanceId: "pi-public-limit",
+        operationRecords: [{ attachments: [{ fileId: "one" }, { fileId: "two" }] }],
+      },
+    });
+
+    const result = await client.callTool({
+      name: "approval_task",
+      arguments: {
+        action: "view",
+        processInstanceId: "pi-public-limit",
+        attachmentAction: "read",
+        attachmentIds: ["one", "two"],
+        maxAttachments: 1,
+      },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({ error: { code: "INVALID_INPUT" } });
+    expect(request).toHaveBeenCalledTimes(1);
   });
 
   it("reads a selected comment attachment inside action=view with DingTalk's comment flag", async () => {
@@ -518,8 +691,8 @@ describe("approval MCP public contract", () => {
           operationRecords: [
             {
               attachments: [
-                { fileId: "file-1", fileName: "one.bin", fileSize: 3 },
-                { fileId: "file-2", fileName: "two.bin", fileSize: 3 },
+                { fileId: "file-1", fileName: "one.pdf", fileSize: 3 },
+                { fileId: "file-2", fileName: "two.pdf", fileSize: 3 },
               ],
             },
           ],
@@ -531,7 +704,7 @@ describe("approval MCP public contract", () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
       new Response(new Uint8Array([1, 2, 3]), {
         status: 200,
-        headers: { "content-type": "application/octet-stream", "content-length": "3" },
+        headers: { "content-type": "application/pdf", "content-length": "3" },
       }),
     );
     const client = await connectedClientWithDownloader(
@@ -716,7 +889,12 @@ describe("approval MCP public contract", () => {
 
     const result = await client.callTool({
       name: "approve_processInstance",
-      arguments: { processInstanceId: "pi-1", taskId: "task-1", remark: "ok" },
+      arguments: {
+        processInstanceId: "pi-1",
+        taskId: "task-1",
+        requestId: "77777777-7777-4777-8777-777777777777",
+        remark: "ok",
+      },
     });
 
     expect(result.isError).toBe(true);

@@ -22,6 +22,12 @@ export interface DownloadedAttachment {
   size: number;
   sha256: string;
   contentBase64: string;
+  redaction: {
+    policy: "credentials-v1";
+    evaluated: boolean;
+    applied: boolean;
+    replacements: number;
+  };
 }
 
 interface AttachmentDownloaderOptions {
@@ -30,7 +36,28 @@ interface AttachmentDownloaderOptions {
   allowedHostSuffixes?: string[];
   timeoutMs?: number;
   maxRedirects?: number;
+  allowedMimeTypes?: string[];
 }
+
+const DEFAULT_ALLOWED_MIME_TYPES = [
+  "application/json",
+  "application/msword",
+  "application/pdf",
+  "application/rtf",
+  "application/vnd.ms-excel",
+  "application/vnd.ms-powerpoint",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/xml",
+  "image/gif",
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "text/csv",
+  "text/plain",
+  "text/xml",
+] as const;
 
 export function extractApprovalAttachments(detail: unknown): ApprovalAttachment[] {
   const root = asRecord(detail) ?? {};
@@ -96,6 +123,7 @@ export class AttachmentDownloader {
   readonly #allowedHostSuffixes: string[];
   readonly #timeoutMs: number;
   readonly #maxRedirects: number;
+  readonly #allowedMimeTypes: Set<string>;
 
   constructor(options: AttachmentDownloaderOptions = {}) {
     this.#fetch = options.fetch ?? fetch;
@@ -107,6 +135,9 @@ export class AttachmentDownloader {
     ]).map((value) => value.toLowerCase());
     this.#timeoutMs = options.timeoutMs ?? 30_000;
     this.#maxRedirects = options.maxRedirects ?? 3;
+    this.#allowedMimeTypes = new Set(
+      (options.allowedMimeTypes ?? [...DEFAULT_ALLOWED_MIME_TYPES]).map((value) => value.toLowerCase()),
+    );
   }
 
   async downloadToBase64(downloadUrl: string, fileName: string): Promise<DownloadedAttachment> {
@@ -125,13 +156,21 @@ export class AttachmentDownloader {
       });
     }
 
-    const bytes = await readBounded(response, this.#maxBytes);
+    const mimeType = resolveAllowedMimeType(response.headers.get("content-type"), fileName, this.#allowedMimeTypes);
+    const sourceBytes = await readBounded(response, this.#maxBytes);
+    const { bytes, redaction } = redactCredentialText(sourceBytes, mimeType);
+    if (bytes.byteLength > this.#maxBytes) {
+      throw new ApprovalMcpError("ATTACHMENT_TOO_LARGE", "The redacted approval attachment exceeds the configured limit.", {
+        details: { maxBytes: this.#maxBytes },
+      });
+    }
     return {
       fileName: sanitizeFileName(fileName),
-      mimeType: response.headers.get("content-type")?.split(";", 1)[0]?.trim() || "application/octet-stream",
+      mimeType,
       size: bytes.byteLength,
       sha256: createHash("sha256").update(bytes).digest("hex"),
       contentBase64: Buffer.from(bytes).toString("base64"),
+      redaction,
     };
   }
 
@@ -188,6 +227,107 @@ export class AttachmentDownloader {
     }
     return url;
   }
+}
+
+const MIME_BY_EXTENSION: Readonly<Record<string, string>> = {
+  ".csv": "text/csv",
+  ".doc": "application/msword",
+  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".gif": "image/gif",
+  ".jpeg": "image/jpeg",
+  ".jpg": "image/jpeg",
+  ".json": "application/json",
+  ".pdf": "application/pdf",
+  ".png": "image/png",
+  ".ppt": "application/vnd.ms-powerpoint",
+  ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  ".rtf": "application/rtf",
+  ".txt": "text/plain",
+  ".webp": "image/webp",
+  ".xls": "application/vnd.ms-excel",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ".xml": "application/xml",
+};
+
+function resolveAllowedMimeType(
+  contentType: string | null,
+  fileName: string,
+  allowedMimeTypes: ReadonlySet<string>,
+): string {
+  const declared = contentType?.split(";", 1)[0]?.trim().toLowerCase();
+  const extension = /\.[a-z0-9]+$/iu.exec(fileName)?.[0]?.toLowerCase();
+  const inferred = extension === undefined ? undefined : MIME_BY_EXTENSION[extension];
+  if (extension !== undefined && inferred === undefined) {
+    throw new ApprovalMcpError(
+      "ATTACHMENT_TYPE_NOT_ALLOWED",
+      "The approval attachment file extension is outside the configured allowlist.",
+      { details: { declaredMimeType: declared ?? "missing", fileExtension: extension } },
+    );
+  }
+  if (
+    declared !== undefined &&
+    declared !== "" &&
+    declared !== "application/octet-stream" &&
+    inferred !== undefined &&
+    declared !== inferred &&
+    !(declared === "text/xml" && inferred === "application/xml")
+  ) {
+    throw new ApprovalMcpError(
+      "ATTACHMENT_TYPE_NOT_ALLOWED",
+      "The approval attachment MIME type does not match its allowlisted file extension.",
+      { details: { declaredMimeType: declared, inferredMimeType: inferred, fileExtension: extension } },
+    );
+  }
+  const mimeType = declared === undefined || declared === "" || declared === "application/octet-stream"
+    ? inferred
+    : declared;
+  if (mimeType === undefined || !allowedMimeTypes.has(mimeType)) {
+    throw new ApprovalMcpError(
+      "ATTACHMENT_TYPE_NOT_ALLOWED",
+      "The approval attachment MIME type is outside the configured allowlist.",
+      { details: { declaredMimeType: declared ?? "missing", fileExtension: extension ?? "missing" } },
+    );
+  }
+  return mimeType;
+}
+
+function redactCredentialText(
+  sourceBytes: Uint8Array,
+  mimeType: string,
+): { bytes: Uint8Array; redaction: DownloadedAttachment["redaction"] } {
+  const textLike = mimeType.startsWith("text/") || mimeType === "application/json" || mimeType === "application/xml";
+  if (!textLike) {
+    return {
+      bytes: sourceBytes,
+      redaction: { policy: "credentials-v1", evaluated: false, applied: false, replacements: 0 },
+    };
+  }
+  let decoded: string;
+  try {
+    decoded = new TextDecoder("utf-8", { fatal: true }).decode(sourceBytes);
+  } catch {
+    return {
+      bytes: sourceBytes,
+      redaction: { policy: "credentials-v1", evaluated: false, applied: false, replacements: 0 },
+    };
+  }
+  let replacements = 0;
+  const redacted = decoded.replace(
+    /((?:access[_-]?token|api[_-]?key|app[_-]?secret|authorization|client[_-]?secret|password)\s*[:=]\s*)(?:bearer\s+)?([^\s,;]+)/giu,
+    (_match, prefix: string) => {
+      replacements += 1;
+      return `${prefix}[REDACTED]`;
+    },
+  );
+  return {
+    bytes: new TextEncoder().encode(redacted),
+    redaction: {
+      policy: "credentials-v1",
+      evaluated: true,
+      applied: replacements > 0,
+      replacements,
+    },
+  };
 }
 
 function attachmentObjects(value: unknown): Record<string, unknown>[] {

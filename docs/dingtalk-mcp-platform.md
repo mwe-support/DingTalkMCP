@@ -98,8 +98,8 @@ Body: 工具参数对象
 代码后端启用后，正常 Agent 工具清单只发布 `approval_task`：
 
 - `action=view`：一次返回审批内容、操作记录、评论、当前可操作任务和附件元数据；`attachmentAction=read` 时在同一调用中完成选定附件的授权、临时地址换取、安全下载和逐文件 ledger。
-- `action=approve`：要求 `processInstanceId + taskId + confirm`，服务端重新读取任务并校验固定调用人后再同意。
-- `action=reject`：与同意共用状态机，但强制要求非空 `remark`。
+- `action=approve`：要求 `processInstanceId + taskId + requestId + confirm`，服务端原子预留幂等键、重新读取任务并校验固定调用人后再同意。
+- `action=reject`：与同意共用状态机和持久化幂等账本，但强制要求非空 `remark`。
 - 三个动作统一返回实例 ID、动作、当前状态、本地审计关联 ID、安全后续动作和数据 envelope。
 
 其余表中的端点仅是钉钉平台迁移期兼容面或内部管理面，不进入正常 MCP `tools/list`。发起、撤销属于申请人角色，不能混入审批人的 `approval_task`；在对外发布代码版申请人能力前应另行聚合为 `approval_request`。

@@ -54,7 +54,7 @@ approval_task
 }
 ```
 
-每次最多读取 5 个附件，默认上限 3 个；超出上限直接报错，不静默截断。批量读取按附件返回 ledger：一个附件失败不会抹掉其他成功结果。内容同时受单文件大小、批次总字节数、HTTPS 主机和重定向校验约束。只有 URL、没有 `fileId` 的图片目前列入元数据清单，但不进入 `attachmentIds` 内容读取链路。
+每次最多读取 5 个附件，默认上限 3 个；超出上限直接报错，不静默截断。批量读取按附件返回 ledger：一个附件失败不会抹掉其他成功结果。内容同时受单文件大小、批次总字节数、MIME allowlist、HTTPS 主机、重定向和文本凭证脱敏规则约束。只有 URL、没有 `fileId` 的图片目前列入元数据清单，但不进入 `attachmentIds` 内容读取链路。
 
 同意和拒绝使用相同主标识和工具边界：
 
@@ -63,6 +63,7 @@ approval_task
   "action": "approve",
   "processInstanceId": "审批实例ID",
   "taskId": "view返回的当前任务ID",
+  "requestId": "每次业务决策生成并稳定复用的UUID",
   "confirm": true,
   "remark": "符合要求"
 }
@@ -186,7 +187,7 @@ MCP 客户端
 
 写工具支持 `dryRun=true`：执行本地权限和最新状态校验，但不调用写接口，也不要求 `confirm=true`。
 
-`start_process_instance.requestId` 是 MCP 侧持久化幂等键，不会作为未知字段传给钉钉 OpenAPI。成功结果写入 `APPROVAL_IDEMPOTENCY_LEDGER_PATH`，重启后仍会复用；同一个 UUID 配不同请求返回 `IDEMPOTENCY_CONFLICT`。若超时或崩溃导致结果不确定，服务返回 `IDEMPOTENCY_OUTCOME_UNKNOWN` 并停止自动重试，要求先在钉钉中核对，避免重复发起。
+`start_process_instance.requestId` 和 `approval_task(action=approve|reject).requestId` 是 MCP 侧持久化幂等键，不会作为未知字段传给钉钉 OpenAPI。发起与审批决策使用不同账本命名空间；成功结果写入 `APPROVAL_IDEMPOTENCY_LEDGER_PATH`，重启后仍会复用；同一个 UUID 在同类动作中配不同请求返回 `IDEMPOTENCY_CONFLICT`。若超时或崩溃导致结果不确定，服务返回 `IDEMPOTENCY_OUTCOME_UNKNOWN` 并停止自动重试，要求先刷新钉钉审批状态，避免重复写入。
 
 目录账本为每个 requestId 建立 SHA-256 命名目录，并以原子 `mkdir` 完成“检查并预留”，支持共享同一文件系统的多个 HTTP 并发实例。崩溃留下的 `pending` 记录不会被回收，而是持续失败关闭，要求人工核对钉钉实例后处理；跨主机多副本若不共享该目录，应改用带唯一约束事务的共享数据库。
 
@@ -203,6 +204,8 @@ MCP 客户端
 `approval_task(action=view, attachmentAction=read)` 自动根据附件来源选择下载链路。表单附件先以详情返回的 `spaceId + fileId` 为固定调用人授权，再以 `processInstanceId + fileId` 换取临时地址；评论附件自动使用官方 SDK 当前使用的 `withCommentAttatchment` 字段。固定调用人不能由 MCP 参数伪造。通用钉盘列表、搜索、共享和预览接口不进入本工具；OA 审批专用的 `/workflow/processInstances/spaces/files/*` 仍是附件读取的必要底层接口。
 
 默认单文件最多下载 10 MiB 解码后字节，组合调用中的 Base64 正文默认总计最多 15 MiB，内容附带 SHA-256。可分别通过 `APPROVAL_DOWNLOAD_MAX_BYTES` 与 `APPROVAL_ATTACHMENT_BATCH_MAX_BYTES` 调整；批次按请求顺序串行下载，超过 Base64 正文预算的文件返回独立 ledger 错误，避免并发大响应造成内存峰值。审批详情与 JSON 字段开销不计入该正文预算。
+
+正文只允许常用 PDF、Office、文本、JSON/XML 和图片 MIME；服务端返回 `application/octet-stream` 时必须能由白名单文件扩展名推断类型，未知二进制和可执行类型失败关闭。UTF-8 文本会在转 Base64 前按 `credentials-v1` 规则替换 access token、API key、App Secret、Authorization、client secret 和 password 等凭证值，并返回是否执行/命中的脱敏元数据。PDF、Office 和图片等二进制不做会破坏原文件的语义改写，`redaction.evaluated=false` 明确标识该边界；附件正文不会进入审计日志。
 
 ## 目录结构
 

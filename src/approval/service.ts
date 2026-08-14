@@ -38,6 +38,7 @@ export interface ExecuteTaskInput {
   correlationId?: string | undefined;
   processInstanceId: string;
   taskId: string | number;
+  requestId: string;
   actionerUserId?: string | undefined;
   result: "agree" | "refuse";
   remark?: string | undefined;
@@ -95,6 +96,7 @@ export type ApprovalTaskInput =
       action: "approve" | "reject";
       processInstanceId: string;
       taskId: string | number;
+      requestId: string;
       confirm: boolean;
       dryRun?: boolean | undefined;
       remark?: string | undefined;
@@ -121,6 +123,7 @@ export class ApprovalService {
   readonly #audit: ApprovalAuditSink;
   readonly #idempotencyLedger: IdempotencyLedger;
   readonly #startRequests = new Map<string, { fingerprint: string; promise: Promise<unknown> }>();
+  readonly #decisionRequests = new Map<string, { fingerprint: string; promise: Promise<unknown> }>();
 
   constructor(options: ApprovalServiceOptions) {
     this.#api = options.api;
@@ -214,21 +217,29 @@ export class ApprovalService {
       correlationId: auditCorrelationId,
       processInstanceId: input.processInstanceId,
       taskId: input.taskId,
+      requestId: input.requestId,
       result: input.action === "approve" ? "agree" : "refuse",
       ...(input.remark === undefined ? {} : { remark: input.remark }),
     });
-    const current = await this.getProcessInstanceDetail(input.processInstanceId);
+    let current: Awaited<ReturnType<ApprovalService["getProcessInstanceDetail"]>> | undefined;
+    try {
+      current = await this.getProcessInstanceDetail(input.processInstanceId);
+    } catch {
+      // The decision has already succeeded or was a dry run. A failed refresh must
+      // never turn that outcome into a mutation error that invites a duplicate retry.
+    }
     return {
       processInstanceId: input.processInstanceId,
       action: input.action,
-      currentStatus: current.normalized.status?.toUpperCase() ?? "UNKNOWN",
+      currentStatus: current?.normalized.status?.toUpperCase() ?? "UNKNOWN",
       auditCorrelationId,
       safeNextActions: input.dryRun === true ? ["view", input.action] : ["view"],
       data: {
         taskId: String(input.taskId),
         dryRun: input.dryRun === true,
         upstreamResult,
-        normalized: current.normalized,
+        postActionRefresh: { ok: current !== undefined },
+        ...(current === undefined ? {} : { normalized: current.normalized }),
       },
     };
   }
@@ -351,6 +362,10 @@ export class ApprovalService {
   async executeTask(input: ExecuteTaskInput): Promise<unknown> {
     const actorUserId = this.#resolveCaller(input.actionerUserId);
     this.#assertActorAllowed(actorUserId);
+    const remark = input.remark?.trim();
+    if (input.result === "refuse" && (remark === undefined || remark === "")) {
+      throw new ApprovalMcpError("INVALID_INPUT", "Rejecting an approval requires a non-empty business reason.");
+    }
     if (input.dryRun === true) {
       await this.#assertTaskActionable(input.processInstanceId, input.taskId, actorUserId);
       return {
@@ -358,6 +373,7 @@ export class ApprovalService {
         action: input.result === "agree" ? "approve" : "reject",
         processInstanceId: input.processInstanceId,
         taskId: String(input.taskId),
+        requestIdPresent: input.requestId.trim() !== "",
       };
     }
     return this.#audited(
@@ -367,18 +383,51 @@ export class ApprovalService {
         ...(input.correlationId === undefined ? {} : { correlationId: input.correlationId }),
         processInstanceId: input.processInstanceId,
         taskId: String(input.taskId),
+        requestId: input.requestId,
       },
       async () => {
         this.#assertConfirmedActor(input.confirm, actorUserId);
-        await this.#assertTaskActionable(input.processInstanceId, input.taskId, actorUserId);
-        return this.#api.request({
-          method: "POST",
-          path: "/v1.0/workflow/processInstances/execute",
-          body: {
-            ...omit(input, ["confirm", "dryRun", "correlationId", "actionerUserId"]),
-            actionerUserId: actorUserId,
-          },
+        if (input.requestId.trim() === "") {
+          throw new ApprovalMcpError(
+            "IDEMPOTENCY_KEY_REQUIRED",
+            "An approval decision requires a stable requestId UUID.",
+          );
+        }
+        const body = {
+          ...omit(input, ["confirm", "dryRun", "correlationId", "actionerUserId", "requestId", "remark"]),
+          ...(remark === undefined || remark === "" ? {} : { remark }),
+          actionerUserId: actorUserId,
+        };
+        const fingerprint = createHash("sha256").update(stableStringify(body)).digest("hex");
+        const existing = this.#decisionRequests.get(input.requestId);
+        if (existing !== undefined) {
+          if (existing.fingerprint !== fingerprint) {
+            throw new ApprovalMcpError(
+              "IDEMPOTENCY_CONFLICT",
+              "The requestId was already used with a different approval decision payload.",
+            );
+          }
+          return existing.promise;
+        }
+        const request = this.#executeTaskIdempotently(
+          input.requestId,
+          fingerprint,
+          input.processInstanceId,
+          input.taskId,
+          actorUserId,
+          body,
+        ).catch((error: unknown) => {
+          if (!(error instanceof ApprovalMcpError) || error.code !== "IDEMPOTENCY_OUTCOME_UNKNOWN") {
+            this.#decisionRequests.delete(input.requestId);
+          }
+          throw error;
         });
+        this.#decisionRequests.set(input.requestId, { fingerprint, promise: request });
+        if (this.#decisionRequests.size > 1000) {
+          const oldest = this.#decisionRequests.keys().next().value as string | undefined;
+          if (oldest !== undefined && oldest !== input.requestId) this.#decisionRequests.delete(oldest);
+        }
+        return request;
       },
     );
   }
@@ -777,6 +826,67 @@ export class ApprovalService {
     }
   }
 
+  async #executeTaskIdempotently(
+    requestId: string,
+    fingerprint: string,
+    processInstanceId: string,
+    taskId: string | number,
+    actorUserId: string,
+    body: Record<string, unknown>,
+  ): Promise<unknown> {
+    const ledgerKey = `approval-task:${requestId}`;
+    const reservation = await this.#idempotencyLedger.reserve(ledgerKey, fingerprint);
+    if (!reservation.created) {
+      const previous = reservation.entry;
+      if (previous.fingerprint !== fingerprint) {
+        throw new ApprovalMcpError(
+          "IDEMPOTENCY_CONFLICT",
+          "The requestId was already used with a different approval decision payload.",
+        );
+      }
+      if (previous.status === "succeeded") return previous.result;
+      throw new ApprovalMcpError(
+        "IDEMPOTENCY_OUTCOME_UNKNOWN",
+        "A previous approval decision may have reached DingTalk; refresh the approval before any new decision.",
+      );
+    }
+
+    try {
+      await this.#assertTaskActionable(processInstanceId, taskId, actorUserId);
+      const result = await this.#api.request({
+        method: "POST",
+        path: "/v1.0/workflow/processInstances/execute",
+        body,
+      });
+      await this.#idempotencyLedger.put(ledgerKey, {
+        fingerprint,
+        status: "succeeded",
+        result,
+        updatedAt: new Date().toISOString(),
+      });
+      return result;
+    } catch (error) {
+      if (isKnownPreWriteRejection(error)) {
+        await this.#idempotencyLedger.delete(ledgerKey);
+        throw error;
+      }
+      try {
+        await this.#idempotencyLedger.put(ledgerKey, {
+          fingerprint,
+          status: "uncertain",
+          updatedAt: new Date().toISOString(),
+        });
+      } catch {
+        // The pending reservation still prevents an unsafe automatic replay.
+      }
+      throw new ApprovalMcpError(
+        "IDEMPOTENCY_OUTCOME_UNKNOWN",
+        "The approval decision result is uncertain; refresh the approval before any new decision.",
+        { cause: error },
+      );
+    }
+  }
+
   async #audited<T>(context: ApprovalAuditContext, operation: () => Promise<T>): Promise<T> {
     try {
       const result = await operation();
@@ -845,6 +955,25 @@ function attachmentReadError(
 function base64EncodedBytes(decodedBytes: number): number {
   return 4 * Math.ceil(decodedBytes / 3);
 }
+
+function isKnownPreWriteRejection(error: unknown): boolean {
+  if (!(error instanceof ApprovalMcpError)) return false;
+  if (error.code === "DINGTALK_API_ERROR") return !error.retryable;
+  return PRE_WRITE_REJECTION_CODES.has(error.code);
+}
+
+const PRE_WRITE_REJECTION_CODES = new Set<ApprovalMcpErrorCode>([
+  "CALLER_IDENTITY_MISMATCH",
+  "CALLER_IDENTITY_NOT_CONFIGURED",
+  "CONFIRMATION_REQUIRED",
+  "IDEMPOTENCY_CONFLICT",
+  "IDEMPOTENCY_KEY_REQUIRED",
+  "INVALID_INPUT",
+  "PROCESS_CODE_NOT_ALLOWED",
+  "TASK_ACTOR_MISMATCH",
+  "TASK_NOT_ACTIONABLE",
+  "WRITE_ACTOR_NOT_ALLOWED",
+]);
 
 function withoutUndefined<T extends Record<string, unknown>>(input: T): T {
   return Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined)) as T;

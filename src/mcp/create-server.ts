@@ -23,6 +23,7 @@ const jsonRecord = z.record(z.string(), z.unknown());
 const processInstanceId = z.string().min(1).describe("DingTalk approval processInstanceId");
 const userId = z.string().min(1).describe("DingTalk userId; write operations must match the server allowlist");
 const taskId = z.union([z.string().min(1), z.number().int().nonnegative()]);
+const decisionRequestId = z.string().uuid().describe("Stable UUID used to prevent duplicate approval decisions");
 const approvalTaskViewSchema = z
   .object({
     action: z.literal("view"),
@@ -32,23 +33,24 @@ const approvalTaskViewSchema = z
     maxAttachments: z.number().int().min(1).max(5).optional(),
   })
   .strict();
+const approvalTaskDecisionShape = {
+  processInstanceId,
+  taskId,
+  requestId: decisionRequestId,
+  confirm: z.boolean(),
+  dryRun: z.boolean().optional(),
+} as const;
 const approvalTaskApproveSchema = z
   .object({
     action: z.literal("approve"),
-    processInstanceId,
-    taskId,
-    confirm: z.boolean(),
-    dryRun: z.boolean().optional(),
+    ...approvalTaskDecisionShape,
     remark: z.string().max(1024).optional(),
   })
   .strict();
 const approvalTaskRejectSchema = z
   .object({
     action: z.literal("reject"),
-    processInstanceId,
-    taskId,
-    confirm: z.boolean(),
-    dryRun: z.boolean().optional(),
+    ...approvalTaskDecisionShape,
     remark: z.string().trim().min(1).max(1024),
   })
   .strict();
@@ -269,6 +271,7 @@ export function createApprovalMcpServer(
     dryRun: z.boolean().optional().describe("Refresh and validate the task without executing a decision"),
     processInstanceId,
     taskId: z.union([z.string().min(1), z.number().int().nonnegative()]),
+    requestId: decisionRequestId,
     actionerUserId: userId.optional().describe("Optional compatibility field; must match the server-bound caller"),
     remark: z.string().max(1024).optional(),
     file: jsonRecord.optional(),

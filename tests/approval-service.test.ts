@@ -114,6 +114,7 @@ describe("ApprovalService OpenAPI contract", () => {
         confirm: true,
         processInstanceId: "pi-1",
         taskId: 456,
+        requestId: "11111111-1111-4111-8111-111111111111",
         actionerUserId: "user-1",
         result: "agree",
       }),
@@ -158,6 +159,7 @@ describe("ApprovalService OpenAPI contract", () => {
         confirm: true,
         processInstanceId: "pi-1",
         taskId: 456,
+        requestId: "22222222-2222-4222-8222-222222222222",
         actionerUserId: "user-1",
         result: "agree",
       }),
@@ -192,6 +194,7 @@ describe("ApprovalService OpenAPI contract", () => {
         confirm: true,
         processInstanceId: "pi-1",
         taskId: 456,
+        requestId: "44444444-4444-4444-8444-444444444444",
         actionerUserId: "user-1",
         result: "agree",
       }),
@@ -273,6 +276,7 @@ describe("ApprovalService OpenAPI contract", () => {
         confirm: true,
         processInstanceId: "pi-1",
         taskId: 456,
+        requestId: "44444444-4444-4444-8444-444444444444",
         actionerUserId: "user-1",
         result: "agree",
       }),
@@ -335,6 +339,74 @@ describe("ApprovalService OpenAPI contract", () => {
     await expect(service.startProcessInstance(input)).rejects.toMatchObject({ code: "IDEMPOTENCY_OUTCOME_UNKNOWN" });
     await expect(service.startProcessInstance(input)).rejects.toMatchObject({ code: "IDEMPOTENCY_OUTCOME_UNKNOWN" });
     expect(api.request).toHaveBeenCalledTimes(1);
+  });
+
+  it("reuses a persisted successful approval decision across service restarts", async () => {
+    const ledger = new InMemoryIdempotencyLedger();
+    const firstApi = apiMock();
+    vi.mocked(firstApi.request)
+      .mockResolvedValueOnce({
+        result: {
+          processInstanceId: "pi-decision",
+          status: "RUNNING",
+          tasks: [{ taskId: "task-decision", userId: "user-1", status: "RUNNING" }],
+        },
+      })
+      .mockResolvedValueOnce({ success: true });
+    const options = {
+      writeUserIds: ["user-1"],
+      callerUserId: "user-1",
+      idempotencyLedger: ledger,
+    } as const;
+    const input = {
+      confirm: true,
+      requestId: "88888888-8888-4888-8888-888888888888",
+      processInstanceId: "pi-decision",
+      taskId: "task-decision",
+      result: "agree" as const,
+    };
+
+    await expect(new ApprovalService({ api: firstApi, ...options }).executeTask(input)).resolves.toEqual({
+      success: true,
+    });
+    await expect(ledger.get(`approval-task:${input.requestId}`)).resolves.toMatchObject({ status: "succeeded" });
+
+    const restartedApi = apiMock();
+    await expect(new ApprovalService({ api: restartedApi, ...options }).executeTask(input)).resolves.toEqual({
+      success: true,
+    });
+    expect(restartedApi.request).not.toHaveBeenCalled();
+  });
+
+  it("fails closed after an uncertain approval decision instead of submitting twice", async () => {
+    const ledger = new InMemoryIdempotencyLedger();
+    const api = apiMock();
+    vi.mocked(api.request)
+      .mockResolvedValueOnce({
+        result: {
+          processInstanceId: "pi-uncertain",
+          status: "RUNNING",
+          tasks: [{ taskId: "task-uncertain", userId: "user-1", status: "RUNNING" }],
+        },
+      })
+      .mockRejectedValueOnce(new ApprovalMcpError("DINGTALK_API_ERROR", "timeout", { retryable: true }));
+    const service = new ApprovalService({
+      api,
+      writeUserIds: ["user-1"],
+      callerUserId: "user-1",
+      idempotencyLedger: ledger,
+    });
+    const input = {
+      confirm: true,
+      requestId: "99999999-9999-4999-8999-999999999999",
+      processInstanceId: "pi-uncertain",
+      taskId: "task-uncertain",
+      result: "agree" as const,
+    };
+
+    await expect(service.executeTask(input)).rejects.toMatchObject({ code: "IDEMPOTENCY_OUTCOME_UNKNOWN" });
+    await expect(service.executeTask(input)).rejects.toMatchObject({ code: "IDEMPOTENCY_OUTCOME_UNKNOWN" });
+    expect(api.request).toHaveBeenCalledTimes(2);
   });
 
   it("authorizes a form attachment with fileInfos before requesting its URL", async () => {

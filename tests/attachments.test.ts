@@ -73,7 +73,70 @@ describe("AttachmentDownloader", () => {
       size: bytes.byteLength,
       sha256: createHash("sha256").update(bytes).digest("hex"),
       contentBase64: Buffer.from(bytes).toString("base64"),
+      redaction: {
+        policy: "credentials-v1",
+        evaluated: true,
+        applied: false,
+        replacements: 0,
+      },
     });
+  });
+
+  it("rejects MIME types outside the approval attachment allowlist", async () => {
+    const downloader = new AttachmentDownloader({
+      fetch: vi.fn<typeof fetch>().mockResolvedValue(
+        new Response(new Uint8Array([0x4d, 0x5a]), {
+          status: 200,
+          headers: { "content-type": "image/png" },
+        }),
+      ),
+      allowedHostSuffixes: [".dingtalk.com"],
+    });
+
+    await expect(
+      downloader.downloadToBase64("https://files.dingtalk.com/malware", "invoice.exe"),
+    ).rejects.toMatchObject({ code: "ATTACHMENT_TYPE_NOT_ALLOWED" });
+  });
+
+  it("redacts credential-like values in UTF-8 text attachments before returning Base64", async () => {
+    const source = new TextEncoder().encode("project=alpha\napp_secret = super-sensitive-value\nowner=mwe");
+    const redacted = "project=alpha\napp_secret = [REDACTED]\nowner=mwe";
+    const downloader = new AttachmentDownloader({
+      fetch: vi.fn<typeof fetch>().mockResolvedValue(
+        new Response(source, { status: 200, headers: { "content-type": "text/plain" } }),
+      ),
+      allowedHostSuffixes: [".dingtalk.com"],
+    });
+
+    await expect(
+      downloader.downloadToBase64("https://files.dingtalk.com/sensitive", "notes.txt"),
+    ).resolves.toMatchObject({
+      contentBase64: Buffer.from(redacted).toString("base64"),
+      redaction: {
+        policy: "credentials-v1",
+        evaluated: true,
+        applied: true,
+        replacements: 1,
+      },
+    });
+  });
+
+  it("reapplies the byte limit after text redaction expands the returned content", async () => {
+    const source = new TextEncoder().encode("api_key=x");
+    const downloader = new AttachmentDownloader({
+      fetch: vi.fn<typeof fetch>().mockResolvedValue(
+        new Response(source, {
+          status: 200,
+          headers: { "content-type": "text/plain", "content-length": String(source.byteLength) },
+        }),
+      ),
+      maxBytes: source.byteLength,
+      allowedHostSuffixes: [".dingtalk.com"],
+    });
+
+    await expect(
+      downloader.downloadToBase64("https://files.dingtalk.com/expanded", "notes.txt"),
+    ).rejects.toMatchObject({ code: "ATTACHMENT_TOO_LARGE" });
   });
 
   it("rejects non-HTTPS, unapproved hosts, and oversized bodies before exposing content", async () => {
