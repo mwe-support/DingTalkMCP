@@ -2,11 +2,11 @@
 
 `MWE审批MCP` 是一个独立的钉钉 OA 审批 MCP Server。它只使用新建企业内部应用的身份访问钉钉官方 OpenAPI，不复用、也不会修改“金蝶对接”应用。
 
-当前版本：`0.3.0`。
+当前版本：`0.3.1`。
 
-当前发布状态（2026-08-13）：钉钉官方网关已发布 3 个平台直连工具：`get_approval_capabilities` 版本 1、`get_approval_instance` 版本 2 和 `start_process_instance` 版本 1。`start_process_instance` 由钉钉 MCP 开发平台以 HTTP POST 直接调用官方 OA OpenAPI，发起人固定映射为平台的“系统参数.操作用户id”，不向 Agent 暴露 `originatorUserId`，也不开放会覆盖 OA 后台流程的 `approvers`。无效模板负向联调进入 OA 业务校验并返回 `processCodeError`，未创建审批实例；真实模板仍需在用户明确确认具体表单内容后验收。
+当前发布状态（2026-08-14）：钉钉官方网关仍发布 3 个平台直连工具：`get_approval_capabilities` 版本 1、`get_approval_instance` 版本 2 和 `start_process_instance` 版本 1。CVM 上的代码后端已经通过 `https://dingtalk.mwexk.com/platform/tools/approval_task` 生产部署并完成真实审批和附件验收；在钉钉 MCP 开发平台重新编辑并发布 `approval_task` 版本前，官方网关工具清单仍以现有平台直连版本为准。
 
-本仓库 `0.3.0` 的代码实现继续保留，作为工具数量增加、更新频繁后切换到自建 HTTPS 工具后端的基础。代码版只向正常 Agent 工具清单发布一个审批人工具 `approval_task`，把查看、同意、拒绝以及附件读取收敛为 `action=view|approve|reject`；端点形状的旧工具仅保留为平台迁移期兼容入口。代码版同时实现服务端确认、固定调用人、allowlist、持久化幂等、审计和附件正文读取；当前平台直连版不部署自建服务器，也不具备这些服务端增强语义。无论采用平台直连还是代码后端，对外 MCP 地址始终由钉钉官方 `mcp-gw.dingtalk.com` 托管。
+本仓库 `0.3.1` 已部署为钉钉 MCP 平台调用的 HTTPS 工具后端。正常 Agent 只使用一个审批人工具 `approval_task`，把查看、同意、拒绝以及附件读取收敛为 `action=view|approve|reject`；端点形状的旧工具仅保留为平台迁移期兼容入口。代码后端实现服务端确认、固定调用人、allowlist、持久化幂等、审计和附件正文读取。无论平台动作直连 OpenAPI 还是调用代码后端，对外 MCP 地址始终由钉钉官方 `mcp-gw.dingtalk.com` 托管。
 
 当前正式平台工具的边界：
 
@@ -25,7 +25,7 @@
 - 表单附件、评论/操作记录附件、图片元数据的统一识别。
 - 表单与评论附件安全下载：下载授权、临时 URL 换取、HTTPS/Host/重定向校验、大小上限、SHA-256 和 Base64 返回。
 - MCP 客户端只使用钉钉官方生成的 Streamable HTTP 配置，MCP 域名必须为 `mcp-gw.dingtalk.com`。
-- 本项目不暴露 MCP 传输端点，也不包含 stdio；未来启用代码版时只提供钉钉 MCP 开发平台调用的 HTTPS 工具后端。
+- 本项目不暴露 MCP 传输端点，也不包含 stdio；只提供钉钉 MCP 开发平台调用的 HTTPS 工具后端。
 
 正常 Agent 工具清单只包含：
 
@@ -159,24 +159,25 @@ node .\dist\transports\http.js
 
 ## 唯一 MCP 发布路径：钉钉官方托管
 
-当前生产链路是：
+`approval_task` 平台版本发布后的唯一生产链路是：
 
 ```text
 MCP 客户端
   -> 钉钉官方 Streamable HTTP 网关（mcp-gw.dingtalk.com）
   -> 钉钉 MCP 开发平台配置的 HTTP 动作
+  -> CVM HTTPS 工具后端（dingtalk.mwexk.com/platform/tools/approval_task）
   -> 钉钉官方 OpenAPI（api.dingtalk.com）
 ```
 
-未来工具数量和更新频率需要代码化管理时，平台 HTTP 动作才切换到本项目 `/platform/tools/<toolName>` HTTPS 后端，再由后端调用钉钉 OpenAPI。钉钉 MCP 开发平台始终负责生成和维护外部 Streamable HTTP MCP 地址；未来本项目的 HTTPS 动作地址由我们部署和维护，但它不是 MCP 域名。
+钉钉 MCP 开发平台始终负责生成和维护外部 Streamable HTTP MCP 地址；本项目的 HTTPS 动作地址由我们部署和维护，但它是平台的普通 HTTP 后端，不是 MCP 域名。CVM 只把精确路径 `/platform/tools/approval_task` 和 `/healthz` 暴露在 TLS 反向代理之后，Node.js 仅监听 `127.0.0.1:3000`。
 
 2026-08-12 在已登录的钉钉官方 MCP 市场实测，“获取 MCP Server 配置”返回 `type: streamable-http`，URL 主机为钉钉官方域名 `mcp-gw.dingtalk.com`；官方文档同时说明 MCP 服务通过钉钉统一网关。由此可确认当前 `MWE审批MCP` 版本 1 的 MCP 网关由钉钉托管。URL 中的 `key` 是敏感凭据，禁止写入代码、文档、日志或 Git。
 
 不使用 Deap 自定义 MCP URL，也不提供任何自托管 MCP 回退。完整设置步骤和工具端点表见 [`docs/dingtalk-mcp-platform.md`](docs/dingtalk-mcp-platform.md)。
 
-## 未来代码后端的写操作安全语义
+## 代码后端的写操作安全语义
 
-以下保护属于尚未部署的代码后端，不代表当前平台直连工具已经具备。代码后端启用后，发起、同意、拒绝和撤销必须同时满足：
+以下保护已经在 CVM 代码后端实现；尚未切换的旧平台直连工具不具备同等语义。代码后端的发起、同意、拒绝和撤销必须同时满足：
 
 1. MCP 参数 `confirm=true`，代表宿主已获得用户明确确认。
 2. 操作者由服务端 `DINGTALK_CALLER_USER_ID` 固定绑定；客户端即使传 userId，也只能与它相同。
@@ -226,8 +227,10 @@ tests/             OpenAPI、MCP、HTTP 和附件安全测试
 - P1：使用 Stream 订阅 `bpms_instance_change`、`bpms_task_change`，实现待办投影与事件幂等。
 - P1：取得并验证存储上传权限后，实现本机文件到审批钉盘的完整上传链路。
 - 已完成：在真实审批记录附件上验收 `withCommentAttatchment` 下载地址链路，并验证 PDF 字节、文本与渲染均可读取。
-- 部署前：为钉钉 MCP 平台提供正式 HTTPS 工具后端域名和平台到后端的 Bearer Key，再把平台分散的详情/同意/拒绝动作收敛为 `/platform/tools/approval_task`。
-- 部署前：使用测试模板和测试人员完成真实的详情、表单附件下载、发起、同意、拒绝、撤销验收。
+- 已完成：在 CVM 以 `dingtalk.mwexk.com` 部署正式 HTTPS 工具后端；公网只开放 `/healthz` 和 `/platform/tools/approval_task`，平台到后端使用 Bearer Key。
+- 已完成：通过公网代码后端读取最近两个真实审批并下载、解码和查看 19 个表单附件；另以一条真实已完成审批验证评论区 PDF 附件下载与渲染。
+- 待平台发布：重新编辑并发布钉钉 MCP 开发平台的 `approval_task` 版本，把官方网关的审批人入口切换到 CVM 组合工具。
+- 待完整写验收：使用测试模板和测试人员完成发起、同意、拒绝、撤销的回归测试。
 
 官方能力与开发者平台设置证据见：
 
