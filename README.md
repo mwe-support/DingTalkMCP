@@ -2,11 +2,11 @@
 
 `MWE审批MCP` 是一个独立的钉钉 OA 审批 MCP Server。它只使用新建企业内部应用的身份访问钉钉官方 OpenAPI，不复用、也不会修改“金蝶对接”应用。
 
-当前版本：`0.4.0`。
+当前版本：`0.5.0`。
 
 当前发布状态（2026-08-14）：原钉钉 AIHub 平台版本已删除。CVM 代码后端通过 `https://dingtalk.mwexk.com/platform/tools/approval_task` 提供唯一生产工具动作；重新在钉钉 MCP 开发平台创建并发布版本后，Agent 才会重新取得由 `mcp-gw.dingtalk.com` 托管的正式 MCP URL。
 
-本仓库 `0.4.0` 是钉钉 MCP 平台调用的 HTTPS 工具后端。正常 Agent 只使用一个审批人工具 `approval_task`，把查看、同意、拒绝以及附件链接换取收敛为 `action=view|approve|reject`。代码后端实现服务端确认、固定调用人、allowlist、持久化幂等和审计；附件字节下载、文件识别、文档解析与 OCR 全部由 Agent 客户端完成。对外 MCP 地址仍应由钉钉官方 `mcp-gw.dingtalk.com` 托管。
+本仓库 `0.5.0` 是钉钉 MCP 平台调用的 HTTPS 工具后端。正常 Agent 只使用一个审批人工具 `approval_task`，把查看、同意、拒绝以及附件链接换取收敛为 `action=view|approve|reject`。代码后端实现服务端确认、固定调用人、allowlist、持久化幂等和 30 天结构化审计；附件字节下载、文件识别、文档解析与 OCR 全部由 Agent 客户端完成。对外 MCP 地址仍应由钉钉官方 `mcp-gw.dingtalk.com` 托管。
 
 当前代码后端只暴露 `approval_task`；端点形状的兼容工具仅保留在进程内测试/迁移 catalog，不通过公网 `/platform/tools/*` 路由发布。
 
@@ -22,6 +22,7 @@
 - 表单与评论附件链接换取：隐藏授权差异，校验临时 URL 的 HTTPS 协议与 Host allowlist，不在服务端下载文件。
 - MCP 客户端只使用钉钉官方生成的 Streamable HTTP 配置，MCP 域名必须为 `mcp-gw.dingtalk.com`。
 - 本项目不暴露 MCP 传输端点，也不包含 stdio；只提供钉钉 MCP 开发平台调用的 HTTPS 工具后端。
+- 所有通过平台 Bearer 鉴权并进入工具执行阶段的调用都写入按 UTC 日期滚动的结构化 JSONL；日志最多保留 30 个 UTC 日历日。
 
 正常 Agent 工具清单只包含：
 
@@ -188,7 +189,16 @@ MCP 客户端
 
 目录账本为每个 requestId 建立 SHA-256 命名目录，并以原子 `mkdir` 完成“检查并预留”，支持共享同一文件系统的多个 HTTP 并发实例。崩溃留下的 `pending` 记录不会被回收，而是持续失败关闭，要求人工核对钉钉实例后处理；跨主机多副本若不共享该目录，应改用带唯一约束事务的共享数据库。
 
-每个实际写操作会向 stderr 输出一行脱敏 JSON 审计事件，包含动作、固定调用人、实例/task/request 标识和结果，不记录 Client Secret、access token、表单内容、备注或附件正文。
+## 审计日志
+
+生产 HTTP 进程把两类事件写入 `APPROVAL_AUDIT_LOG_PATH`（默认 `./data/audit`，容器中为 `/app/data/audit`）下的 `YYYY-MM-DD.jsonl`：
+
+- `mcp_tool_invocation`：以同一匿名 `invocationId` 写入 `started` 和 `completed` 两阶段事件；完成事件记录工具名、安全动作枚举、结果、HTTP 状态、耗时和安全错误码。响应头 `x-mwe-audit-id` 可用于定位同一调用，`x-mwe-audit-status=recorded|partial|failed` 表示审计落盘状态。
+- `approval_audit`：保留实际审批写操作原有的动作、固定调用人、目标和结果审计；写操作仍使用工具响应中的审批审计关联 ID 做业务审计定位，不把该 ID 复制进最小化的工具调用事件。
+
+工具调用事件不保存请求体、实例/task/request ID、人员、表单、备注、附件元数据、附件正文、临时下载 URL、Client Secret、access token、Bearer Key 或审批业务审计关联 ID。审计文件是唯一持久副本，不再复制到 stderr/Docker 标准日志。每次审计写入最多等待 2 秒：若 `started` 无法落盘或超时，后端返回 503 且不执行工具；若工具已完成但 `completed` 或内部 `approval_audit` 落盘失败/超时，保留已有 `started` 记录、返回原业务结果并仅把当前调用标为 `partial`，同时输出不含业务数据的运维错误提示，避免诱发写操作重试或误伤并发调用。
+
+保留策略固定上限为 30 个 UTC 日历日（当天加前 29 天），不能配置得更长。服务启动时、每次写入后以及运行期间每 6 小时都会清理过期日期文件；非日期命名文件不会被审计清理器误删。容器使用具名卷保存日志，升级或重启不会丢失未到期记录。
 
 ## 附件边界
 

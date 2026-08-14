@@ -10,6 +10,7 @@ export interface ApprovalMcpConfig {
   allowedProcessCodes: string[];
   downloadHostSuffixes: string[];
   idempotencyLedgerPath: string;
+  auditLogPath: string;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApprovalMcpConfig {
@@ -42,6 +43,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApprovalMcpCon
       ".aliyuncs.com",
     ]),
     idempotencyLedgerPath: resolve(env.APPROVAL_IDEMPOTENCY_LEDGER_PATH?.trim() || "./data/approval-idempotency"),
+    auditLogPath: resolve(env.APPROVAL_AUDIT_LOG_PATH?.trim() || "./data/audit"),
   };
 }
 

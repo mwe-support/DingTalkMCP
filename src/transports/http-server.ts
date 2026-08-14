@@ -1,7 +1,16 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 
 import type { ApprovalService } from "../approval/service.js";
+import {
+  DEFAULT_AUDIT_WRITE_TIMEOUT_MS,
+  type AuditInvocationContext,
+  runAuditWriteWithinTimeout,
+  type ToolInvocationAuditEvent,
+  type ToolInvocationAuditEventBase,
+  type ToolInvocationAuditOutcome,
+  type ToolInvocationAuditSink,
+} from "../core/audit-log.js";
 import { invokeApprovalTool } from "../mcp/invoke-tool.js";
 
 export interface ApprovalHttpOptions {
@@ -9,6 +18,9 @@ export interface ApprovalHttpOptions {
   port: number;
   platformApiKey?: string | undefined;
   allowedHosts: string[];
+  auditContext?: AuditInvocationContext;
+  auditWriteTimeoutMs?: number;
+  toolAudit?: ToolInvocationAuditSink;
 }
 
 export interface RunningApprovalHttpServer {
@@ -86,13 +98,74 @@ async function handlePlatformTool(
     json(response, 401, { error: "Unauthorized" });
     return;
   }
+  const invocationId = randomUUID();
+  const timestamp = new Date().toISOString();
+  const startedAt = performance.now();
+  const audit = options.toolAudit ?? unavailableToolInvocationAuditSink;
+  const auditWriteTimeoutMs = options.auditWriteTimeoutMs ?? DEFAULT_AUDIT_WRITE_TIMEOUT_MS;
+  const baseEvent: ToolInvocationAuditEventBase = {
+    timestamp,
+    invocationId,
+    transport: "dingtalk_platform_http",
+    toolName,
+  };
+  response.setHeader("x-mwe-audit-id", invocationId);
+  try {
+    await runAuditWriteWithinTimeout(() => audit.record({ ...baseEvent, phase: "started" }), auditWriteTimeoutMs);
+  } catch {
+    response.setHeader("x-mwe-audit-status", "failed");
+    json(response, 503, { error: "Structured audit log is unavailable" });
+    return;
+  }
+  const invocationAuditState = options.auditContext?.createState();
+  const auditedJson = async (
+    status: number,
+    responseBody: unknown,
+    outcome: ToolInvocationAuditOutcome,
+    input?: Record<string, unknown>,
+    errorCode?: string,
+  ): Promise<void> => {
+    const action = approvalAction(input);
+    const event: ToolInvocationAuditEvent = {
+      ...baseEvent,
+      timestamp: new Date().toISOString(),
+      ...(action === undefined ? {} : { action }),
+      phase: "completed",
+      outcome,
+      httpStatus: status,
+      durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      ...(errorCode === undefined ? {} : { errorCode }),
+    };
+    const nestedAuditFailed = invocationAuditState?.approvalAuditFailed === true;
+    if (nestedAuditFailed) {
+      response.setHeader("x-mwe-audit-status", "partial");
+      process.stderr.write("Structured tool audit completion write failed.\n");
+      json(response, status, responseBody);
+      return;
+    }
+    try {
+      await runAuditWriteWithinTimeout(() => audit.record(event), auditWriteTimeoutMs);
+      response.setHeader("x-mwe-audit-status", "recorded");
+    } catch {
+      response.setHeader("x-mwe-audit-status", "partial");
+      process.stderr.write("Structured tool audit completion write failed.\n");
+    }
+    json(response, status, responseBody);
+  };
+
   if (request.method !== "POST") {
     response.setHeader("allow", "POST");
-    json(response, 405, { error: "Method Not Allowed" });
+    await auditedJson(405, { error: "Method Not Allowed" }, "rejected", undefined, "METHOD_NOT_ALLOWED");
     return;
   }
   if (!isJson(request.headers["content-type"])) {
-    json(response, 415, { error: "Content-Type must be application/json" });
+    await auditedJson(
+      415,
+      { error: "Content-Type must be application/json" },
+      "rejected",
+      undefined,
+      "UNSUPPORTED_MEDIA_TYPE",
+    );
     return;
   }
 
@@ -101,18 +174,28 @@ async function handlePlatformTool(
     body = await readJsonBody(request, 1024 * 1024);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Invalid JSON request body";
-    json(response, 400, { error: message });
+    await auditedJson(400, { error: message }, "rejected", undefined, "INVALID_JSON_BODY");
     return;
   }
   if (!isRecord(body)) {
-    json(response, 400, { error: "JSON request body must be an object" });
+    await auditedJson(
+      400,
+      { error: "JSON request body must be an object" },
+      "rejected",
+      undefined,
+      "INVALID_JSON_BODY",
+    );
     return;
   }
 
   try {
-    const result = await invokeApprovalTool(service, toolName, body);
+    const invoke = () => invokeApprovalTool(service, toolName, body);
+    const result =
+      options.auditContext === undefined || invocationAuditState === undefined
+        ? await invoke()
+        : await options.auditContext.run(invocationAuditState, invoke);
     if (result === undefined) {
-      json(response, 404, { error: "Unknown approval tool" });
+      await auditedJson(404, { error: "Unknown approval tool" }, "unknown_tool", body, "UNKNOWN_TOOL");
       return;
     }
     if (result.isError === true) {
@@ -124,12 +207,20 @@ async function handlePlatformTool(
               message: firstTextContent(result.content) ?? "Approval tool rejected the request.",
             },
           };
-      json(response, 422, payload);
+      const errorCode = safeErrorCode(payload, "TOOL_INPUT_OR_EXECUTION_ERROR");
+      await auditedJson(422, payload, toolErrorOutcome(errorCode), body, errorCode);
       return;
     }
-    json(response, 200, isRecord(result.structuredContent) ? result.structuredContent : { result: result.content });
+    const payload = isRecord(result.structuredContent) ? result.structuredContent : { result: result.content };
+    await auditedJson(200, payload, "succeeded", body);
   } catch {
-    json(response, 500, { error: "Approval tool invocation failed" });
+    await auditedJson(
+      500,
+      { error: "Approval tool invocation failed" },
+      "failed",
+      body,
+      "TOOL_INVOCATION_FAILED",
+    );
   }
 }
 
@@ -143,6 +234,9 @@ function validateOptions(options: ApprovalHttpOptions): void {
   }
   if (options.platformApiKey !== undefined && Buffer.byteLength(options.platformApiKey, "utf8") < 32) {
     throw new Error("MCP_PLATFORM_API_KEY must contain at least 32 UTF-8 bytes.");
+  }
+  if (options.auditWriteTimeoutMs !== undefined && (!Number.isInteger(options.auditWriteTimeoutMs) || options.auditWriteTimeoutMs < 1)) {
+    throw new Error("auditWriteTimeoutMs must be a positive integer.");
   }
 }
 
@@ -198,6 +292,36 @@ function firstTextContent(content: unknown): string | undefined {
   );
   return typeof item?.text === "string" ? item.text : undefined;
 }
+
+function approvalAction(input: Record<string, unknown> | undefined): ToolInvocationAuditEventBase["action"] {
+  const action = input?.action;
+  return action === "view" || action === "approve" || action === "reject" ? action : undefined;
+}
+
+function safeErrorCode(payload: Record<string, unknown>, fallback: string): string {
+  const error = isRecord(payload.error) ? payload.error : undefined;
+  const code = typeof error?.code === "string" ? error.code : undefined;
+  return code !== undefined && /^[A-Z][A-Z0-9_]{0,63}$/u.test(code) ? code : fallback;
+}
+
+function toolErrorOutcome(errorCode: string): ToolInvocationAuditOutcome {
+  if (errorCode === "IDEMPOTENCY_OUTCOME_UNKNOWN") return "uncertain";
+  return TOOL_FAILURE_CODES.has(errorCode) ? "failed" : "rejected";
+}
+
+const TOOL_FAILURE_CODES = new Set([
+  "CONFIGURATION_ERROR",
+  "DINGTALK_AUTH_ERROR",
+  "DINGTALK_API_ERROR",
+  "IDEMPOTENCY_LEDGER_ERROR",
+  "INTERNAL_ERROR",
+  "INVALID_RESPONSE",
+]);
+
+const unavailableToolInvocationAuditSink: ToolInvocationAuditSink = {
+  record: () => Promise.reject(new Error("Tool invocation audit sink is not configured.")),
+};
+
 
 async function readJsonBody(request: IncomingMessage, maxBytes: number): Promise<unknown> {
   const chunks: Buffer[] = [];

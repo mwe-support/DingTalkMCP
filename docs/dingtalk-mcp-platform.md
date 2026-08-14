@@ -23,7 +23,7 @@
 - 2026-08-14 实测客户端手选本地文件形成的表单附件虽然也会返回 `spaceId`，但以该空间调用 `authDownload` 会返回 `noPermission`；直接向下载地址接口提交 `processInstanceId + fileId + fileName + fileType` 则成功。服务端因此优先采用完整文件标识直取，仅在缺少这组标识时保留 `spaceId` 授权链路。
 - 同轮实测下载接口返回 `http://*.aliyuncs.com` 签名地址；同主机改用 HTTPS 后下载成功。代码只对已通过白名单的 `.aliyuncs.com` 初始地址强制升级 HTTPS，绝不执行明文下载，其他 HTTP 域名仍被拒绝。
 - 全程未出现 401、403 或权限不足错误，因此本轮不需要再申请权限。
-- 旧版 `0.3.1` 曾在 CVM 生产后端经公网 HTTPS 读取最近两个真实审批，并把 19 个表单附件以 Base64 返回。`0.4.0` 已移除该高资源链路：后端只换取经校验的临时链接，Agent 客户端负责下载、文件识别、解析和 OCR。
+- 旧版 `0.3.1` 曾在 CVM 生产后端经公网 HTTPS 读取最近两个真实审批，并把 19 个表单附件以 Base64 返回。`0.4.0` 已移除该高资源链路：后端只换取经校验的临时链接，Agent 客户端负责下载、文件识别、解析和 OCR。`0.5.0` 新增所有已鉴权工具调用的结构化 JSONL 审计流，并把保留期强制限制为 30 个 UTC 日历日。
 - `get_approval_instance` 已更新为版本 2，工具入参使用顶层 `processInstanceId`，经最近两个真实审批实例验证可返回表单内容、操作记录、表单附件和评论附件元数据；仍不返回附件正文。
 - `start_process_instance` 已发布版本 1，HTTP 动作为 `POST https://api.dingtalk.com/v1.0/workflow/processInstances`。正式 schema 必填 `confirm`、`processCode`、`deptId`、`formComponentValues`；`originatorUserId` 固定映射平台“系统参数.操作用户id”，不暴露给 Agent；不开放 `approvers`，默认复用 OA 后台审批流程。
 - 发起工具使用不存在的 processCode 做负向联调，OA 返回 HTTP 400 `processCodeError`，证明 Token、请求体和当前用户映射已经进入业务校验，且没有创建审批实例。真实发起必须等待用户确认具体模板、部门和全部表单内容。
@@ -53,6 +53,8 @@ CVM 代码后端已生产部署。钉钉 AIHub 平台版本已删除，重新发
 MCP_PLATFORM_API_KEY=<仅供钉钉平台调用工具动作的密钥>
 # 临时附件链接允许的官方 Host 后缀
 APPROVAL_DOWNLOAD_HOST_SUFFIXES=.dingtalk.com,.alicdn.com,.aliyuncs.com
+# 容器具名卷中的按日 JSONL 审计目录
+APPROVAL_AUDIT_LOG_PATH=/app/data/audit
 ```
 
 反向代理必须提供 HTTPS，并把实际后端域名加入 `APPROVAL_BACKEND_ALLOWED_HOSTS`。不要把 Node.js 明文端口直接暴露到公网。
@@ -68,6 +70,8 @@ Body: 工具参数对象
 ```
 
 `MCP_PLATFORM_API_KEY` 是平台到我们后端的鉴权；它与 MCP 客户端访问钉钉网关时使用的凭据不是同一个概念。
+
+后端为每个已鉴权调用返回 `x-mwe-audit-id`，并在 `APPROVAL_AUDIT_LOG_PATH/YYYY-MM-DD.jsonl` 以同一匿名 ID 写入 `started` / `completed` 两阶段 `mcp_tool_invocation` 事件；事件不含请求体、审批标识、审批业务关联 ID、附件、临时 URL 或鉴权凭据。单次审计写入上限 2 秒；`x-mwe-audit-status=recorded|partial|failed` 明确落盘结果：起始记录失败/超时时工具不执行，完成记录或内部写操作审计失败/超时时保留起始记录且不把已完成写操作转成可重试错误。内部失败通过逐调用异步上下文归属，只把对应调用标为 `partial`，不会误伤并发健康调用。清理在启动、每次写入和每 6 小时运行一次，保留当天及前 29 天；原有审批写操作事件也进入同一受控目录。
 
 ## 工具端点
 

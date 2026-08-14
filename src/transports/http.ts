@@ -1,6 +1,14 @@
 import type { AddressInfo } from "node:net";
 
 import { loadConfig } from "../config.js";
+import {
+  BoundedApprovalAuditSink,
+  AuditInvocationContext,
+  DailyJsonLineAuditStore,
+  RetainedApprovalAuditSink,
+  RetainedToolInvocationAuditSink,
+  startAuditRetentionSweep,
+} from "../core/audit-log.js";
 import { createApprovalService } from "../runtime.js";
 import { startApprovalHttpServer } from "./http-server.js";
 
@@ -10,12 +18,28 @@ async function main(): Promise<void> {
   const port = parsePort(process.env.APPROVAL_BACKEND_PORT);
   const platformApiKey = process.env.MCP_PLATFORM_API_KEY?.trim() || undefined;
   const allowedHosts = csv(process.env.APPROVAL_BACKEND_ALLOWED_HOSTS);
-  const running = await startApprovalHttpServer(createApprovalService(config), {
-    host,
-    port,
-    platformApiKey,
-    allowedHosts,
+  const auditStore = new DailyJsonLineAuditStore(config.auditLogPath);
+  const auditContext = new AuditInvocationContext();
+  const retentionSweep = await startAuditRetentionSweep(auditStore, {
+    onError: () => {
+      process.stderr.write("Structured audit retention sweep failed.\n");
+    },
   });
+  const running = await startApprovalHttpServer(
+    createApprovalService(config, {
+      audit: new BoundedApprovalAuditSink(new RetainedApprovalAuditSink(auditStore), auditStore, {
+        invocationContext: auditContext,
+      }),
+    }),
+    {
+      host,
+      port,
+      platformApiKey,
+      allowedHosts,
+      auditContext,
+      toolAudit: new RetainedToolInvocationAuditSink(auditStore),
+    },
+  );
   const address = running.httpServer.address() as AddressInfo;
   process.stderr.write(`MWE approval tool backend listening on http://${host}:${address.port}\n`);
   if (platformApiKey !== undefined) {
@@ -23,6 +47,7 @@ async function main(): Promise<void> {
   }
 
   const shutdown = (): void => {
+    retentionSweep.close();
     void running.close().finally(() => process.exit(0));
   };
   process.once("SIGINT", shutdown);

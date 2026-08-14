@@ -34,6 +34,9 @@ These instructions apply to the entire `approval-mcp` repository.
 - Keep process-code and write-user allowlists, idempotency protection, structured audit records, and secret-safe logs.
 - A rejection must require a non-empty business reason unless a documented template policy explicitly permits an empty remark.
 - Never log application secrets, bearer tokens, full approval forms, attachment contents, or temporary attachment download URLs.
+- Record authenticated public tool invocations as structured, append-only JSONL with an anonymous invocation ID, bounded action enum, outcome, status, duration, and safe error code. Do not persist the request body or business identifiers in the invocation event.
+- Keep production audit files for at most 30 UTC calendar days. Enforce cleanup at startup, after writes, and periodically while idle; do not duplicate retained audit events into unmanaged container stdout/stderr logs.
+- Bound every retained audit write. If the start record cannot be persisted, do not execute the tool; if a completion or nested mutation record fails or times out after the business action, preserve the original business result and mark the invocation audit as partial rather than returning a retryable mutation error.
 
 ## Transport and deployment
 
