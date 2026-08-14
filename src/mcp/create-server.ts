@@ -24,12 +24,19 @@ const processInstanceId = z.string().min(1).describe("DingTalk approval processI
 const userId = z.string().min(1).describe("DingTalk userId; write operations must match the server allowlist");
 const taskId = z.union([z.string().min(1), z.number().int().nonnegative()]);
 const decisionRequestId = z.string().uuid().describe("Stable UUID used to prevent duplicate approval decisions");
-const approvalTaskViewSchema = z
+const approvalTaskViewMetadataSchema = z
   .object({
     action: z.literal("view"),
     processInstanceId,
-    attachmentAction: z.enum(["list", "read"]).optional(),
-    attachmentIds: z.array(z.string().min(1)).max(10).optional(),
+    attachmentAction: z.literal("list").optional(),
+  })
+  .strict();
+const approvalTaskViewReadSchema = z
+  .object({
+    action: z.literal("view"),
+    processInstanceId,
+    attachmentAction: z.literal("read"),
+    attachmentIds: z.array(z.string().min(1)).min(1).max(10),
     maxAttachments: z.number().int().min(1).max(5).optional(),
   })
   .strict();
@@ -54,8 +61,9 @@ const approvalTaskRejectSchema = z
     remark: z.string().trim().min(1).max(1024),
   })
   .strict();
-const approvalTaskSchema = z.discriminatedUnion("action", [
-  approvalTaskViewSchema,
+const approvalTaskSchema = z.union([
+  approvalTaskViewMetadataSchema,
+  approvalTaskViewReadSchema,
   approvalTaskApproveSchema,
   approvalTaskRejectSchema,
 ]);
@@ -82,18 +90,7 @@ export function createApprovalMcpServer(
       inputSchema: approvalTaskSchema,
       annotations: writeAnnotations,
     },
-    async (input) =>
-      safely(() => {
-        if (input.action === "view" && input.attachmentAction === "read") {
-          if (input.attachmentIds === undefined || input.attachmentIds.length === 0) {
-            throw new ApprovalMcpError(
-              "INVALID_INPUT",
-              "attachmentIds must contain at least one fileId when attachmentAction=read.",
-            );
-          }
-        }
-        return service.approvalTask(input);
-      }),
+    async (input) => safely(() => service.approvalTask(input)),
   );
 
   if (options.includeCompatibilityTools !== true) return server;

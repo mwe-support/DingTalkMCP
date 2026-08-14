@@ -121,6 +121,30 @@ describe("AttachmentDownloader", () => {
     });
   });
 
+  it("redacts credential fields in JSON attachments while preserving valid JSON", async () => {
+    const source = '{"api_key":"secret-value","nested":{"owner":"mwe","access_token":"token-value"}}';
+    const expected = '{"api_key":"[REDACTED]","nested":{"owner":"mwe","access_token":"[REDACTED]"}}';
+    const downloader = new AttachmentDownloader({
+      fetch: vi.fn<typeof fetch>().mockResolvedValue(
+        new Response(source, { status: 200, headers: { "content-type": "application/json" } }),
+      ),
+      allowedHostSuffixes: [".dingtalk.com"],
+    });
+
+    const downloaded = await downloader.downloadToBase64(
+      "https://files.dingtalk.com/sensitive-json",
+      "credentials.json",
+    );
+
+    expect(JSON.parse(Buffer.from(downloaded.contentBase64, "base64").toString("utf8"))).toEqual(JSON.parse(expected));
+    expect(downloaded.redaction).toEqual({
+      policy: "credentials-v1",
+      evaluated: true,
+      applied: true,
+      replacements: 2,
+    });
+  });
+
   it("reapplies the byte limit after text redaction expands the returned content", async () => {
     const source = new TextEncoder().encode("api_key=x");
     const downloader = new AttachmentDownloader({

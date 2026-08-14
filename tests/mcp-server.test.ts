@@ -309,6 +309,32 @@ describe("approval MCP public contract", () => {
     expect(request).not.toHaveBeenCalled();
   });
 
+  it("forbids attachment read fields unless action=view explicitly selects read mode", async () => {
+    const { client, request } = await connectedPublicClient();
+
+    const implicit = await client.callTool({
+      name: "approval_task",
+      arguments: {
+        action: "view",
+        processInstanceId: "pi-view",
+        attachmentIds: ["file-ignored"],
+      },
+    });
+    const listMode = await client.callTool({
+      name: "approval_task",
+      arguments: {
+        action: "view",
+        processInstanceId: "pi-view",
+        attachmentAction: "list",
+        maxAttachments: 2,
+      },
+    });
+
+    expect(implicit.isError).toBe(true);
+    expect(listMode.isError).toBe(true);
+    expect(request).not.toHaveBeenCalled();
+  });
+
   it("fails closed when the active task belongs to another DingTalk user", async () => {
     const { client, request } = await connectedPublicClient({
       result: {

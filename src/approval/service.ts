@@ -88,8 +88,13 @@ export type ApprovalTaskInput =
   | {
       action: "view";
       processInstanceId: string;
-      attachmentAction?: "list" | "read" | undefined;
-      attachmentIds?: string[] | undefined;
+      attachmentAction?: "list" | undefined;
+    }
+  | {
+      action: "view";
+      processInstanceId: string;
+      attachmentAction: "read";
+      attachmentIds: string[];
       maxAttachments?: number | undefined;
     }
   | {
@@ -182,8 +187,12 @@ export class ApprovalService {
       const approval = await this.getApprovalInstance({
         processInstanceId: input.processInstanceId,
         ...(input.attachmentAction === undefined ? {} : { attachmentAction: input.attachmentAction }),
-        ...(input.attachmentIds === undefined ? {} : { attachmentIds: input.attachmentIds }),
-        ...(input.maxAttachments === undefined ? {} : { maxAttachments: input.maxAttachments }),
+        ...(input.attachmentAction === "read"
+          ? {
+              attachmentIds: input.attachmentIds,
+              ...(input.maxAttachments === undefined ? {} : { maxAttachments: input.maxAttachments }),
+            }
+          : {}),
       });
       const actionableTasks = approval.normalized.tasks.filter((task) => {
         const status = text(asRecord(task)?.status)?.toUpperCase();

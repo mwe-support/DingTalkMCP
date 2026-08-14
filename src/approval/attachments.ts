@@ -311,6 +311,20 @@ function redactCredentialText(
       redaction: { policy: "credentials-v1", evaluated: false, applied: false, replacements: 0 },
     };
   }
+  if (mimeType === "application/json") {
+    try {
+      const parsed = JSON.parse(decoded) as unknown;
+      const replacements = redactJsonCredentials(parsed);
+      if (replacements > 0) {
+        return {
+          bytes: new TextEncoder().encode(JSON.stringify(parsed)),
+          redaction: { policy: "credentials-v1", evaluated: true, applied: true, replacements },
+        };
+      }
+    } catch {
+      // Invalid JSON is still scanned as UTF-8 text below.
+    }
+  }
   let replacements = 0;
   const redacted = decoded.replace(
     /((?:access[_-]?token|api[_-]?key|app[_-]?secret|authorization|client[_-]?secret|password)\s*[:=]\s*)(?:bearer\s+)?([^\s,;]+)/giu,
@@ -328,6 +342,26 @@ function redactCredentialText(
       replacements,
     },
   };
+}
+
+const CREDENTIAL_FIELD_NAME = /^(?:access[_-]?token|api[_-]?key|app[_-]?secret|authorization|client[_-]?secret|password)$/iu;
+
+function redactJsonCredentials(value: unknown): number {
+  if (Array.isArray(value)) return value.reduce((count, item) => count + redactJsonCredentials(item), 0);
+  const record = asRecord(value);
+  if (record === undefined) return 0;
+  let replacements = 0;
+  for (const [key, item] of Object.entries(record)) {
+    if (CREDENTIAL_FIELD_NAME.test(key)) {
+      if (item !== "[REDACTED]") {
+        record[key] = "[REDACTED]";
+        replacements += 1;
+      }
+      continue;
+    }
+    replacements += redactJsonCredentials(item);
+  }
+  return replacements;
 }
 
 function attachmentObjects(value: unknown): Record<string, unknown>[] {
