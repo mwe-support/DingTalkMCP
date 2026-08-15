@@ -15,6 +15,7 @@ describe("DingTalkOAuthIdentityAdapter", () => {
       response_type: "code",
       client_id: "ding-app-1",
       scope: "openid corpid",
+      prompt: "consent",
       state: "upstream-state-1",
       corpId: "corp-1",
     });

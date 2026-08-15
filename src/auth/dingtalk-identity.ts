@@ -48,6 +48,7 @@ export class DingTalkOAuthIdentityAdapter implements DingTalkIdentityPort {
       response_type: "code",
       client_id: this.#clientId,
       scope: "openid corpid",
+      prompt: "consent",
       state,
       corpId: this.#corpId,
     }).toString();

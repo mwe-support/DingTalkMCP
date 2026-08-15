@@ -2,7 +2,7 @@
 
 `MWE审批MCP` 是部署在 `https://dingtalk.mwexk.com/mcp` 的自托管钉钉 OA 审批 MCP Server。
 
-当前版本：`0.6.1`。
+当前版本：`0.6.2`。
 
 ## 当前架构
 
