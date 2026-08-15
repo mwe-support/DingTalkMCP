@@ -5,9 +5,12 @@ import { describe, expect, it } from "vitest";
 describe("CVM DingTalk edge contract", () => {
   it("routes the sole production backend through loopback port 3000", async () => {
     const config = await readFile(new URL("../deploy/cvm/edge/dingtalk.conf", import.meta.url), "utf8");
+    const environment = await readFile(new URL("../.env.example", import.meta.url), "utf8");
 
     expect(config).toContain("proxy_pass http://127.0.0.1:3000");
     expect(config).not.toContain("127.0.0.1:3001");
+    expect(environment).toMatch(/^APPROVAL_HOST_PORT=3000$/mu);
+    expect(environment).not.toMatch(/^APPROVAL_HOST_PORT=3001$/mu);
   });
 
   it("uses exact OAuth/MCP locations with strict method allowlists", async () => {
