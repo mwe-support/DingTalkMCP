@@ -2,7 +2,7 @@
 
 `MWE审批MCP` 是部署在 `https://dingtalk.mwexk.com/mcp` 的自托管钉钉 OA 审批 MCP Server。
 
-当前版本：`0.6.0`。
+当前版本：`0.6.1`。
 
 ## 当前架构
 
@@ -96,7 +96,7 @@ https://dingtalk.mwexk.com/oauth/dingtalk/callback
 并确认应用具备：
 
 - 登录用户身份/个人信息权限。
-- 根据 unionId 映射企业 userId 的通讯录权限。
+- 根据 unionId 映射企业 userId 的通讯录权限 `qyapi_get_member`。
 - 审批实例读写和审批表单读取权限。
 
 ## 本地验证

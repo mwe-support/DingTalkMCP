@@ -10,6 +10,7 @@ import {
   InMemoryAuthorizationStore,
   type DingTalkIdentityPort,
 } from "../src/auth/mcp-authorization.js";
+import { ApprovalMcpError } from "../src/core/errors.js";
 import { JoseMcpTokenCodec } from "../src/auth/jwt-codec.js";
 import type { SecurityAuditEventInput } from "../src/auth/security-audit.js";
 
@@ -103,6 +104,45 @@ describe("createMcpAuthorization", () => {
       expect.objectContaining({ event: "consent_approved", outcome: "succeeded" }),
       expect.objectContaining({ event: "login_succeeded", outcome: "succeeded", subject: "union-1" }),
     ]));
+  });
+
+  it("audits the safe DingTalk identity stage when enterprise user mapping fails", async () => {
+    const identity = {
+      authorizationUrl: vi.fn((state: string) => new URL(`https://login.dingtalk.test/oauth?state=${encodeURIComponent(state)}`)),
+      verifyAuthorizationCode: vi.fn(() => Promise.reject(new ApprovalMcpError(
+        "DINGTALK_AUTH_ERROR",
+        "DingTalk rejected the enterprise identity mapping request.",
+        { details: { authStage: "enterprise_user_mapping", upstreamMessage: "must-not-enter-audit" } },
+      ))),
+    } satisfies DingTalkIdentityPort;
+    const { baseUrl, securityEvents } = await fixture(identity);
+    const client = await registerPublicClient(baseUrl);
+    const verifier = "mapping-failure-verifier-that-is-long-enough-1234567890";
+    const authorize = new URL("/authorize", baseUrl);
+    authorize.search = new URLSearchParams({
+      response_type: "code",
+      client_id: client.client_id,
+      redirect_uri: redirectUri,
+      code_challenge: createHash("sha256").update(verifier).digest("base64url"),
+      code_challenge_method: "S256",
+      resource,
+      scope: "approval:read",
+    }).toString();
+    const login = new URL(requiredHeader(await fetch(authorize, { redirect: "manual" }), "location"));
+    const callback = new URL("/oauth/dingtalk/callback", baseUrl);
+    callback.searchParams.set("authCode", "mapping-failure-code");
+    callback.searchParams.set("state", requiredParam(login, "state"));
+
+    const response = await fetch(callback, { redirect: "manual" });
+
+    expect(response.status).toBe(302);
+    expect(new URL(requiredHeader(response, "location")).searchParams.get("error")).toBe("access_denied");
+    expect(securityEvents).toContainEqual(expect.objectContaining({
+      event: "login_failed",
+      outcome: "failed",
+      reasonCode: "DINGTALK_ENTERPRISE_USER_MAPPING_FAILED",
+    }));
+    expect(JSON.stringify(securityEvents)).not.toContain("must-not-enter-audit");
   });
 
   it("does not start DingTalk login when the user denies approval decision scope", async () => {
@@ -280,10 +320,10 @@ describe("createMcpAuthorization", () => {
   });
 });
 
-async function fixture(): Promise<{
+async function fixture(identityOverride?: DingTalkIdentityPort): Promise<{
   baseUrl: URL;
   securityEvents: SecurityAuditEventInput[];
-  identity: { authorizationUrl: ReturnType<typeof vi.fn>; verifyAuthorizationCode: DingTalkIdentityPort["verifyAuthorizationCode"] };
+  identity: DingTalkIdentityPort;
 }> {
   const { privateKey } = generateKeyPairSync("ed25519");
   const tokenCodec = await JoseMcpTokenCodec.create({
@@ -295,7 +335,7 @@ async function fixture(): Promise<{
     accessTokenTtlSeconds: 600,
     now: () => 1_800_000_000,
   });
-  const identity = {
+  const identity = identityOverride ?? {
     authorizationUrl: vi.fn((state: string) => new URL(`https://login.dingtalk.test/oauth?state=${encodeURIComponent(state)}`)),
     verifyAuthorizationCode: async (code) => {
       if (code !== "valid-dingtalk-code") throw new Error("invalid code");

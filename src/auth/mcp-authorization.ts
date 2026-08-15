@@ -28,6 +28,7 @@ import type {
 import type { JoseMcpTokenCodec, TokenIdentity } from "./jwt-codec.js";
 import { MCP_SCOPES, principalFromAuthInfo, type McpPrincipal, type McpScope } from "./types.js";
 import type { SecurityAuditEventInput, SecurityAuditSink } from "./security-audit.js";
+import { ApprovalMcpError } from "../core/errors.js";
 
 export interface DingTalkIdentityPort {
   authorizationUrl(state: string): URL;
@@ -297,12 +298,12 @@ export function createMcpAuthorization(options: CreateMcpAuthorizationOptions): 
       target.searchParams.set("code", localCode);
       if (transaction.clientState !== undefined) target.searchParams.set("state", transaction.clientState);
       response.redirect(302, target.href);
-    } catch {
+    } catch (error) {
       await recordSecurity(options.securityAudit, {
         event: "login_failed",
         outcome: "failed",
         clientId: transaction.clientId,
-        reasonCode: "DINGTALK_IDENTITY_VERIFICATION_FAILED",
+        reasonCode: dingTalkIdentityFailureReasonCode(error),
       }).catch(() => undefined);
       const target = new URL(transaction.redirectUri);
       target.searchParams.set("error", "access_denied");
@@ -346,6 +347,16 @@ export function createMcpAuthorization(options: CreateMcpAuthorizationOptions): 
       requireBearerAuth({ verifier: provider, requiredScopes: [...scopes], resourceMetadataUrl }),
     principal: principalFromAuthInfo,
   };
+}
+
+function dingTalkIdentityFailureReasonCode(error: unknown): string {
+  if (!(error instanceof ApprovalMcpError)) return "DINGTALK_IDENTITY_VERIFICATION_FAILED";
+  switch (error.details?.authStage) {
+    case "enterprise_user_mapping":
+      return "DINGTALK_ENTERPRISE_USER_MAPPING_FAILED";
+    default:
+      return "DINGTALK_IDENTITY_VERIFICATION_FAILED";
+  }
 }
 
 class DingTalkBackedOAuthProvider implements OAuthServerProvider {

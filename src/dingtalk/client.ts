@@ -11,6 +11,7 @@ export interface DingTalkRequest {
 interface DingTalkApiClientOptions {
   tokenProvider: Pick<DingTalkTokenProvider, "getToken" | "invalidate">;
   baseUrl?: string;
+  legacyBaseUrl?: string;
   fetch?: typeof fetch;
   timeoutMs?: number;
 }
@@ -24,14 +25,76 @@ export function getDingTalkRequestId(value: unknown): string | undefined {
 export class DingTalkApiClient {
   readonly #tokenProvider: Pick<DingTalkTokenProvider, "getToken" | "invalidate">;
   readonly #baseUrl: string;
+  readonly #legacyBaseUrl: string;
   readonly #fetch: typeof fetch;
   readonly #timeoutMs: number;
 
   constructor(options: DingTalkApiClientOptions) {
     this.#tokenProvider = options.tokenProvider;
     this.#baseUrl = (options.baseUrl ?? "https://api.dingtalk.com").replace(/\/$/u, "");
+    this.#legacyBaseUrl = (options.legacyBaseUrl ?? "https://oapi.dingtalk.com").replace(/\/$/u, "");
     this.#fetch = options.fetch ?? fetch;
     this.#timeoutMs = options.timeoutMs ?? 30_000;
+  }
+
+  async resolveUserIdByUnionId(unionId: string): Promise<string> {
+    const token = await this.#tokenProvider.getToken();
+    const url = new URL(`${this.#legacyBaseUrl}/topapi/user/getbyunionid`);
+    url.searchParams.set("access_token", token);
+
+    let response: Response;
+    try {
+      response = await this.#fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({ unionid: unionId }),
+        signal: AbortSignal.timeout(this.#timeoutMs),
+      });
+    } catch {
+      throw new ApprovalMcpError(
+        "DINGTALK_API_ERROR",
+        "Unable to reach the DingTalk enterprise identity mapping endpoint.",
+        {
+          details: { method: "POST", path: "/topapi/user/getbyunionid" },
+          retryable: true,
+        },
+      );
+    }
+
+    const payload = await parseResponseBody(response);
+    const record = asRecord(payload);
+    const result = asRecord(record?.result);
+    const upstreamCode = stringValue(record?.errcode ?? record?.code);
+    if (!response.ok || upstreamCode !== "0" || result === undefined) {
+      if (response.status === 401) this.#tokenProvider.invalidate();
+      const denied = asRecord(record?.AccessDeniedDetail ?? record?.accessDeniedDetail);
+      throw new ApprovalMcpError(
+        "DINGTALK_API_ERROR",
+        "DingTalk rejected the enterprise identity mapping request.",
+        {
+          details: {
+            status: response.status,
+            method: "POST",
+            path: "/topapi/user/getbyunionid",
+            upstreamCode,
+            upstreamMessage: stringValue(record?.errmsg ?? record?.message),
+            requestId: stringValue(record?.request_id ?? record?.requestid ?? record?.requestId),
+            requiredScopes: denied?.requiredScopes,
+          },
+          retryable: response.status === 429 || response.status >= 500,
+        },
+      );
+    }
+
+    const userId = result.userid ?? result.userId;
+    if (typeof userId !== "string" || userId === "") {
+      throw new ApprovalMcpError(
+        "INVALID_RESPONSE",
+        "DingTalk enterprise identity mapping did not return a userId.",
+        { details: { path: "/topapi/user/getbyunionid" } },
+      );
+    }
+    return userId;
   }
 
   async request<T = unknown>(request: DingTalkRequest): Promise<T> {

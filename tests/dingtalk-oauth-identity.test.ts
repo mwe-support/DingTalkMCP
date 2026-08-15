@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { DingTalkOAuthIdentityAdapter } from "../src/auth/dingtalk-identity.js";
+import { ApprovalMcpError } from "../src/core/errors.js";
 
 describe("DingTalkOAuthIdentityAdapter", () => {
   it("builds the documented enterprise login URL without exposing application secrets", () => {
@@ -21,7 +22,7 @@ describe("DingTalkOAuthIdentityAdapter", () => {
   });
 
   it("verifies corpId and maps the server-derived unionId to the enterprise userId", async () => {
-    const { adapter, fetch, applicationRequest } = fixture();
+    const { adapter, fetch, resolveUserIdByUnionId } = fixture();
 
     const identity = await adapter.verifyAuthorizationCode("dingtalk-code-1");
 
@@ -51,11 +52,7 @@ describe("DingTalkOAuthIdentityAdapter", () => {
         headers: expect.objectContaining({ "x-acs-dingtalk-access-token": "ding-user-token" }),
       }),
     );
-    expect(applicationRequest).toHaveBeenCalledWith({
-      method: "POST",
-      path: "/v1.0/contact/users/unionId",
-      body: { unionId: "union-1" },
-    });
+    expect(resolveUserIdByUnionId).toHaveBeenCalledWith("union-1");
   });
 
   it("fails closed when DingTalk returns another enterprise", async () => {
@@ -66,21 +63,38 @@ describe("DingTalkOAuthIdentityAdapter", () => {
       "DingTalk OAuth returned an unexpected enterprise",
     );
   });
+
+  it("classifies enterprise user mapping failures without exposing upstream details", async () => {
+    const { adapter, resolveUserIdByUnionId } = fixture();
+    resolveUserIdByUnionId.mockRejectedValueOnce(new ApprovalMcpError(
+      "DINGTALK_API_ERROR",
+      "DingTalk rejected the enterprise identity mapping request.",
+      { details: { upstreamCode: "88", upstreamMessage: "sensitive-upstream-detail" } },
+    ));
+
+    await expect(adapter.verifyAuthorizationCode("dingtalk-code-1")).rejects.toMatchObject({
+      code: "DINGTALK_AUTH_ERROR",
+      details: {
+        authStage: "enterprise_user_mapping",
+        upstreamCode: "88",
+      },
+    });
+  });
 });
 
 function fixture(): {
   adapter: DingTalkOAuthIdentityAdapter;
   fetch: ReturnType<typeof vi.fn>;
-  applicationRequest: ReturnType<typeof vi.fn>;
+  resolveUserIdByUnionId: ReturnType<typeof vi.fn>;
 } {
   const fetch = vi
     .fn()
     .mockResolvedValueOnce(jsonResponse({ accessToken: "ding-user-token", expireIn: 7200, corpId: "corp-1" }))
     .mockResolvedValueOnce(jsonResponse({ unionId: "union-1", openId: "open-1" }));
-  const applicationRequest = vi.fn().mockResolvedValue({ result: { userId: "user-1" } });
+  const resolveUserIdByUnionId = vi.fn().mockResolvedValue("user-1");
   return {
     fetch,
-    applicationRequest,
+    resolveUserIdByUnionId,
     adapter: new DingTalkOAuthIdentityAdapter({
       clientId: "ding-app-1",
       clientSecret: "app-secret",
@@ -88,7 +102,7 @@ function fixture(): {
       redirectUrl: "https://dingtalk.mwexk.com/oauth/dingtalk/callback",
       apiBaseUrl: "https://api.dingtalk.com",
       fetch: fetch as typeof globalThis.fetch,
-      applicationApi: { request: applicationRequest },
+      applicationApi: { resolveUserIdByUnionId },
       now: () => 1_800_000_000,
     }),
   };

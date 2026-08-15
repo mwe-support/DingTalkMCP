@@ -1,10 +1,9 @@
 import { ApprovalMcpError } from "../core/errors.js";
-import type { DingTalkRequest } from "../dingtalk/client.js";
 import type { TokenIdentity } from "./jwt-codec.js";
 import type { DingTalkIdentityPort } from "./mcp-authorization.js";
 
 interface ApplicationApiPort {
-  request<T = unknown>(request: DingTalkRequest): Promise<T>;
+  resolveUserIdByUnionId(unionId: string): Promise<string>;
 }
 
 export interface DingTalkOAuthIdentityAdapterOptions {
@@ -65,16 +64,24 @@ export class DingTalkOAuthIdentityAdapter implements DingTalkIdentityPort {
     }
     const profile = await this.#getUserProfile(token.accessToken);
     const unionId = requiredString(profile.unionId, "DingTalk user profile did not contain unionId.");
-    const mapped = await this.#applicationApi.request({
-      method: "POST",
-      path: "/v1.0/contact/users/unionId",
-      body: { unionId },
-    });
-    const result = record(record(mapped)?.result) ?? record(mapped);
-    const userId = requiredString(
-      result?.userId ?? result?.userid,
-      "DingTalk did not map the OAuth unionId to an enterprise userId.",
-    );
+    let userId: string;
+    try {
+      userId = await this.#applicationApi.resolveUserIdByUnionId(unionId);
+    } catch (error) {
+      const upstream = error instanceof ApprovalMcpError ? error : undefined;
+      throw new ApprovalMcpError(
+        "DINGTALK_AUTH_ERROR",
+        "DingTalk could not map the OAuth identity to an enterprise userId.",
+        {
+          cause: error,
+          details: {
+            authStage: "enterprise_user_mapping",
+            ...safeUpstreamDetails(upstream?.details),
+          },
+          retryable: upstream?.retryable ?? false,
+        },
+      );
+    }
     return {
       subject: unionId,
       tenantId: this.#corpId,
@@ -175,4 +182,13 @@ function requiredString(value: unknown, message: string): string {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" || typeof value === "number" ? String(value) : undefined;
+}
+
+function safeUpstreamDetails(details: Record<string, unknown> | undefined): Record<string, unknown> {
+  if (details === undefined) return {};
+  return {
+    ...(details.upstreamCode === undefined ? {} : { upstreamCode: details.upstreamCode }),
+    ...(details.requestId === undefined ? {} : { requestId: details.requestId }),
+    ...(details.requiredScopes === undefined ? {} : { requiredScopes: details.requiredScopes }),
+  };
 }
