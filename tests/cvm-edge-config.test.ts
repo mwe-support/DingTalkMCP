@@ -3,6 +3,13 @@ import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 
 describe("CVM DingTalk edge contract", () => {
+  it("routes the sole production backend through loopback port 3000", async () => {
+    const config = await readFile(new URL("../deploy/cvm/edge/dingtalk.conf", import.meta.url), "utf8");
+
+    expect(config).toContain("proxy_pass http://127.0.0.1:3000");
+    expect(config).not.toContain("127.0.0.1:3001");
+  });
+
   it("uses exact OAuth/MCP locations with strict method allowlists", async () => {
     const config = await readFile(new URL("../deploy/cvm/edge/dingtalk.conf", import.meta.url), "utf8");
 
