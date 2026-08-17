@@ -59,21 +59,46 @@ export interface RefreshTokenRecord {
   expiresAt: number;
 }
 
-export type RefreshConsumeResult =
-  | { status: "active"; record: RefreshTokenRecord }
+export interface RefreshTokenSuccessor<T> {
+  token: string;
+  record: RefreshTokenRecord;
+  result: T;
+}
+
+export type RefreshRotateResult<T> =
+  | { status: "rotated"; result: T }
   | { status: "replayed" }
   | { status: "missing" };
 
+export function assertRefreshSuccessor<T>(
+  currentToken: string,
+  current: RefreshTokenRecord,
+  successor: RefreshTokenSuccessor<T>,
+): void {
+  if (
+    successor.token === currentToken ||
+    successor.token === "" ||
+    successor.record.familyId !== current.familyId ||
+    successor.record.clientId !== current.clientId ||
+    successor.record.resource !== current.resource
+  ) {
+    throw new Error("The refresh token successor does not preserve its family binding.");
+  }
+}
+
 export interface AuthorizationStore extends OAuthRegisteredClientsStore {
   prune(): Promise<void>;
+  touchClient(clientId: string): Promise<void>;
   putTransaction(state: string, transaction: AuthorizationTransaction): Promise<void>;
   consumeTransaction(state: string): Promise<AuthorizationTransaction | undefined>;
   putAuthorizationCode(code: string, record: AuthorizationCodeRecord): Promise<void>;
   getAuthorizationCode(code: string): Promise<AuthorizationCodeRecord | undefined>;
   consumeAuthorizationCode(code: string): Promise<AuthorizationCodeRecord | undefined>;
   putRefreshToken(token: string, record: RefreshTokenRecord): Promise<void>;
-  consumeRefreshToken(token: string): Promise<RefreshConsumeResult>;
-  isRefreshFamilyRevoked(familyId: string): Promise<boolean>;
+  rotateRefreshToken<T>(
+    token: string,
+    successor: (record: RefreshTokenRecord) => Promise<RefreshTokenSuccessor<T>>,
+  ): Promise<RefreshRotateResult<T>>;
   revokeRefreshToken(token: string): Promise<void>;
 }
 
@@ -91,16 +116,22 @@ interface StoredClient {
   expiresAt: number;
 }
 
+interface InMemorySpentRefresh {
+  familyId: string;
+  expiresAt: number;
+}
+
 export class InMemoryAuthorizationStore implements AuthorizationStore {
   readonly #clients = new Map<string, StoredClient>();
   readonly #transactions = new Map<string, AuthorizationTransaction>();
   readonly #codes = new Map<string, AuthorizationCodeRecord>();
   readonly #refresh = new Map<string, RefreshTokenRecord>();
-  readonly #spentRefresh = new Map<string, string>();
-  readonly #revokedFamilies = new Set<string>();
+  readonly #spentRefresh = new Map<string, InMemorySpentRefresh>();
+  readonly #revokedFamilies = new Map<string, number>();
   readonly #now: () => number;
   readonly #maximumClients: number;
   readonly #clientTtlSeconds: number;
+  #refreshQueue: Promise<unknown> = Promise.resolve();
 
   constructor(options: InMemoryAuthorizationStoreOptions = {}) {
     this.#now = options.now ?? (() => Math.floor(Date.now() / 1000));
@@ -111,9 +142,7 @@ export class InMemoryAuthorizationStore implements AuthorizationStore {
   getClient(clientId: string): OAuthClientInformationFull | undefined {
     this.#prune();
     const stored = this.#clients.get(clientId);
-    if (stored === undefined) return undefined;
-    stored.expiresAt = this.#now() + this.#clientTtlSeconds;
-    return structuredClone(stored.client);
+    return stored === undefined ? undefined : structuredClone(stored.client);
   }
 
   registerClient(
@@ -134,6 +163,12 @@ export class InMemoryAuthorizationStore implements AuthorizationStore {
 
   async prune(): Promise<void> {
     this.#prune();
+  }
+
+  async touchClient(clientId: string): Promise<void> {
+    const stored = this.#clients.get(clientId);
+    if (stored === undefined) throw new InvalidClientMetadataError("The OAuth client registration has expired.");
+    stored.expiresAt = this.#now() + this.#clientTtlSeconds;
   }
 
   async putTransaction(state: string, transaction: AuthorizationTransaction): Promise<void> {
@@ -167,39 +202,70 @@ export class InMemoryAuthorizationStore implements AuthorizationStore {
     this.#refresh.set(hash(token), record);
   }
 
-  async consumeRefreshToken(token: string): Promise<RefreshConsumeResult> {
-    const key = hash(token);
-    const record = this.#refresh.get(key);
-    if (record !== undefined) {
-      this.#refresh.delete(key);
-      this.#spentRefresh.set(key, record.familyId);
-      if (record.expiresAt < this.#now() || this.#revokedFamilies.has(record.familyId)) {
-        return { status: "missing" };
+  rotateRefreshToken<T>(
+    token: string,
+    successorFactory: (record: RefreshTokenRecord) => Promise<RefreshTokenSuccessor<T>>,
+  ): Promise<RefreshRotateResult<T>> {
+    const rotate = async (): Promise<RefreshRotateResult<T>> => {
+      this.#prune();
+      const key = hash(token);
+      const record = this.#refresh.get(key);
+      if (record !== undefined) {
+        if (record.expiresAt < this.#now()) {
+          this.#refresh.delete(key);
+          return { status: "missing" };
+        }
+        if (this.#revokedFamilies.has(record.familyId)) return { status: "missing" };
+        const successor = await successorFactory(structuredClone(record));
+        assertRefreshSuccessor(token, record, successor);
+        const client = this.#clients.get(record.clientId);
+        if (client === undefined) throw new InvalidClientMetadataError("The OAuth client registration has expired.");
+        this.#refresh.delete(key);
+        for (const [spentKey, spent] of this.#spentRefresh) {
+          if (spent.familyId === record.familyId) this.#spentRefresh.delete(spentKey);
+        }
+        this.#spentRefresh.set(key, {
+          familyId: record.familyId,
+          expiresAt: successor.record.expiresAt,
+        });
+        this.#refresh.set(hash(successor.token), structuredClone(successor.record));
+        client.expiresAt = this.#now() + this.#clientTtlSeconds;
+        return { status: "rotated", result: successor.result };
       }
-      return { status: "active", record };
-    }
-    const replayedFamily = this.#spentRefresh.get(key);
-    if (replayedFamily !== undefined) {
-      this.#revokedFamilies.add(replayedFamily);
-      return { status: "replayed" };
-    }
-    return { status: "missing" };
-  }
-
-  async isRefreshFamilyRevoked(familyId: string): Promise<boolean> {
-    return this.#revokedFamilies.has(familyId);
+      const spent = this.#spentRefresh.get(key);
+      if (spent !== undefined) {
+        this.#revokedFamilies.set(spent.familyId, spent.expiresAt);
+        return { status: "replayed" };
+      }
+      return { status: "missing" };
+    };
+    const next = this.#refreshQueue.then(rotate, rotate);
+    this.#refreshQueue = next.catch(() => undefined);
+    return next;
   }
 
   async revokeRefreshToken(token: string): Promise<void> {
     const key = hash(token);
-    const familyId = this.#refresh.get(key)?.familyId ?? this.#spentRefresh.get(key);
-    if (familyId !== undefined) this.#revokedFamilies.add(familyId);
+    const active = this.#refresh.get(key);
+    const spent = this.#spentRefresh.get(key);
+    const familyId = active?.familyId ?? spent?.familyId;
+    const expiresAt = active?.expiresAt ?? spent?.expiresAt;
+    if (familyId !== undefined && expiresAt !== undefined) this.#revokedFamilies.set(familyId, expiresAt);
   }
 
   #prune(): void {
     const now = this.#now();
     for (const [clientId, stored] of this.#clients) {
       if (stored.expiresAt < now) this.#clients.delete(clientId);
+    }
+    for (const [token, record] of this.#refresh) {
+      if (record.expiresAt < now) this.#refresh.delete(token);
+    }
+    for (const [token, spent] of this.#spentRefresh) {
+      if (spent.expiresAt < now) this.#spentRefresh.delete(token);
+    }
+    for (const [familyId, expiresAt] of this.#revokedFamilies) {
+      if (expiresAt < now) this.#revokedFamilies.delete(familyId);
     }
   }
 }
@@ -480,9 +546,76 @@ class DingTalkBackedOAuthProvider implements OAuthServerProvider {
     scopes?: string[],
     resource?: URL,
   ): Promise<OAuthTokens> {
-    const consumed = await this.#options.store.consumeRefreshToken(refreshToken);
-    if (consumed.status !== "active") {
-      if (consumed.status === "replayed") {
+    let revokeOnFailure = false;
+    try {
+      const rotated = await this.#options.store.rotateRefreshToken(refreshToken, async (record) => {
+        let refreshResource: string;
+        try {
+          refreshResource = this.#validateResource(resource);
+        } catch (error) {
+          await recordSecurity(this.#options.securityAudit, {
+            event: "authorization_failed",
+            outcome: "rejected",
+            clientId: client.client_id,
+            reasonCode: "REFRESH_TARGET_INVALID",
+          }).catch(() => undefined);
+          throw error;
+        }
+        if (record.clientId !== client.client_id || refreshResource !== record.resource) {
+          revokeOnFailure = true;
+          await recordSecurity(this.#options.securityAudit, {
+            event: "authorization_failed",
+            outcome: "rejected",
+            clientId: client.client_id,
+            reasonCode: "REFRESH_BINDING_INVALID",
+          }).catch(() => undefined);
+          throw new InvalidGrantError("Refresh token is not valid for this client or resource.");
+        }
+        let requestedScopes: McpScope[];
+        try {
+          requestedScopes = scopes === undefined ? record.scopes : this.#validateScopes(scopes);
+        } catch (error) {
+          await recordSecurity(this.#options.securityAudit, {
+            event: "scope_rejected",
+            outcome: "rejected",
+            clientId: client.client_id,
+            reasonCode: "REFRESH_SCOPE_INVALID",
+          }).catch(() => undefined);
+          throw error;
+        }
+        if (requestedScopes.some((scope) => !record.scopes.includes(scope))) {
+          await recordSecurity(this.#options.securityAudit, {
+            event: "scope_rejected",
+            outcome: "rejected",
+            clientId: client.client_id,
+            reasonCode: "REFRESH_SCOPE_EXPANSION",
+          }).catch(() => undefined);
+          throw new InvalidScopeError("A refresh request cannot expand the original scope.");
+        }
+        const accessToken = await this.#options.tokenCodec.issue({
+          principal: record.principal,
+          clientId: record.clientId,
+          scopes: requestedScopes,
+        });
+        const nextRefreshToken = this.#randomToken();
+        return {
+          token: nextRefreshToken,
+          record: {
+            ...record,
+            scopes: requestedScopes,
+            expiresAt: this.#now() + this.#options.refreshTokenTtlSeconds,
+          },
+          result: {
+            access_token: accessToken,
+            token_type: "bearer" as const,
+            expires_in: this.#options.accessTokenTtlSeconds,
+            scope: requestedScopes.join(" "),
+            refresh_token: nextRefreshToken,
+          },
+        };
+      });
+      if (rotated.status === "rotated") return rotated.result;
+      if (rotated.status === "replayed") {
         await recordSecurity(this.#options.securityAudit, {
           event: "refresh_replay",
           outcome: "rejected",
@@ -498,62 +631,10 @@ class DingTalkBackedOAuthProvider implements OAuthServerProvider {
         }).catch(() => undefined);
       }
       throw new InvalidGrantError("Refresh token is invalid, expired, revoked, or replayed.");
-    }
-    const record = consumed.record;
-    let refreshResource: string;
-    try {
-      refreshResource = this.#validateResource(resource);
     } catch (error) {
-      await recordSecurity(this.#options.securityAudit, {
-        event: "authorization_failed",
-        outcome: "rejected",
-        clientId: client.client_id,
-        reasonCode: "REFRESH_TARGET_INVALID",
-      }).catch(() => undefined);
+      if (revokeOnFailure) await this.#options.store.revokeRefreshToken(refreshToken).catch(() => undefined);
       throw error;
     }
-    if (
-      record.clientId !== client.client_id ||
-      refreshResource !== record.resource ||
-      await this.#options.store.isRefreshFamilyRevoked(record.familyId)
-    ) {
-      await this.#options.store.revokeRefreshToken(refreshToken);
-      await recordSecurity(this.#options.securityAudit, {
-        event: "authorization_failed",
-        outcome: "rejected",
-        clientId: client.client_id,
-        reasonCode: "REFRESH_BINDING_INVALID",
-      }).catch(() => undefined);
-      throw new InvalidGrantError("Refresh token is not valid for this client or resource.");
-    }
-    let requestedScopes: McpScope[];
-    try {
-      requestedScopes = scopes === undefined ? record.scopes : this.#validateScopes(scopes);
-    } catch (error) {
-      await recordSecurity(this.#options.securityAudit, {
-        event: "scope_rejected",
-        outcome: "rejected",
-        clientId: client.client_id,
-        reasonCode: "REFRESH_SCOPE_INVALID",
-      }).catch(() => undefined);
-      throw error;
-    }
-    if (requestedScopes.some((scope) => !record.scopes.includes(scope))) {
-      await recordSecurity(this.#options.securityAudit, {
-        event: "scope_rejected",
-        outcome: "rejected",
-        clientId: client.client_id,
-        reasonCode: "REFRESH_SCOPE_EXPANSION",
-      }).catch(() => undefined);
-      throw new InvalidScopeError("A refresh request cannot expand the original scope.");
-    }
-    return this.#issueTokenPair(
-      record.clientId,
-      record.resource,
-      requestedScopes,
-      record.principal,
-      record.familyId,
-    );
   }
 
   verifyAccessToken(token: string): Promise<AuthInfo> {
@@ -595,6 +676,7 @@ class DingTalkBackedOAuthProvider implements OAuthServerProvider {
     familyId: string,
   ): Promise<OAuthTokens> {
     const accessToken = await this.#options.tokenCodec.issue({ principal, clientId, scopes });
+    await this.#options.store.touchClient(clientId);
     const refreshToken = this.#randomToken();
     await this.#options.store.putRefreshToken(refreshToken, {
       familyId,

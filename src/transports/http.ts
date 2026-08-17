@@ -54,7 +54,9 @@ async function main(): Promise<void> {
     apiBaseUrl: config.apiBaseUrl,
     applicationApi: runtime.api,
   });
-  const authorizationStore = new DirectoryAuthorizationStore(config.auth.authStorePath);
+  const authorizationStore = new DirectoryAuthorizationStore(config.auth.authStorePath, {
+    refreshTokenUpgradeTtlSeconds: config.auth.refreshTokenTtlSeconds,
+  });
   const authorizationSweep = await startAuthorizationStoreSweep(authorizationStore, {
     onError: () => {
       process.stderr.write("Authorization state retention sweep failed.\n");

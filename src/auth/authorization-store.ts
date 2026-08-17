@@ -6,11 +6,13 @@ import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/share
 import { InvalidClientMetadataError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 
 import {
+  assertRefreshSuccessor,
   type AuthorizationCodeRecord,
   type AuthorizationStore,
   type AuthorizationTransaction,
-  type RefreshConsumeResult,
+  type RefreshRotateResult,
   type RefreshTokenRecord,
+  type RefreshTokenSuccessor,
   DEFAULT_DYNAMIC_CLIENT_TTL_SECONDS,
   validateDynamicClientRegistration,
 } from "./mcp-authorization.js";
@@ -27,6 +29,7 @@ interface StoredClient {
 
 interface AuthorizationState {
   schemaVersion: 1;
+  refreshTokenUpgradeVersion?: number;
   clients: Record<string, StoredClient>;
   transactions: Record<string, AuthorizationTransaction>;
   authorizationCodes: Record<string, AuthorizationCodeRecord>;
@@ -39,9 +42,11 @@ export interface DirectoryAuthorizationStoreOptions {
   now?: () => number;
   maximumClients?: number;
   clientTtlSeconds?: number;
+  refreshTokenUpgradeTtlSeconds?: number;
 }
 
 export const MAX_AUTHORIZATION_STATE_BYTES = 4 * 1024 * 1024;
+const REFRESH_TOKEN_UPGRADE_VERSION = 1;
 
 export class DirectoryAuthorizationStore implements AuthorizationStore {
   readonly #root: string;
@@ -49,6 +54,7 @@ export class DirectoryAuthorizationStore implements AuthorizationStore {
   readonly #now: () => number;
   readonly #maximumClients: number;
   readonly #clientTtlSeconds: number;
+  readonly #refreshTokenUpgradeTtlSeconds: number | undefined;
   #queue: Promise<unknown> = Promise.resolve();
 
   constructor(root: string, options: DirectoryAuthorizationStoreOptions = {}) {
@@ -57,15 +63,11 @@ export class DirectoryAuthorizationStore implements AuthorizationStore {
     this.#now = options.now ?? (() => Math.floor(Date.now() / 1000));
     this.#maximumClients = options.maximumClients ?? 1000;
     this.#clientTtlSeconds = options.clientTtlSeconds ?? DEFAULT_DYNAMIC_CLIENT_TTL_SECONDS;
+    this.#refreshTokenUpgradeTtlSeconds = options.refreshTokenUpgradeTtlSeconds;
   }
 
   getClient(clientId: string): Promise<OAuthClientInformationFull | undefined> {
-    return this.#update((state) => {
-      const stored = state.clients[clientId];
-      if (stored === undefined) return undefined;
-      stored.expiresAt = this.#now() + this.#clientTtlSeconds;
-      return clone(stored.client);
-    });
+    return this.#update((state) => clone(state.clients[clientId]?.client));
   }
 
   registerClient(
@@ -87,6 +89,14 @@ export class DirectoryAuthorizationStore implements AuthorizationStore {
 
   prune(): Promise<void> {
     return this.#update(() => undefined);
+  }
+
+  touchClient(clientId: string): Promise<void> {
+    return this.#update((state) => {
+      const stored = state.clients[clientId];
+      if (stored === undefined) throw new InvalidClientMetadataError("The OAuth client registration has expired.");
+      stored.expiresAt = this.#now() + this.#clientTtlSeconds;
+    });
   }
 
   putTransaction(stateToken: string, transaction: AuthorizationTransaction): Promise<void> {
@@ -129,15 +139,30 @@ export class DirectoryAuthorizationStore implements AuthorizationStore {
     });
   }
 
-  consumeRefreshToken(token: string): Promise<RefreshConsumeResult> {
-    return this.#update((state) => {
+  rotateRefreshToken<T>(
+    token: string,
+    successorFactory: (record: RefreshTokenRecord) => Promise<RefreshTokenSuccessor<T>>,
+  ): Promise<RefreshRotateResult<T>> {
+    return this.#update(async (state) => {
       const key = hash(token);
       const record = state.refreshTokens[key];
       if (record !== undefined) {
-        delete state.refreshTokens[key];
-        state.spentRefreshTokens[key] = { familyId: record.familyId, expiresAt: record.expiresAt };
         if (state.revokedFamilies[record.familyId] !== undefined) return { status: "missing" };
-        return { status: "active", record: clone(record) };
+        const successor = await successorFactory(clone(record));
+        assertRefreshSuccessor(token, record, successor);
+        const client = state.clients[record.clientId];
+        if (client === undefined) throw new InvalidClientMetadataError("The OAuth client registration has expired.");
+        delete state.refreshTokens[key];
+        for (const [spentKey, spent] of Object.entries(state.spentRefreshTokens)) {
+          if (spent.familyId === record.familyId) delete state.spentRefreshTokens[spentKey];
+        }
+        state.spentRefreshTokens[key] = {
+          familyId: record.familyId,
+          expiresAt: successor.record.expiresAt,
+        };
+        state.refreshTokens[hash(successor.token)] = clone(successor.record);
+        client.expiresAt = this.#now() + this.#clientTtlSeconds;
+        return { status: "rotated", result: successor.result };
       }
       const spent = state.spentRefreshTokens[key];
       if (spent !== undefined) {
@@ -146,10 +171,6 @@ export class DirectoryAuthorizationStore implements AuthorizationStore {
       }
       return { status: "missing" };
     });
-  }
-
-  isRefreshFamilyRevoked(familyId: string): Promise<boolean> {
-    return this.#update((state) => state.revokedFamilies[familyId] !== undefined);
   }
 
   revokeRefreshToken(token: string): Promise<void> {
@@ -166,7 +187,9 @@ export class DirectoryAuthorizationStore implements AuthorizationStore {
   #update<T>(operation: (state: AuthorizationState) => T | Promise<T>): Promise<T> {
     const run = async (): Promise<T> => {
       const state = await this.#read();
-      pruneExpired(state, this.#now());
+      const now = this.#now();
+      upgradeLegacyRefreshTokens(state, now, this.#refreshTokenUpgradeTtlSeconds);
+      pruneExpired(state, now);
       const result = await operation(state);
       await this.#write(state);
       return result;
@@ -224,6 +247,36 @@ function pruneExpired(state: AuthorizationState, now: number): void {
   pruneRecord(state.revokedFamilies, (expiresAt) => expiresAt < now);
 }
 
+function upgradeLegacyRefreshTokens(
+  state: AuthorizationState,
+  now: number,
+  refreshTokenTtlSeconds: number | undefined,
+): void {
+  if (
+    refreshTokenTtlSeconds === undefined ||
+    (state.refreshTokenUpgradeVersion ?? 0) >= REFRESH_TOKEN_UPGRADE_VERSION
+  ) {
+    return;
+  }
+  const familyExpiries = new Map<string, number>();
+  for (const record of Object.values(state.refreshTokens)) {
+    if (record.expiresAt < now) continue;
+    record.expiresAt = Math.max(record.expiresAt, now + refreshTokenTtlSeconds);
+    familyExpiries.set(record.familyId, Math.max(familyExpiries.get(record.familyId) ?? 0, record.expiresAt));
+  }
+  for (const spent of Object.values(state.spentRefreshTokens)) {
+    const familyExpiry = familyExpiries.get(spent.familyId);
+    if (familyExpiry !== undefined && spent.expiresAt < familyExpiry) spent.expiresAt = familyExpiry;
+  }
+  for (const [familyId, familyExpiry] of familyExpiries) {
+    const revokedUntil = state.revokedFamilies[familyId];
+    if (revokedUntil !== undefined && revokedUntil < familyExpiry) {
+      state.revokedFamilies[familyId] = familyExpiry;
+    }
+  }
+  state.refreshTokenUpgradeVersion = REFRESH_TOKEN_UPGRADE_VERSION;
+}
+
 export interface AuthorizationStoreSweep {
   close(): void;
 }
@@ -258,6 +311,7 @@ function isAuthorizationState(value: unknown): value is AuthorizationState {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const state = value as Partial<AuthorizationState>;
   return state.schemaVersion === 1 &&
+    (state.refreshTokenUpgradeVersion === undefined || Number.isInteger(state.refreshTokenUpgradeVersion)) &&
     isRecord(state.clients) &&
     isRecord(state.transactions) &&
     isRecord(state.authorizationCodes) &&

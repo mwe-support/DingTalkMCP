@@ -42,7 +42,8 @@ describe("createMcpAuthorization", () => {
   });
 
   it("completes DingTalk-backed OAuth with PKCE and protects a resource-bound route", async () => {
-    const { baseUrl, securityEvents } = await fixture();
+    const { baseUrl, securityEvents, store } = await fixture();
+    const touchClient = vi.spyOn(store, "touchClient");
     const client = await registerPublicClient(baseUrl);
     const verifier = "workbuddy-codex-verifier-that-is-long-enough-1234567890";
     const challenge = createHash("sha256").update(verifier).digest("base64url");
@@ -84,6 +85,7 @@ describe("createMcpAuthorization", () => {
     });
     expect(typeof tokens.access_token).toBe("string");
     expect(typeof tokens.refresh_token).toBe("string");
+    expect(touchClient).toHaveBeenCalledOnce();
 
     const protectedResponse = await fetch(new URL("/whoami", baseUrl), {
       headers: { authorization: `Bearer ${tokens.access_token}` },
@@ -258,7 +260,8 @@ describe("createMcpAuthorization", () => {
   });
 
   it("audits OAuth requests rejected by SDK validation before provider exchange", async () => {
-    const { baseUrl, securityEvents } = await fixture();
+    const { baseUrl, securityEvents, store } = await fixture();
+    const touchClient = vi.spyOn(store, "touchClient");
     const client = await registerPublicClient(baseUrl);
     const invalidAuthorize = new URL("/authorize", baseUrl);
     invalidAuthorize.search = new URLSearchParams({
@@ -308,6 +311,7 @@ describe("createMcpAuthorization", () => {
     });
 
     expect(rejected.status).toBe(400);
+    expect(touchClient).not.toHaveBeenCalled();
     expect(securityEvents).toContainEqual(expect.objectContaining({
       event: "authorization_failed",
       reasonCode: "TOKEN_REQUEST_REJECTED",
@@ -319,6 +323,7 @@ async function fixture(identityOverride?: DingTalkIdentityPort): Promise<{
   baseUrl: URL;
   securityEvents: SecurityAuditEventInput[];
   identity: DingTalkIdentityPort;
+  store: InMemoryAuthorizationStore;
 }> {
   const { privateKey } = generateKeyPairSync("ed25519");
   const tokenCodec = await JoseMcpTokenCodec.create({
@@ -343,6 +348,7 @@ async function fixture(identityOverride?: DingTalkIdentityPort): Promise<{
     },
   } satisfies DingTalkIdentityPort;
   const securityEvents: SecurityAuditEventInput[] = [];
+  const store = new InMemoryAuthorizationStore({ now: () => 1_800_000_000 });
   const auth = createMcpAuthorization({
     issuerUrl: new URL(issuer),
     resourceUrl: new URL(resource),
@@ -353,7 +359,7 @@ async function fixture(identityOverride?: DingTalkIdentityPort): Promise<{
     refreshTokenTtlSeconds: 28_800,
     transactionTtlSeconds: 300,
     identity,
-    store: new InMemoryAuthorizationStore({ now: () => 1_800_000_000 }),
+    store,
     tokenCodec,
     securityAudit: { record: (event) => { securityEvents.push(event); } },
     now: () => 1_800_000_000,
@@ -371,7 +377,7 @@ async function fixture(identityOverride?: DingTalkIdentityPort): Promise<{
     server.once("error", reject);
   });
   const address = server.address() as AddressInfo;
-  return { baseUrl: new URL(`http://127.0.0.1:${address.port}`), securityEvents, identity };
+  return { baseUrl: new URL(`http://127.0.0.1:${address.port}`), securityEvents, identity, store };
 }
 
 async function registerPublicClient(baseUrl: URL): Promise<{ client_id: string }> {

@@ -77,7 +77,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApprovalMcpCon
   const accessTokenTtlSeconds = boundedInteger(env.MCP_ACCESS_TOKEN_TTL_SECONDS, 600, 60, 3600, "MCP_ACCESS_TOKEN_TTL_SECONDS");
   const refreshTokenTtlSeconds = boundedInteger(
     env.MCP_REFRESH_TOKEN_TTL_SECONDS,
-    30 * 24 * 60 * 60,
+    7 * 24 * 60 * 60,
     accessTokenTtlSeconds,
     30 * 24 * 60 * 60,
     "MCP_REFRESH_TOKEN_TTL_SECONDS",

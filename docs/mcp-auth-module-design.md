@@ -160,8 +160,8 @@ createMcpAuthorization(config: McpAuthConfig, dependencies: McpAuthDependencies)
 2. `/token` 验证：client、redirect URI、resource、授权码未使用、未过期，以及 PKCE verifier。
 3. 签发：
    - MCP access token：非对称签名 JWT，默认 10 分钟。
-   - MCP refresh token：256 bit 不可猜 opaque token，默认 30 天滚动窗口；服务端只保存 SHA-256 哈希。
-4. refresh token 每次使用都轮换；旧 token 再次出现时，撤销整个 token family，阻止重放。
+   - MCP refresh token：256 bit 不可猜 opaque token，默认 7 天滚动窗口；服务端只保存 SHA-256 哈希。
+4. refresh token 每次使用都在 Store 内原子轮换；每个 family 只保留当前 token 与最近一代重放墓碑。重放最近一代时撤销当前 family，更早 token 按无效凭证拒绝，使长期活跃 family 的持久状态保持 O(1)。
 5. 客户端显式 `/revoke` 时撤销 refresh family。已签发 access token 通过 10 分钟上限自然失效；紧急事件可停用签名 `kid` 立即全局失效。
 
 ## 6. MCP token 契约
@@ -194,7 +194,7 @@ Access token 使用 `EdDSA`（Ed25519）或部署环境稳定支持的 `ES256`�
 - 仅允许 `https:` 回调；原生桌面客户端允许 `http://127.0.0.1`、`http://localhost` 或 `http://[::1]`，仅端口可以变化，scheme/host/path/query 必须匹配。
 - 禁止通配域名、用户信息、片段、非 loopback 明文 HTTP 和私网任意回调。
 - 限制每 IP/时间窗口的注册数、每客户端回调数、metadata 长度和总客户端数。
-- 客户端记录使用 30 天滑动 TTL：合法 `getClient` 访问续期，停止使用超过 30 天后清理；公开客户端不生成或保存无意义的 client secret。
+- 客户端记录使用 30 天滑动 TTL：仅在授权码或 refresh token 完成验证并成功签发 token 后续期，未验证的 `client_id` 查询不得续期；停止使用超过 30 天后清理。公开客户端不生成或保存无意义的 client secret。
 - 上线前用真实 Codex MCP OAuth 客户端做一次注册、登录、刷新、撤销兼容测试；如实际客户端支持 Client ID Metadata Documents，再考虑收紧或替换 DCR。
 
 ## 8. 审批域身份注入
@@ -252,7 +252,7 @@ MCP_SIGNING_PRIVATE_KEY_FILE=/run/secrets/mcp_signing_private_key.pem
 MCP_SIGNING_KEY_ID=<版本化 kid>
 MCP_AUDIT_HMAC_KEY_FILE=/run/secrets/mcp_audit_hmac_key
 MCP_ACCESS_TOKEN_TTL_SECONDS=600
-MCP_REFRESH_TOKEN_TTL_SECONDS=2592000
+MCP_REFRESH_TOKEN_TTL_SECONDS=604800
 MCP_AUTH_TRANSACTION_TTL_SECONDS=300
 MCP_AUTH_STORE_PATH=/data/auth
 MCP_ALLOWED_SCOPES=approval:read,approval:decide
