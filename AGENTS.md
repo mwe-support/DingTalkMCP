@@ -6,6 +6,15 @@ These instructions apply to the entire `approval-mcp` repository.
 
 ## Agent-facing tool design
 
+### Authoritative three-tool boundary
+
+- The stable public surface contains exactly three business tools:
+  1. `approval_task` owns one known `processInstanceId` and all instance-scoped operations, including view, approve, reject, return when supported, comment, and other transitions or annotations on that instance.
+  2. `approval_request` owns template-driven preparation and creation of a new approval instance. It must not grow new operations whose primary object is an already-created instance.
+  3. `approval_inbox` owns bounded, read-only batch discovery of the authenticated user's pending or completed records and returns `processInstanceId` values for `approval_task`.
+- Treat the existing `approval_request` comment/revoke branches as explicit migration debt from the earlier applicant-role model. Do not add more instance-scoped actions there. Move them into `approval_task` in a dedicated, tested public-contract change; do not claim return/comment/revoke support in `approval_task` before each action is actually implemented.
+- This primary-object boundary overrides earlier role-only grouping when they conflict: discovery is a collection lifecycle, creation is a template/new-instance lifecycle, and every operation on an existing instance belongs to the single-instance lifecycle.
+
 - Design public MCP tools around a business role and one coherent state machine, not around DingTalk OpenAPI endpoints.
 - Prefer a deep tool with a small, stable interface. Keep OpenAPI calls, attachment authorization/link-exchange steps, compatibility aliases, and HTTP action routes behind that interface as internal adapters.
 - Operations that share the same actor, authorization boundary, primary identifier, and lifecycle belong in one tool. Use a discriminated `action` field and action-specific validation instead of publishing one tool per verb.
@@ -13,9 +22,9 @@ These instructions apply to the entire `approval-mcp` repository.
   - `view` returns normalized approval content, current actionable task state, operation records, attachment metadata, and bounded optional temporary download links.
   - `approve` and `reject` perform the corresponding transition only after rereading and validating the current task.
   - Do not publish raw `get detail`, `list attachments`, `download attachment`, `approve`, and `reject` operations as separate primary tools.
-- Keep applicant operations in a separate business tool, such as `approval_request`, because template selection, preparation, submission, and revocation use a different actor and lifecycle from approver actions.
-- Keep pending-inbox discovery in a separate read-only `approval_inbox` tool. Its primary object is the authenticated approver's event-indexed collection, while `approval_task` owns one known instance and its decision state machine. `approval_inbox` may return only server-bound-user tasks revalidated against current instance detail; it must never approve or reject.
-- Ordinary OA has no complete free pending-inbox backfill API. The non-Premium implementation is an event index fed by `bpms_task_change`; responses must declare coverage since activation and `resyncRequired`, and must never claim parity with the official DWS inbox.
+- Keep template selection, preparation, and submission in the separate `approval_request` creation lifecycle. Do not use it as the permanent home for operations on an already-created instance.
+- Keep approval-record discovery in a separate read-only `approval_inbox` tool. Its primary object is the authenticated approver's event-indexed collection, while `approval_task` owns one known instance and its decision state machine. The same inbox tool may select `pending` or `completed` records through a bounded status discriminator; do not publish separate list tools. `approval_inbox` may return only server-bound-user tasks revalidated against current instance detail; it must never approve or reject.
+- Ordinary OA has no complete free pending/completed inbox backfill API. The non-Premium implementation is an event index fed by `bpms_task_change`; completed records are bounded history from task-finish events, cancelled tasks are excluded, and responses must declare coverage since activation/retention, capacity truncation, and `resyncRequired`. Never claim parity with the official DWS inbox.
 - Do not create a generic catch-all approval tool that mixes unrelated roles, authorization rules, or state machines. Cohesion, not minimum tool count by itself, is the goal.
 - A new public tool is justified only when its actor, authorization boundary, primary business object, or lifecycle is materially different and cannot fit an existing action union without weakening clarity or safety. Document that reason in the change.
 - Diagnostic and compatibility operations may remain callable internally, but they must not expand the normal agent-facing tool list.

@@ -1,4 +1,4 @@
-import type { PendingApprovalEvent, PendingApprovalIndex } from "../approval/pending-index.js";
+import type { ApprovalInboxEvent, ApprovalInboxIndex } from "../approval/pending-index.js";
 
 export interface DingTalkStreamEventEnvelope {
   specVersion: string;
@@ -39,7 +39,7 @@ export interface DingTalkApprovalEventStreamOptions {
   clientId: string;
   clientSecret: string;
   corpId: string;
-  index: PendingApprovalIndex;
+  index: ApprovalInboxIndex;
   clientFactory?: ((config: DingTalkEventClientConfig) => DingTalkEventClient) | undefined;
 }
 
@@ -85,7 +85,7 @@ export async function startDingTalkApprovalEventStream(
 export function parseTaskChangeEvent(
   message: DingTalkStreamEventEnvelope,
   expectedCorpId: string,
-): PendingApprovalEvent | undefined {
+): ApprovalInboxEvent | undefined {
   if (message.type !== "EVENT") return undefined;
   const payload = parseRecord(message.data);
   const eventType = stringValue(payload.EventType ?? payload.eventType ?? message.headers.eventType);

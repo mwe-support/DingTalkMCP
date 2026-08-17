@@ -17,6 +17,7 @@ import { array, asRecord, normalizeProcessInstance, text, unwrapResult } from ".
 import type { ApprovalCaller, McpScope } from "../auth/types.js";
 import {
   APPROVAL_REQUEST_CONTRACTS,
+  DEFAULT_APPROVAL_INBOX_PROCESS_CODES,
   approvalRequestTemplateForInstance,
   assertApprovalRequestTemplateSchema,
   assertAttachmentFieldAllowed,
@@ -28,7 +29,7 @@ import {
   type ApprovalRequestTemplate,
   type ApplicantFormContext,
 } from "./request-templates.js";
-import type { PendingApprovalIndex } from "./pending-index.js";
+import type { ApprovalInboxIndex } from "./pending-index.js";
 
 type ApiPort = Pick<DingTalkApiClient, "request"> &
   Partial<Pick<DingTalkApiClient, "getUserProfile" | "getDepartmentProfile">>;
@@ -84,7 +85,10 @@ interface ApprovalServiceOptions {
   audit?: ApprovalAuditSink;
   idempotencyLedger?: IdempotencyLedger;
   callerScopes?: Iterable<McpScope>;
-  pendingIndex?: PendingApprovalIndex;
+  inboxIndex?: ApprovalInboxIndex;
+  inboxProcessCodes?: Iterable<string>;
+  corpId?: string;
+  now?: () => number;
 }
 
 export interface GetApprovalInstanceInput {
@@ -193,13 +197,15 @@ export interface ApprovalRequestEnvelope {
 }
 
 export interface ApprovalInboxInput {
+  recordStatus?: "pending" | "completed" | undefined;
+  refreshWindowDays?: number | undefined;
   page?: number | undefined;
   limit?: number | undefined;
 }
 
 export interface ApprovalInboxEnvelope {
-  inboxId: "current_user_pending";
-  action: "list_pending";
+  inboxId: "current_user_pending" | "current_user_completed";
+  action: "list_pending" | "list_completed";
   currentStatus: "PARTIAL";
   auditCorrelationId: string;
   safeNextActions: ["view"];
@@ -207,6 +213,11 @@ export interface ApprovalInboxEnvelope {
 }
 
 const ACTIVE_TASK_STATUSES = new Set(["NEW", "PENDING", "RUNNING", "TODO"]);
+const COMPLETED_TASK_STATUSES = new Set(["COMPLETED"]);
+const DAY_MS = 24 * 60 * 60 * 1000;
+const MAX_INBOX_REFRESH_PAGES_PER_PROCESS = 5;
+const MAX_INBOX_REFRESH_CANDIDATES = 40;
+const MAX_INBOX_REFRESH_PROCESS_CODES = 10;
 const CLIENT_ATTACHMENT_HANDLING = {
   mode: "agent_client",
   agentMustDownload: true,
@@ -231,7 +242,10 @@ export class ApprovalService {
   readonly #allowedProcessCodes: Set<string>;
   readonly #audit: ApprovalAuditSink;
   readonly #idempotencyLedger: IdempotencyLedger;
-  readonly #pendingIndex: PendingApprovalIndex | undefined;
+  readonly #inboxIndex: ApprovalInboxIndex | undefined;
+  readonly #inboxProcessCodes: Set<string>;
+  readonly #corpId: string | undefined;
+  readonly #now: () => number;
   readonly #startRequests = new Map<string, { fingerprint: string; promise: Promise<unknown> }>();
   readonly #decisionRequests = new Map<string, { fingerprint: string; promise: Promise<unknown> }>();
   readonly #approvalRequestSubmissions = new Map<
@@ -259,7 +273,23 @@ export class ApprovalService {
     this.#allowedProcessCodes = new Set(options.allowedProcessCodes ?? []);
     this.#audit = options.audit ?? noopAuditSink;
     this.#idempotencyLedger = options.idempotencyLedger ?? new InMemoryIdempotencyLedger();
-    this.#pendingIndex = options.pendingIndex;
+    this.#inboxIndex = options.inboxIndex;
+    const inboxProcessCodes = [...(
+      options.inboxProcessCodes ?? DEFAULT_APPROVAL_INBOX_PROCESS_CODES
+    )];
+    if (
+      inboxProcessCodes.length < 1 ||
+      inboxProcessCodes.length > MAX_INBOX_REFRESH_PROCESS_CODES ||
+      inboxProcessCodes.some((processCode) => processCode.trim() === "" || processCode.length > 200)
+    ) {
+      throw new ApprovalMcpError(
+        "CONFIGURATION_ERROR",
+        `Inbox refresh requires between 1 and ${MAX_INBOX_REFRESH_PROCESS_CODES} bounded process codes.`,
+      );
+    }
+    this.#inboxProcessCodes = new Set(inboxProcessCodes);
+    this.#corpId = options.corpId;
+    this.#now = options.now ?? Date.now;
   }
 
   forCaller(caller: ApprovalCaller): ApprovalService {
@@ -277,7 +307,10 @@ export class ApprovalService {
       allowedProcessCodes: this.#allowedProcessCodes,
       audit: this.#audit,
       idempotencyLedger: this.#idempotencyLedger,
-      ...(this.#pendingIndex === undefined ? {} : { pendingIndex: this.#pendingIndex }),
+      ...(this.#inboxIndex === undefined ? {} : { inboxIndex: this.#inboxIndex }),
+      inboxProcessCodes: this.#inboxProcessCodes,
+      ...(this.#corpId === undefined ? {} : { corpId: this.#corpId }),
+      now: this.#now,
     });
   }
 
@@ -400,13 +433,22 @@ export class ApprovalService {
   async approvalInbox(input: ApprovalInboxInput): Promise<ApprovalInboxEnvelope> {
     this.#assertScope("approval:read");
     const callerUserId = this.#requireCallerUserId();
-    if (this.#pendingIndex === undefined) {
+    if (this.#inboxIndex === undefined) {
       throw new ApprovalMcpError("CONFIGURATION_ERROR", "The approval inbox event index is unavailable.");
     }
-    const page = await this.#pendingIndex.list({
+    const recordStatus = input.recordStatus ?? "pending";
+    const refresh = input.refreshWindowDays === undefined
+      ? undefined
+      : await this.#refreshApprovalInbox({
+          recordStatus,
+          windowDays: input.refreshWindowDays,
+          callerUserId,
+        });
+    const page = await this.#inboxIndex.list({
       userId: callerUserId,
       page: input.page ?? 1,
       limit: input.limit ?? 20,
+      recordStatus,
     });
     const items: Array<{
       processInstanceId: string;
@@ -416,6 +458,9 @@ export class ApprovalService {
       title?: string;
       currentStatus: string;
       taskStatus: string;
+      recordStatus: "pending" | "completed";
+      decisionResult?: "agree" | "refuse" | "redirect";
+      completedAt?: number;
       createdAt: number;
       updatedAt: number;
     }> = [];
@@ -424,20 +469,20 @@ export class ApprovalService {
     for (const candidate of page.items) {
       try {
         const detail = await this.getProcessInstanceDetail(candidate.processInstanceId);
-        const activeTasks = detail.normalized.tasks
+        const matchingTasks = detail.normalized.tasks
           .map(asRecord)
           .filter((task) => {
             const taskStatus = text(task?.status)?.toUpperCase();
             return (candidate.taskId === undefined || text(task?.taskId) === candidate.taskId) &&
               text(task?.userId ?? task?.actionerUserId) === callerUserId &&
               taskStatus !== undefined &&
-              ACTIVE_TASK_STATUSES.has(taskStatus);
+              isInboxTaskStatus(recordStatus, taskStatus);
           });
-        if (activeTasks.length === 0) {
+        if (matchingTasks.length === 0) {
           staleDetected++;
           continue;
         }
-        const activeTask = activeTasks[0] as Record<string, unknown>;
+        const matchingTask = matchingTasks[0] as Record<string, unknown>;
         items.push({
           processInstanceId: candidate.processInstanceId,
           ...(candidate.taskId === undefined
@@ -446,7 +491,10 @@ export class ApprovalService {
           processCode: detail.normalized.processCode ?? candidate.processCode,
           ...(candidate.title === undefined ? {} : { title: candidate.title }),
           currentStatus: detail.normalized.status?.toUpperCase() ?? "UNKNOWN",
-          taskStatus: text(activeTask.status)?.toUpperCase() ?? "UNKNOWN",
+          taskStatus: text(matchingTask.status)?.toUpperCase() ?? "UNKNOWN",
+          recordStatus,
+          ...(candidate.decisionResult === undefined ? {} : { decisionResult: candidate.decisionResult }),
+          ...(candidate.completedAt === undefined ? {} : { completedAt: candidate.completedAt }),
           createdAt: candidate.createdAt,
           updatedAt: candidate.updatedAt,
         });
@@ -455,8 +503,8 @@ export class ApprovalService {
       }
     }
     return {
-      inboxId: "current_user_pending",
-      action: "list_pending",
+      inboxId: recordStatus === "completed" ? "current_user_completed" : "current_user_pending",
+      action: recordStatus === "completed" ? "list_completed" : "list_pending",
       currentStatus: "PARTIAL",
       auditCorrelationId: randomUUID(),
       safeNextActions: ["view"],
@@ -465,6 +513,9 @@ export class ApprovalService {
         coverageSince: page.coverageSince,
         ...(page.lastEventAt === undefined ? {} : { lastEventAt: page.lastEventAt }),
         resyncRequired: page.resyncRequired,
+        recordStatus,
+        ...(page.capacityTruncated === true ? { capacityTruncated: true as const } : {}),
+        ...(refresh === undefined ? {} : { refresh }),
         page: page.page,
         limit: page.limit,
         hasMore: page.hasMore,
@@ -472,6 +523,146 @@ export class ApprovalService {
         staleDetected,
         verificationFailures,
       },
+    };
+  }
+
+  async #refreshApprovalInbox(input: {
+    recordStatus: "pending" | "completed";
+    windowDays: number;
+    callerUserId: string;
+  }): Promise<{
+    windowDays: number;
+    windowStart: number;
+    windowEnd: number;
+    processCodeCount: number;
+    candidateLimit: number;
+    queryPages: number;
+    candidateInstanceCount: number;
+    indexedRecordCount: number;
+    filteredCandidateCount: number;
+    failures: number;
+    truncated: boolean;
+  }> {
+    if (this.#inboxIndex === undefined) {
+      throw new ApprovalMcpError("CONFIGURATION_ERROR", "The approval inbox event index is unavailable.");
+    }
+    if (this.#corpId === undefined || this.#corpId.trim() === "") {
+      throw new ApprovalMcpError("CONFIGURATION_ERROR", "The DingTalk corporation ID is unavailable for inbox refresh.");
+    }
+    const now = this.#now();
+    const windowStart = now - input.windowDays * DAY_MS;
+    const statuses = input.recordStatus === "pending" ? ["RUNNING"] : ["RUNNING", "COMPLETED"];
+    const candidates = new Map<string, string>();
+    let queryPages = 0;
+    let failures = 0;
+    let truncated = false;
+    processCodes: for (const processCode of this.#inboxProcessCodes) {
+      let nextToken = 0;
+      for (let page = 0; page < MAX_INBOX_REFRESH_PAGES_PER_PROCESS; page++) {
+        let payload: unknown;
+        try {
+          payload = await this.#api.request({
+            method: "POST",
+            path: "/v1.0/workflow/processes/instanceIds/query",
+            body: {
+              processCode,
+              startTime: windowStart,
+              endTime: now,
+              nextToken,
+              maxResults: 20,
+              statuses,
+            },
+          });
+        } catch {
+          failures++;
+          break;
+        }
+        queryPages++;
+        const result = asRecord(unwrapResult(payload));
+        const instanceIds = array(result?.list).map(text).filter((value): value is string => value !== undefined);
+        for (const processInstanceId of instanceIds) {
+          if (!candidates.has(processInstanceId)) candidates.set(processInstanceId, processCode);
+          if (candidates.size >= MAX_INBOX_REFRESH_CANDIDATES) {
+            truncated = true;
+            break processCodes;
+          }
+        }
+        const followingToken = nonNegativeSafeInteger(result?.nextToken);
+        if (instanceIds.length === 0 || followingToken === undefined || followingToken === 0 || followingToken === nextToken) {
+          break;
+        }
+        nextToken = followingToken;
+        if (page === MAX_INBOX_REFRESH_PAGES_PER_PROCESS - 1) truncated = true;
+      }
+    }
+
+    let indexedRecordCount = 0;
+    let filteredCandidateCount = 0;
+    for (const [processInstanceId, discoveredProcessCode] of candidates) {
+      try {
+        const payload = await this.#api.request({
+          method: "GET",
+          path: "/v1.0/workflow/processInstances",
+          query: { processInstanceId },
+        });
+        const normalized = normalizeProcessInstance(unwrapResult(payload));
+        const processCode = normalized.processCode ?? discoveredProcessCode;
+        const matchingTasks = normalized.tasks
+          .map(asRecord)
+          .filter((task) => {
+            const taskStatus = text(task?.status)?.toUpperCase();
+            return text(task?.userId ?? task?.actionerUserId) === input.callerUserId &&
+              taskStatus !== undefined &&
+              isInboxTaskStatus(input.recordStatus, taskStatus);
+          });
+        if (matchingTasks.length === 0) {
+          filteredCandidateCount++;
+          continue;
+        }
+        for (const task of matchingTasks) {
+          const taskId = text(task?.taskId);
+          const decisionResult = inboxDecisionResult(task?.result);
+          const completedAt = timestamp(task?.finishTime ?? task?.modifyTime ?? normalized.finishTime, now);
+          const createTime = timestamp(task?.createTime ?? normalized.createTime, now);
+          const eventTime = input.recordStatus === "pending" ? now : completedAt;
+          await this.#inboxIndex.apply({
+            eventId: inboxRefreshEventId({
+              corpId: this.#corpId,
+              recordStatus: input.recordStatus,
+              processInstanceId,
+              taskId,
+              eventTime,
+              decisionResult,
+            }),
+            corpId: this.#corpId,
+            processInstanceId,
+            processCode,
+            ...(taskId === undefined ? {} : { taskId }),
+            staffId: input.callerUserId,
+            ...(normalized.title === undefined ? {} : { title: normalized.title }),
+            type: input.recordStatus === "pending" ? "start" : "finish",
+            ...(decisionResult === undefined ? {} : { result: decisionResult }),
+            eventTime,
+            createTime,
+          });
+          indexedRecordCount++;
+        }
+      } catch {
+        failures++;
+      }
+    }
+    return {
+      windowDays: input.windowDays,
+      windowStart,
+      windowEnd: now,
+      processCodeCount: this.#inboxProcessCodes.size,
+      candidateLimit: MAX_INBOX_REFRESH_CANDIDATES,
+      queryPages,
+      candidateInstanceCount: candidates.size,
+      indexedRecordCount,
+      filteredCandidateCount,
+      failures,
+      truncated,
     };
   }
 
@@ -2231,6 +2422,57 @@ function normalizeCommittedAttachment(
 function extensionOf(fileName: string): string {
   const index = fileName.lastIndexOf(".");
   return index <= 0 || index === fileName.length - 1 ? "" : fileName.slice(index + 1).toLowerCase();
+}
+
+function nonNegativeSafeInteger(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return value;
+  if (typeof value === "string" && /^\d+$/u.test(value)) {
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
+
+function timestamp(value: unknown, fallback: number): number {
+  const parsed = nonNegativeSafeInteger(value);
+  return parsed !== undefined && parsed > 0 ? parsed : fallback;
+}
+
+function inboxDecisionResult(value: unknown): "agree" | "refuse" | "redirect" | undefined {
+  const normalized = text(value)?.trim().toLowerCase();
+  if (normalized === "agree" || normalized === "approved") return "agree";
+  if (normalized === "refuse" || normalized === "rejected") return "refuse";
+  if (normalized === "redirect" || normalized === "redirected") return "redirect";
+  return undefined;
+}
+
+function isInboxTaskStatus(
+  recordStatus: "pending" | "completed",
+  taskStatus: string,
+): boolean {
+  return recordStatus === "pending"
+    ? ACTIVE_TASK_STATUSES.has(taskStatus)
+    : COMPLETED_TASK_STATUSES.has(taskStatus);
+}
+
+function inboxRefreshEventId(input: {
+  corpId: string;
+  recordStatus: "pending" | "completed";
+  processInstanceId: string;
+  taskId: string | undefined;
+  eventTime: number;
+  decisionResult: "agree" | "refuse" | "redirect" | undefined;
+}): string {
+  return `instance-scan-${createHash("sha256")
+    .update([
+      input.corpId,
+      input.recordStatus,
+      input.processInstanceId,
+      input.taskId ?? "",
+      String(input.eventTime),
+      input.decisionResult ?? "",
+    ].join("\0"), "utf8")
+    .digest("hex")}`;
 }
 
 function stableStringify(value: unknown): string {

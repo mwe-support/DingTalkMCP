@@ -1,6 +1,6 @@
 import { ApprovalService } from "./approval/service.js";
 import { AttachmentLinkPolicy } from "./approval/attachments.js";
-import { DirectoryPendingApprovalIndex } from "./approval/pending-index.js";
+import { DirectoryApprovalInboxIndex } from "./approval/pending-index.js";
 import type { ApprovalMcpConfig } from "./config.js";
 import { JsonLineAuditSink, type ApprovalAuditSink } from "./core/audit.js";
 import { DirectoryIdempotencyLedger } from "./core/idempotency.js";
@@ -18,7 +18,7 @@ export function createApprovalService(config: ApprovalMcpConfig, options: Approv
 export function createApprovalRuntime(
   config: ApprovalMcpConfig,
   options: ApprovalRuntimeOptions = {},
-): { service: ApprovalService; api: DingTalkApiClient; pendingIndex: DirectoryPendingApprovalIndex } {
+): { service: ApprovalService; api: DingTalkApiClient; inboxIndex: DirectoryApprovalInboxIndex } {
   const tokenProvider = new DingTalkTokenProvider({
     appKey: config.clientId,
     appSecret: config.clientSecret,
@@ -31,16 +31,18 @@ export function createApprovalRuntime(
   const attachmentLinkPolicy = new AttachmentLinkPolicy({
     allowedHostSuffixes: config.downloadHostSuffixes,
   });
-  const pendingIndex = new DirectoryPendingApprovalIndex(config.approvalInboxPath);
+  const inboxIndex = new DirectoryApprovalInboxIndex(config.approvalInboxPath);
   const service = new ApprovalService({
     api,
     attachmentLinkPolicy,
     ...(config.agentId === undefined ? {} : { agentId: config.agentId }),
     uploadHostSuffixes: config.uploadHostSuffixes,
     allowedProcessCodes: config.allowedProcessCodes,
+    inboxProcessCodes: config.inboxProcessCodes,
+    corpId: config.auth.corpId,
     audit: options.audit ?? new JsonLineAuditSink(),
     idempotencyLedger: new DirectoryIdempotencyLedger(config.idempotencyLedgerPath),
-    pendingIndex,
+    inboxIndex,
   });
-  return { service, api, pendingIndex };
+  return { service, api, inboxIndex };
 }

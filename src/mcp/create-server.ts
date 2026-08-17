@@ -12,7 +12,7 @@ import {
   paymentRequestFieldsSchema,
 } from "../approval/request-templates.js";
 import { ApprovalMcpError, errorPayload } from "../core/errors.js";
-import { approvalToolAction } from "../core/tool-action.js";
+import { approvalToolAction, type ApprovalToolAction } from "../core/tool-action.js";
 import {
   DEFAULT_AUDIT_WRITE_TIMEOUT_MS,
   type AuditInvocationContext,
@@ -87,6 +87,8 @@ const approvalTaskSchema = z.union([
 ]);
 const approvalInboxSchema = z
   .object({
+    recordStatus: z.enum(["pending", "completed"]).optional().describe("List pending tasks by default, or tasks already handled by the authenticated approver"),
+    refreshWindowDays: z.number().int().min(1).max(30).optional().describe("Optionally refresh the event index through the bounded official instance-ID list scan for configured templates"),
     page: z.number().int().min(1).max(10).optional().describe("1-based event-index page; defaults to 1"),
     limit: z.number().int().min(1).max(20).optional().describe("Return 1 item for a single lookup or up to 20 for a batch"),
   })
@@ -496,9 +498,9 @@ function createPublicApprovalMcpServer(
     tools: [
       {
         name: "approval_inbox",
-        title: "List the current approver's pending approvals",
+        title: "List the current approver's pending or completed approvals",
         description:
-          "Read-only discovery of one or a bounded page of pending approval tasks for the authenticated DingTalk user. Results come from the self-hosted bpms_task_change event index and are revalidated against current approval details before processInstanceId and an available taskId are returned; taskIdUnavailable=true marks an instance-only event. Because ordinary OA exposes no complete free backfill API, every response declares partial coverage since event activation and whether resynchronization is required. Use approval_task to view or decide a returned instance.",
+          "Read-only discovery of one or a bounded page of pending or already handled approval tasks for the authenticated DingTalk user. Set recordStatus=completed for handled tasks; pending is the default. Optional refreshWindowDays performs a bounded scan through the official instance-ID list API for configured process codes, then revalidates each candidate against current approval details and the OAuth-bound user. Results are stored in the same bpms_task_change index before processInstanceId and an available taskId are returned; taskIdUnavailable=true marks an instance-only event. Completed history retains finish events for 30 days and can include agree, refuse, or redirect. Cancelled tasks are not completed approvals. Because neither the event index nor a configured-template scan is a complete free inbox backfill, every response declares partial coverage since event activation, retention, and any capacity truncation, plus whether resynchronization is required. Use approval_task for one returned instance.",
         inputSchema: { ...z.toJSONSchema(approvalInboxSchema), type: "object" },
         annotations: readAnnotations,
       },
@@ -558,7 +560,9 @@ async function auditedPublicToolCall(
   if (options.toolAudit === undefined) return safely(operation);
   const invocationId = randomUUID();
   const startedAt = performance.now();
-  const action = requestedToolName === "approval_inbox" ? "list_pending" : approvalToolAction(rawArguments?.action);
+  const action = requestedToolName === "approval_inbox"
+    ? approvalInboxAuditAction(rawArguments?.recordStatus)
+    : approvalToolAction(rawArguments?.action);
   const publishedTool = requestedToolName === "approval_inbox" || requestedToolName === "approval_task" || requestedToolName === "approval_request";
   const base: ToolInvocationAuditEventBase = {
     timestamp: new Date().toISOString(),
@@ -608,6 +612,12 @@ async function auditedPublicToolCall(
     return markAuditPartial(result);
   }
   return result;
+}
+
+function approvalInboxAuditAction(value: unknown): ApprovalToolAction | undefined {
+  if (value === undefined || value === "pending") return "list_pending";
+  if (value === "completed") return "list_completed";
+  return undefined;
 }
 
 function markAuditPartial<T extends Awaited<ReturnType<typeof safely>>>(result: T): T {

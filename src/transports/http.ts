@@ -94,7 +94,7 @@ async function main(): Promise<void> {
         clientId: config.clientId,
         clientSecret: config.clientSecret,
         corpId: config.auth.corpId,
-        index: runtime.pendingIndex,
+        index: runtime.inboxIndex,
       })
     : undefined;
 

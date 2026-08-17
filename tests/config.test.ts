@@ -21,6 +21,24 @@ describe("loadConfig", () => {
     expect(config.auditLogPath).toBe(resolve("./data/audit"));
     expect(config.approvalInboxPath).toBe(resolve("./data/approval-inbox"));
     expect(config.approvalEventsEnabled).toBe(false);
+    expect(config.inboxProcessCodes).toEqual([
+      "PROC-2DB91B79-3CDD-421D-A223-0489A7BAB2C0",
+      "PROC-5E238117-7121-4CB3-8219-9F11A2E42BE4",
+    ]);
+  });
+
+  it("loads an explicit processCode list for bounded inbox refresh", () => {
+    expect(loadConfig({
+      ...requiredEnvironment,
+      APPROVAL_INBOX_PROCESS_CODES: "PROC-A,PROC-B,PROC-A",
+    }).inboxProcessCodes).toEqual(["PROC-A", "PROC-B"]);
+  });
+
+  it("rejects more than ten process codes for one inbox refresh", () => {
+    expect(() => loadConfig({
+      ...requiredEnvironment,
+      APPROVAL_INBOX_PROCESS_CODES: Array.from({ length: 11 }, (_, index) => `PROC-${index}`).join(","),
+    })).toThrow("Inbox refresh requires between 1 and 10 bounded process codes");
   });
 
   it("enables the DingTalk approval event stream only from an explicit boolean", () => {

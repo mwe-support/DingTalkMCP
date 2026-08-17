@@ -1,6 +1,7 @@
 import { ApprovalMcpError } from "./core/errors.js";
 import { resolve } from "node:path";
 import { MCP_SCOPES, type McpScope } from "./auth/types.js";
+import { DEFAULT_APPROVAL_INBOX_PROCESS_CODES } from "./approval/request-templates.js";
 
 export interface McpAuthConfig {
   publicUrl: string;
@@ -23,6 +24,7 @@ export interface ApprovalMcpConfig {
   agentId?: number;
   apiBaseUrl: string;
   allowedProcessCodes: string[];
+  inboxProcessCodes: string[];
   downloadHostSuffixes: string[];
   uploadHostSuffixes: string[];
   idempotencyLedgerPath: string;
@@ -96,6 +98,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApprovalMcpCon
     throw new ApprovalMcpError("CONFIGURATION_ERROR", "MCP_ALLOWED_SCOPES contains an unsupported scope.");
   }
   const agentId = optionalPositiveInteger(env.DINGTALK_AGENT_ID, "DINGTALK_AGENT_ID");
+  const inboxProcessCodes = csv(
+    env.APPROVAL_INBOX_PROCESS_CODES,
+    [...DEFAULT_APPROVAL_INBOX_PROCESS_CODES],
+  );
+  if (inboxProcessCodes.length > 10 || inboxProcessCodes.some((processCode) => processCode.length > 200)) {
+    throw new ApprovalMcpError(
+      "CONFIGURATION_ERROR",
+      "Inbox refresh requires between 1 and 10 bounded process codes.",
+    );
+  }
 
   return {
     clientId,
@@ -103,6 +115,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApprovalMcpCon
     ...(agentId === undefined ? {} : { agentId }),
     apiBaseUrl: parsedBaseUrl.toString().replace(/\/$/u, ""),
     allowedProcessCodes: csv(env.APPROVAL_ALLOWED_PROCESS_CODES),
+    inboxProcessCodes,
     downloadHostSuffixes: csv(env.APPROVAL_DOWNLOAD_HOST_SUFFIXES, [
       ".dingtalk.com",
       ".alicdn.com",

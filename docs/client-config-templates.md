@@ -70,7 +70,7 @@ codex mcp login mwe_approval_mcp
 4. 已持有较小 scope 的客户端调用发起审批、同意或拒绝动作时，服务端仍通过 HTTP 403 `insufficient_scope` 分别要求 `approval:create` 或 `approval:decide`。WorkBuddy 5.3.13 会把运行时 403 归类为 transport error，不能自动升级；应只执行一次“重新授权”，让它按 metadata 重新申请。自动打开授权页后不要同时点击第二个手动授权按钮，否则并行 OAuth 流程会互相覆盖本地 `clientInformation` 与 `pendingOAuth` 状态。
 5. 浏览器跳转到 `login.dingtalk.com`，使用公司当前账号授权。
 6. 确认回调最终回到客户端 loopback URI，而不是停留在本站 callback。
-7. `tools/list` 应只显示 `approval_inbox`、`approval_task` 与 `approval_request`。`approval_inbox` 使用既有 `approval:read` scope，不需要重新走钉钉授权。
+7. `tools/list` 应只显示 `approval_inbox`、`approval_task` 与 `approval_request`。`approval_inbox` 通过 `recordStatus=pending|completed` 合并待审批和已处理记录，使用既有 `approval:read` scope，不需要重新走钉钉授权。
 8. 先用一个该用户确实参与的实例测试：
 
    ```json

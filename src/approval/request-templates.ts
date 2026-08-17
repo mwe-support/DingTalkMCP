@@ -190,6 +190,10 @@ export const APPROVAL_REQUEST_CONTRACTS: Record<ApprovalRequestTemplate, Templat
   },
 };
 
+export const DEFAULT_APPROVAL_INBOX_PROCESS_CODES = Object.freeze(
+  Object.values(APPROVAL_REQUEST_CONTRACTS).map((contract) => contract.processCode),
+);
+
 export function parseApprovalRequestFields(
   template: ApprovalRequestTemplate,
   fields: unknown,
