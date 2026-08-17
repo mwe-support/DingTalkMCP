@@ -27,6 +27,8 @@ export interface ApprovalMcpConfig {
   uploadHostSuffixes: string[];
   idempotencyLedgerPath: string;
   auditLogPath: string;
+  approvalInboxPath: string;
+  approvalEventsEnabled: boolean;
   auth: McpAuthConfig;
 }
 
@@ -109,6 +111,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApprovalMcpCon
     uploadHostSuffixes: csv(env.APPROVAL_UPLOAD_HOST_SUFFIXES, [".trans.dingtalk.com", ".aliyuncs.com"]),
     idempotencyLedgerPath: resolve(env.APPROVAL_IDEMPOTENCY_LEDGER_PATH?.trim() || "./data/approval-idempotency"),
     auditLogPath: resolve(env.APPROVAL_AUDIT_LOG_PATH?.trim() || "./data/audit"),
+    approvalInboxPath: resolve(env.APPROVAL_INBOX_PATH?.trim() || "./data/approval-inbox"),
+    approvalEventsEnabled: strictBoolean(
+      env.DINGTALK_APPROVAL_EVENTS_ENABLED,
+      false,
+      "DINGTALK_APPROVAL_EVENTS_ENABLED",
+    ),
     auth: {
       publicUrl: publicUrl.href.replace(/\/$/u, ""),
       issuerUrl: issuerUrl.href,
@@ -124,6 +132,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApprovalMcpCon
       allowedScopes: allowedScopes as McpScope[],
     },
   };
+}
+
+function strictBoolean(value: string | undefined, fallback: boolean, key: string): boolean {
+  if (value === undefined || value.trim() === "") return fallback;
+  if (value.trim() === "true") return true;
+  if (value.trim() === "false") return false;
+  throw new ApprovalMcpError("CONFIGURATION_ERROR", `${key} must be true or false.`);
 }
 
 function optionalPositiveInteger(value: string | undefined, key: string): number | undefined {

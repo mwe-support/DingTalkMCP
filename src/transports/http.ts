@@ -16,6 +16,7 @@ import {
   startAuditRetentionSweep,
 } from "../core/audit-log.js";
 import { createApprovalRuntime } from "../runtime.js";
+import { startDingTalkApprovalEventStream } from "../dingtalk/event-stream.js";
 import { startApprovalHttpServer } from "./http-server.js";
 
 async function main(): Promise<void> {
@@ -88,8 +89,17 @@ async function main(): Promise<void> {
   });
   const address = running.httpServer.address() as AddressInfo;
   process.stderr.write(`MWE approval MCP listening on http://${host}:${address.port}/mcp\n`);
+  const approvalEvents = config.approvalEventsEnabled
+    ? await startDingTalkApprovalEventStream({
+        clientId: config.clientId,
+        clientSecret: config.clientSecret,
+        corpId: config.auth.corpId,
+        index: runtime.pendingIndex,
+      })
+    : undefined;
 
   const shutdown = (): void => {
+    approvalEvents?.close();
     retentionSweep.close();
     authorizationSweep.close();
     void running.close().finally(() => process.exit(0));

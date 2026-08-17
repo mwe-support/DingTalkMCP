@@ -74,10 +74,11 @@ describe("approval MCP public contract", () => {
 
     const tools = await client.listTools();
 
-    expect(tools.tools.map((tool) => tool.name)).toEqual(["approval_task", "approval_request"]);
-    expect(tools.tools[0]?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true });
+    expect(tools.tools.map((tool) => tool.name)).toEqual(["approval_inbox", "approval_task", "approval_request"]);
+    expect(tools.tools[0]?.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false });
     expect(tools.tools[1]?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true });
-    const applicantContract = JSON.stringify(tools.tools[1]?.inputSchema);
+    expect(tools.tools[2]?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true });
+    const applicantContract = JSON.stringify(tools.tools[2]?.inputSchema);
     expect(applicantContract).toContain("expense_reimbursement");
     expect(applicantContract).toContain("payment_request");
     expect(applicantContract).toContain("counterparty");

@@ -74,7 +74,7 @@ describe("self-hosted Streamable HTTP transport", () => {
       accessToken,
     );
     expect((await jsonRpcBody(listed)) as Record<string, unknown>).toMatchObject({
-      result: { tools: [{ name: "approval_task" }, { name: "approval_request" }] },
+      result: { tools: [{ name: "approval_inbox" }, { name: "approval_task" }, { name: "approval_request" }] },
     });
 
     const called = await mcpRequest(

@@ -85,6 +85,12 @@ const approvalTaskSchema = z.union([
   approvalTaskApproveSchema,
   approvalTaskRejectSchema,
 ]);
+const approvalInboxSchema = z
+  .object({
+    page: z.number().int().min(1).max(10).optional().describe("1-based event-index page; defaults to 1"),
+    limit: z.number().int().min(1).max(20).optional().describe("Return 1 item for a single lookup or up to 20 for a batch"),
+  })
+  .strict();
 const approvalRequestAttachmentBaseSchema = z
   .object({
     fileName: z.string().trim().min(1).max(255),
@@ -489,6 +495,14 @@ function createPublicApprovalMcpServer(
   server.setRequestHandler(ListToolsRequestSchema, () => ({
     tools: [
       {
+        name: "approval_inbox",
+        title: "List the current approver's pending approvals",
+        description:
+          "Read-only discovery of one or a bounded page of pending approval tasks for the authenticated DingTalk user. Results come from the self-hosted bpms_task_change event index and are revalidated against current approval details before processInstanceId and taskId are returned. Because ordinary OA exposes no complete free backfill API, every response declares partial coverage since event activation and whether resynchronization is required. Use approval_task to view or decide a returned instance.",
+        inputSchema: { ...z.toJSONSchema(approvalInboxSchema), type: "object" },
+        annotations: readAnnotations,
+      },
+      {
         name: "approval_task",
         title: "View or decide an approval task",
         description:
@@ -508,6 +522,13 @@ function createPublicApprovalMcpServer(
   }));
   server.setRequestHandler(CallToolRequestSchema, async (request) =>
     auditedPublicToolCall(options, request.params.name, request.params.arguments, async () => {
+      if (request.params.name === "approval_inbox") {
+        const parsed = await approvalInboxSchema.safeParseAsync(request.params.arguments ?? {});
+        if (!parsed.success) {
+          throw new ApprovalMcpError("INVALID_INPUT", "approval_inbox arguments do not match the list contract.");
+        }
+        return service.approvalInbox(parsed.data);
+      }
       if (request.params.name !== "approval_task") {
         if (request.params.name !== "approval_request") {
           throw new ApprovalMcpError("INVALID_INPUT", "The requested MCP tool is not published.");
@@ -538,7 +559,7 @@ async function auditedPublicToolCall(
   const invocationId = randomUUID();
   const startedAt = performance.now();
   const action = approvalToolAction(rawArguments?.action);
-  const publishedTool = requestedToolName === "approval_task" || requestedToolName === "approval_request";
+  const publishedTool = requestedToolName === "approval_inbox" || requestedToolName === "approval_task" || requestedToolName === "approval_request";
   const base: ToolInvocationAuditEventBase = {
     timestamp: new Date().toISOString(),
     invocationId,

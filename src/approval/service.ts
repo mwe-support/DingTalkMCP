@@ -28,6 +28,7 @@ import {
   type ApprovalRequestTemplate,
   type ApplicantFormContext,
 } from "./request-templates.js";
+import type { PendingApprovalIndex } from "./pending-index.js";
 
 type ApiPort = Pick<DingTalkApiClient, "request"> &
   Partial<Pick<DingTalkApiClient, "getUserProfile" | "getDepartmentProfile">>;
@@ -83,6 +84,7 @@ interface ApprovalServiceOptions {
   audit?: ApprovalAuditSink;
   idempotencyLedger?: IdempotencyLedger;
   callerScopes?: Iterable<McpScope>;
+  pendingIndex?: PendingApprovalIndex;
 }
 
 export interface GetApprovalInstanceInput {
@@ -190,6 +192,20 @@ export interface ApprovalRequestEnvelope {
   data: unknown;
 }
 
+export interface ApprovalInboxInput {
+  page?: number | undefined;
+  limit?: number | undefined;
+}
+
+export interface ApprovalInboxEnvelope {
+  inboxId: "current_user_pending";
+  action: "list_pending";
+  currentStatus: "PARTIAL";
+  auditCorrelationId: string;
+  safeNextActions: ["view"];
+  data: unknown;
+}
+
 const ACTIVE_TASK_STATUSES = new Set(["NEW", "PENDING", "RUNNING", "TODO"]);
 const CLIENT_ATTACHMENT_HANDLING = {
   mode: "agent_client",
@@ -215,6 +231,7 @@ export class ApprovalService {
   readonly #allowedProcessCodes: Set<string>;
   readonly #audit: ApprovalAuditSink;
   readonly #idempotencyLedger: IdempotencyLedger;
+  readonly #pendingIndex: PendingApprovalIndex | undefined;
   readonly #startRequests = new Map<string, { fingerprint: string; promise: Promise<unknown> }>();
   readonly #decisionRequests = new Map<string, { fingerprint: string; promise: Promise<unknown> }>();
   readonly #approvalRequestSubmissions = new Map<
@@ -242,6 +259,7 @@ export class ApprovalService {
     this.#allowedProcessCodes = new Set(options.allowedProcessCodes ?? []);
     this.#audit = options.audit ?? noopAuditSink;
     this.#idempotencyLedger = options.idempotencyLedger ?? new InMemoryIdempotencyLedger();
+    this.#pendingIndex = options.pendingIndex;
   }
 
   forCaller(caller: ApprovalCaller): ApprovalService {
@@ -259,6 +277,7 @@ export class ApprovalService {
       allowedProcessCodes: this.#allowedProcessCodes,
       audit: this.#audit,
       idempotencyLedger: this.#idempotencyLedger,
+      ...(this.#pendingIndex === undefined ? {} : { pendingIndex: this.#pendingIndex }),
     });
   }
 
@@ -374,6 +393,87 @@ export class ApprovalService {
         upstreamResult,
         postActionRefresh: { ok: current !== undefined },
         ...(current === undefined ? {} : { normalized: current.normalized }),
+      },
+    };
+  }
+
+  async approvalInbox(input: ApprovalInboxInput): Promise<ApprovalInboxEnvelope> {
+    this.#assertScope("approval:read");
+    const callerUserId = this.#requireCallerUserId();
+    if (this.#pendingIndex === undefined) {
+      throw new ApprovalMcpError("CONFIGURATION_ERROR", "The approval inbox event index is unavailable.");
+    }
+    const page = await this.#pendingIndex.list({
+      userId: callerUserId,
+      page: input.page ?? 1,
+      limit: input.limit ?? 20,
+    });
+    const items: Array<{
+      processInstanceId: string;
+      taskId: string;
+      processCode?: string;
+      title?: string;
+      currentStatus: string;
+      taskStatus: string;
+      createdAt: number;
+      updatedAt: number;
+    }> = [];
+    let staleRemoved = 0;
+    let verificationFailures = 0;
+    for (const candidate of page.items) {
+      try {
+        const detail = await this.getProcessInstanceDetail(candidate.processInstanceId);
+        const activeTask = detail.normalized.tasks
+          .map(asRecord)
+          .find((task) => {
+            const taskStatus = text(task?.status)?.toUpperCase();
+            return text(task?.taskId) === candidate.taskId &&
+              text(task?.userId ?? task?.actionerUserId) === callerUserId &&
+              taskStatus !== undefined &&
+              ACTIVE_TASK_STATUSES.has(taskStatus);
+          });
+        if (activeTask === undefined) {
+          staleRemoved++;
+          await this.#pendingIndex.remove({
+            userId: callerUserId,
+            processInstanceId: candidate.processInstanceId,
+            taskId: candidate.taskId,
+          });
+          continue;
+        }
+        items.push({
+          processInstanceId: candidate.processInstanceId,
+          taskId: candidate.taskId,
+          ...(detail.normalized.processCode ?? candidate.processCode) === undefined
+            ? {}
+            : { processCode: detail.normalized.processCode ?? candidate.processCode },
+          ...(candidate.title === undefined ? {} : { title: candidate.title }),
+          currentStatus: detail.normalized.status?.toUpperCase() ?? "UNKNOWN",
+          taskStatus: text(activeTask.status)?.toUpperCase() ?? "UNKNOWN",
+          createdAt: candidate.createdAt,
+          updatedAt: candidate.updatedAt,
+        });
+      } catch {
+        verificationFailures++;
+      }
+    }
+    return {
+      inboxId: "current_user_pending",
+      action: "list_pending",
+      currentStatus: "PARTIAL",
+      auditCorrelationId: randomUUID(),
+      safeNextActions: ["view"],
+      data: {
+        coverage: page.coverage,
+        coverageSince: page.coverageSince,
+        ...(page.lastEventAt === undefined ? {} : { lastEventAt: page.lastEventAt }),
+        resyncRequired: page.resyncRequired,
+        page: page.page,
+        limit: page.limit,
+        hasMore: page.hasMore,
+        items,
+        staleRemoved,
+        verificationFailures,
       },
     };
   }

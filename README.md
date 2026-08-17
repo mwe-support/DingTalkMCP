@@ -2,7 +2,7 @@
 
 `MWE审批MCP` 是部署在 `https://dingtalk.mwexk.com/mcp` 的自托管钉钉 OA 审批 MCP Server。
 
-当前版本：`0.8.1`。
+当前版本：`0.9.0`。
 
 ## 当前架构
 
@@ -14,6 +14,10 @@ WorkBuddy / Codex
   -> Streamable HTTP /mcp
   -> MWE审批MCP 企业内部应用 access token
   -> 钉钉 OA OpenAPI
+
+钉钉 bpms_task_change
+  -> 官方 Stream 长连接（仅上游事件摄取）
+  -> 本地待审批索引
 ```
 
 - 只提供自托管 Streamable HTTP；不提供 stdio。
@@ -22,15 +26,28 @@ WorkBuddy / Codex
 - 钉钉 `userAccessToken` 只用于登录身份验证，不作为 MCP Bearer、不持久化。
 - OA OpenAPI 仍使用 `MWE审批MCP` 企业内部应用的 App ID/App Secret。
 - MCP token 中的 `corpId + unionId + userId` 按请求绑定审批调用者，模型输入不能覆盖身份。
+- 钉钉 Stream 是服务端使用应用凭证建立的出站事件通道，不是 MCP 传输，不新增公网工具端点。
 
 ## 公共工具
 
-正常 `tools/list` 只有两个按业务角色聚合的工具：
+正常 `tools/list` 只有三个按业务角色/主对象聚合的工具：
 
 ```text
+approval_inbox    # 当前审批人：发现单个或批量待审批任务
 approval_task     # 审批人：查看、同意、拒绝
 approval_request  # 申请人：准备附件、提交、评论、撤销
 ```
+
+发现当前 OAuth 用户的待审批（`limit=1` 为单条，最多 20 条）：
+
+```json
+{
+  "page": 1,
+  "limit": 20
+}
+```
+
+`approval_inbox` 从 `bpms_task_change` 事件索引取候选项，然后逐项调用审批详情确认任务仍处于可操作状态且属于登录用户，才返回 `processInstanceId` 和 `taskId`。普通 OA 没有免费的全量回填 API，因此响应固定声明 `coverage=partial` 和 `resyncRequired=true`：它覆盖事件连接激活后的任务，不冒充钉钉官方 DWS 的全历史收件箱。
 
 读取审批：
 
@@ -152,6 +169,9 @@ https://dingtalk.mwexk.com/oauth/dingtalk/callback
 - 审批实例读写和审批表单读取权限。
 - 附件直传所需的 `Storage.UploadInfo.Read` 与 `Storage.File.Write` 权限。
 - H5 微应用能力及其 AgentId；将正整数配置为 `DINGTALK_AGENT_ID`。未配置时，无附件审批仍可使用，附件 `prepare` 会明确失败。
+- 事件订阅的推送方式选择 `Stream模式推送`，并订阅“审批任务开始、结束、取消/转交”（`bpms_task_change`）。生产配置 `DINGTALK_APPROVAL_EVENTS_ENABLED=true`，索引保存到 `APPROVAL_INBOX_PATH`。
+
+`Premium.Workflow.ReadWrite.All` 及 OA 高级版待审批列表不是生产依赖。`Todo.Todo.Read` 只在 2026-08-17 做过可行性探测：当前企业的未完成和已完成企业待办都返回 0，不能用它冒充 OA 收件箱；服务代码不调用该接口。
 
 附件上传 URL 必须经过 HTTPS 主机白名单校验。2026-08-17 的企业实测返回
 `sh-dualstack.trans.dingtalk.com`，因此默认精确允许 `.trans.dingtalk.com`；同时保留
@@ -203,7 +223,8 @@ WorkBuddy 与 Codex 的无密钥 OAuth 配置模板和测试顺序见：
 - 当前 CVM 入口以 `/public/cvm-web-edge/README.md` 为准：应用只发布一个唯一的 loopback 后端端口，由 `edge-nginx` 转发；不得绑定 `0.0.0.0`。
 - `127.0.0.1:3000` 已登记给唯一的正式 DingTalk 服务。后续并行灰度须通过 `APPROVAL_HOST_PORT` 选择并登记另一个经 `ss -lntp` 验证为空闲的临时端口；临时实例不得继续占用正式端口。
 - 容器 Router 与共享外部 Docker 网络是后续全站入口迁移目标，不在本次 MCP 鉴权升级中单点切换。
-- OAuth/审批状态、幂等账本和最多 30 天审计日志位于持久卷 `/app/data`。
+- OAuth/审批状态、事件驱动的待审批索引、幂等账本和最多 30 天审计日志位于持久卷 `/app/data`。
+- 同一应用 Client ID 同时只能运行一个生产 Stream 消费者。灰度容器不得在旧生产容器仍运行时开启 `DINGTALK_APPROVAL_EVENTS_ENABLED`。
 
 详细安全与模块设计见：
 

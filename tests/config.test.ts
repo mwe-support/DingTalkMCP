@@ -17,7 +17,25 @@ const requiredEnvironment = {
 
 describe("loadConfig", () => {
   it("uses a persistent audit directory under data by default", () => {
-    expect(loadConfig(requiredEnvironment).auditLogPath).toBe(resolve("./data/audit"));
+    const config = loadConfig(requiredEnvironment);
+    expect(config.auditLogPath).toBe(resolve("./data/audit"));
+    expect(config.approvalInboxPath).toBe(resolve("./data/approval-inbox"));
+    expect(config.approvalEventsEnabled).toBe(false);
+  });
+
+  it("enables the DingTalk approval event stream only from an explicit boolean", () => {
+    expect(loadConfig({
+      ...requiredEnvironment,
+      DINGTALK_APPROVAL_EVENTS_ENABLED: "true",
+      APPROVAL_INBOX_PATH: "./mounted/inbox",
+    })).toMatchObject({
+      approvalEventsEnabled: true,
+      approvalInboxPath: resolve("./mounted/inbox"),
+    });
+    expect(() => loadConfig({
+      ...requiredEnvironment,
+      DINGTALK_APPROVAL_EVENTS_ENABLED: "yes",
+    })).toThrow("DINGTALK_APPROVAL_EVENTS_ENABLED must be true or false");
   });
 
   it("allows deployment to place retained audit logs on a mounted volume", () => {
