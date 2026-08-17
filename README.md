@@ -47,7 +47,7 @@ approval_request  # 申请人：准备附件、提交、评论、撤销
 }
 ```
 
-`approval_inbox` 从 `bpms_task_change` 事件索引取候选项，然后逐项调用审批详情确认任务仍处于可操作状态且属于登录用户，才返回 `processInstanceId` 和 `taskId`。普通 OA 没有免费的全量回填 API，因此响应固定声明 `coverage=partial` 和 `resyncRequired=true`：它覆盖事件连接激活后的任务，不冒充钉钉官方 DWS 的全历史收件箱。
+`approval_inbox` 从 `bpms_task_change` 事件索引取候选项，然后逐项调用审批详情确认任务仍处于可操作状态且属于登录用户，才返回 `processInstanceId` 和可用的 `taskId`；若源事件缺少任务 ID，则仅返回实例 ID 并标记 `taskIdUnavailable=true`。普通 OA 没有免费的全量回填 API，因此响应固定声明 `coverage=partial` 和 `resyncRequired=true`：它覆盖事件连接激活后的任务，不冒充钉钉官方 DWS 的全历史收件箱。
 
 读取审批：
 

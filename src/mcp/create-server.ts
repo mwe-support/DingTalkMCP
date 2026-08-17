@@ -498,7 +498,7 @@ function createPublicApprovalMcpServer(
         name: "approval_inbox",
         title: "List the current approver's pending approvals",
         description:
-          "Read-only discovery of one or a bounded page of pending approval tasks for the authenticated DingTalk user. Results come from the self-hosted bpms_task_change event index and are revalidated against current approval details before processInstanceId and taskId are returned. Because ordinary OA exposes no complete free backfill API, every response declares partial coverage since event activation and whether resynchronization is required. Use approval_task to view or decide a returned instance.",
+          "Read-only discovery of one or a bounded page of pending approval tasks for the authenticated DingTalk user. Results come from the self-hosted bpms_task_change event index and are revalidated against current approval details before processInstanceId and an available taskId are returned; taskIdUnavailable=true marks an instance-only event. Because ordinary OA exposes no complete free backfill API, every response declares partial coverage since event activation and whether resynchronization is required. Use approval_task to view or decide a returned instance.",
         inputSchema: { ...z.toJSONSchema(approvalInboxSchema), type: "object" },
         annotations: readAnnotations,
       },
