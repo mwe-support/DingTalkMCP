@@ -6,7 +6,7 @@ import {
   InMemoryIdempotencyLedger,
   type IdempotencyLedger,
 } from "../core/idempotency.js";
-import { getDingTalkRequestId, type DingTalkApiClient } from "../dingtalk/client.js";
+import { getDingTalkRequestId, getDingTalkResponseStatus, type DingTalkApiClient } from "../dingtalk/client.js";
 import {
   AttachmentLinkPolicy,
   extractApprovalAttachments,
@@ -1366,11 +1366,27 @@ export class ApprovalService {
       if (reservation.entry.status === "succeeded") {
         return reservation.entry.result as ApprovalRequestEnvelope;
       }
-      const previousDiagnostic = asRecord(reservation.entry.result);
+      const createdRecovery = parseApprovalCreatedRecovery(reservation.entry.result);
+      if (createdRecovery !== undefined) {
+        return {
+          processInstanceId: createdRecovery.processInstanceId,
+          action: "submit",
+          template: createdRecovery.template,
+          currentStatus: "SUBMITTED",
+          auditCorrelationId: createdRecovery.auditCorrelationId,
+          safeNextActions: ["comment", "revoke"],
+          data: {
+            recoveredFromIdempotency: true,
+            idempotencyPersistence: "failed",
+            retryWithSameRequestId: false,
+          },
+        };
+      }
+      const previousDiagnostic = parseApprovalSubmissionDiagnostic(reservation.entry.result);
       throw new ApprovalMcpError(
         "IDEMPOTENCY_OUTCOME_UNKNOWN",
         "A previous approval submission may have committed attachments or reached DingTalk.",
-        previousDiagnostic === undefined ? {} : { details: previousDiagnostic },
+        previousDiagnostic === undefined ? {} : { details: { ...previousDiagnostic } },
       );
     }
     let sideEffectCommitted = false;
@@ -1404,7 +1420,11 @@ export class ApprovalService {
           });
           sideEffectCommitted = true;
           committedAttachmentCount = index + 1;
-          committedAttachments.push(normalizeCommittedAttachment(upload, currentSpace.spaceId, payload));
+          try {
+            committedAttachments.push(normalizeCommittedAttachment(upload, currentSpace.spaceId, payload));
+          } catch (error) {
+            throw attachUpstreamResponseMetadata(error, payload);
+          }
         }
       }
       const byField: Partial<Record<ApprovalAttachmentField, ApprovalAttachmentFormValue[]>> = {};
@@ -1441,7 +1461,17 @@ export class ApprovalService {
       const returned = asRecord(unwrapResult(upstreamResult));
       const processInstanceId = text(returned?.instanceId ?? returned?.processInstanceId);
       if (processInstanceId === undefined) {
-        throw new ApprovalMcpError("INVALID_RESPONSE", "DingTalk did not return the created approval instance ID.");
+        throw new ApprovalMcpError(
+          "INVALID_RESPONSE",
+          "DingTalk did not return the created approval instance ID.",
+          {
+            details: withoutUndefined({
+              path: "/v1.0/workflow/processInstances",
+              status: getDingTalkResponseStatus(upstreamResult),
+              requestId: getDingTalkRequestId(upstreamResult),
+            }),
+          },
+        );
       }
       const result: ApprovalRequestEnvelope = {
         processInstanceId,
@@ -1460,11 +1490,30 @@ export class ApprovalService {
           updatedAt: new Date().toISOString(),
         });
       } catch {
+        let recoveryPersisted = false;
+        try {
+          await this.#idempotencyLedger.put(ledgerKey, {
+            fingerprint: input.fingerprint,
+            status: "uncertain",
+            result: {
+              kind: "approval_created",
+              processInstanceId,
+              template: input.template,
+              auditCorrelationId: input.auditCorrelationId,
+            } satisfies ApprovalCreatedRecovery,
+            updatedAt: new Date().toISOString(),
+          });
+          recoveryPersisted = true;
+        } catch {
+          // The caller still receives the confirmed instance ID. The pending
+          // reservation continues to fail closed if even recovery persistence fails.
+        }
         return {
           ...result,
           data: {
             ...(asRecord(result.data) ?? {}),
             idempotencyPersistence: "failed",
+            idempotencyRecoveryPersisted: recoveryPersisted,
             retryWithSameRequestId: false,
           },
         };
@@ -1495,7 +1544,7 @@ export class ApprovalService {
       throw new ApprovalMcpError(
         "IDEMPOTENCY_OUTCOME_UNKNOWN",
         "The approval submission result is uncertain; inspect DingTalk before using a new requestId.",
-        { cause: error, details: diagnostic },
+        { cause: error, details: { ...diagnostic } },
       );
     }
   }
@@ -1910,7 +1959,9 @@ export class ApprovalService {
       return result;
     } catch (error) {
       const known = error instanceof ApprovalMcpError;
-      const upstreamRequestId = known && typeof error.details?.requestId === "string" ? error.details.requestId : undefined;
+      const upstreamRequestId = known
+        ? text(error.details?.upstreamRequestId ?? error.details?.requestId)
+        : undefined;
       await this.#recordAudit({
         ...context,
         timestamp: new Date().toISOString(),
@@ -1950,28 +2001,140 @@ type ApprovalSubmissionFailureStage =
   | "form_build"
   | "approval_create";
 
+interface ApprovalSubmissionDiagnostic {
+  failureStage: ApprovalSubmissionFailureStage;
+  committedAttachmentCount: number;
+  totalAttachmentCount: number;
+  attachmentIndex?: number;
+  causeCode: ApprovalMcpErrorCode | "INTERNAL_ERROR";
+  causeRetryable: boolean;
+  httpStatus?: number;
+  upstreamCode?: string;
+  upstreamRequestId?: string;
+}
+
+interface ApprovalCreatedRecovery {
+  kind: "approval_created";
+  processInstanceId: string;
+  template: ApprovalRequestTemplate;
+  auditCorrelationId: string;
+}
+
 function approvalSubmissionDiagnostic(input: {
   error: unknown;
   failureStage: ApprovalSubmissionFailureStage;
   committedAttachmentCount: number;
   totalAttachmentCount: number;
   attachmentIndex?: number | undefined;
-}): Record<string, unknown> {
+}): ApprovalSubmissionDiagnostic {
   const known = input.error instanceof ApprovalMcpError ? input.error : undefined;
   const httpStatus = typeof known?.details?.status === "number" && Number.isInteger(known.details.status)
     ? known.details.status
     : undefined;
-  return withoutUndefined({
+  const upstreamCode = boundedDiagnosticText(known?.details?.upstreamCode, 200);
+  const upstreamRequestId = boundedDiagnosticText(known?.details?.requestId, 200);
+  return {
     failureStage: input.failureStage,
     committedAttachmentCount: input.committedAttachmentCount,
     totalAttachmentCount: input.totalAttachmentCount,
-    attachmentIndex: input.attachmentIndex,
+    ...(input.attachmentIndex === undefined ? {} : { attachmentIndex: input.attachmentIndex }),
     causeCode: known?.code ?? "INTERNAL_ERROR",
     causeRetryable: known?.retryable ?? false,
-    httpStatus,
-    upstreamCode: scalarText(known?.details?.upstreamCode),
-    requestId: text(known?.details?.requestId),
+    ...(httpStatus === undefined ? {} : { httpStatus }),
+    ...(upstreamCode === undefined ? {} : { upstreamCode }),
+    ...(upstreamRequestId === undefined ? {} : { upstreamRequestId }),
+  };
+}
+
+function attachUpstreamResponseMetadata(error: unknown, responsePayload: unknown): unknown {
+  if (!(error instanceof ApprovalMcpError)) return error;
+  const requestId = getDingTalkRequestId(responsePayload);
+  const status = getDingTalkResponseStatus(responsePayload);
+  if (requestId === undefined && status === undefined) return error;
+  return new ApprovalMcpError(error.code, error.message, {
+    cause: error,
+    retryable: error.retryable,
+    details: {
+      ...(error.details ?? {}),
+      ...(status === undefined ? {} : { status }),
+      ...(requestId === undefined ? {} : { requestId }),
+    },
   });
+}
+
+function parseApprovalSubmissionDiagnostic(value: unknown): ApprovalSubmissionDiagnostic | undefined {
+  const record = asRecord(value);
+  if (record === undefined) return undefined;
+  const failureStage = record.failureStage;
+  const committedAttachmentCount = record.committedAttachmentCount;
+  const totalAttachmentCount = record.totalAttachmentCount;
+  const causeCode = record.causeCode;
+  const causeRetryable = record.causeRetryable;
+  if (
+    (failureStage !== "attachment_context" &&
+      failureStage !== "attachment_commit" &&
+      failureStage !== "form_build" &&
+      failureStage !== "approval_create") ||
+    !Number.isInteger(committedAttachmentCount) ||
+    (committedAttachmentCount as number) < 0 ||
+    !Number.isInteger(totalAttachmentCount) ||
+    (totalAttachmentCount as number) < 0 ||
+    (totalAttachmentCount as number) > 10 ||
+    (committedAttachmentCount as number) > (totalAttachmentCount as number) ||
+    typeof causeCode !== "string" ||
+    causeCode.length === 0 ||
+    causeCode.length > 64 ||
+    typeof causeRetryable !== "boolean"
+  ) {
+    return undefined;
+  }
+  const attachmentIndex = record.attachmentIndex;
+  if (
+    attachmentIndex !== undefined &&
+    (!Number.isInteger(attachmentIndex) ||
+      (attachmentIndex as number) < 1 ||
+      (attachmentIndex as number) > (totalAttachmentCount as number))
+  ) {
+    return undefined;
+  }
+  const httpStatus = record.httpStatus;
+  if (httpStatus !== undefined && (!Number.isInteger(httpStatus) || (httpStatus as number) < 100 || (httpStatus as number) > 599)) {
+    return undefined;
+  }
+  const upstreamCode = boundedDiagnosticText(record.upstreamCode, 200);
+  const upstreamRequestId = boundedDiagnosticText(record.upstreamRequestId, 200);
+  return {
+    failureStage,
+    committedAttachmentCount: committedAttachmentCount as number,
+    totalAttachmentCount: totalAttachmentCount as number,
+    ...(attachmentIndex === undefined ? {} : { attachmentIndex: attachmentIndex as number }),
+    causeCode: causeCode as ApprovalSubmissionDiagnostic["causeCode"],
+    causeRetryable,
+    ...(httpStatus === undefined ? {} : { httpStatus: httpStatus as number }),
+    ...(upstreamCode === undefined ? {} : { upstreamCode }),
+    ...(upstreamRequestId === undefined ? {} : { upstreamRequestId }),
+  };
+}
+
+function parseApprovalCreatedRecovery(value: unknown): ApprovalCreatedRecovery | undefined {
+  const record = asRecord(value);
+  if (record?.kind !== "approval_created") return undefined;
+  const processInstanceId = boundedDiagnosticText(record.processInstanceId, 200);
+  const auditCorrelationId = boundedDiagnosticText(record.auditCorrelationId, 200);
+  const template = record.template;
+  if (
+    processInstanceId === undefined ||
+    auditCorrelationId === undefined ||
+    (template !== "expense_reimbursement" && template !== "payment_request")
+  ) {
+    return undefined;
+  }
+  return { kind: "approval_created", processInstanceId, template, auditCorrelationId };
+}
+
+function boundedDiagnosticText(value: unknown, maximumLength: number): string | undefined {
+  const parsed = scalarText(value);
+  return parsed === undefined || parsed.length > maximumLength ? undefined : parsed;
 }
 
 function isDefiniteMutationRejection(error: unknown): boolean {

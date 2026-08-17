@@ -136,7 +136,7 @@ approval_request  # 申请人：准备附件、提交、评论、撤销
 
 单文件最大 20 MiB、每单最多 10 个、合计最大 50 MiB。费用报销仅允许附件字段 `invoice`/`other`，付款申请仅允许 `attachment`。实际提交和撤销必须 `confirm=true` 且提供稳定 UUID `requestId`；幂等命名空间绑定 OAuth 申请人。附件提交、审批创建或撤销结果不确定时会失败关闭，禁止自动换 UUID 重试。
 
-`IDEMPOTENCY_OUTCOME_UNKNOWN` 会返回安全诊断字段：`failureStage`、已 commit/总附件数、当前附件序号、原始安全错误码、HTTP 状态、上游错误码和 request ID。这些诊断会与 `uncertain` 幂等项一起持久化，同 UUID 回读结果一致；不保存表单、文件名、`uploadKey`、用户 ID 或临时 URL。失败阶段仅限 `attachment_context`、`attachment_commit`、`form_build` 和 `approval_create`。若审批已返回实例 ID，仅随后的幂等账本写入失败，服务保留成功结果并标记 `idempotencyPersistence=failed`，不再吞掉实例 ID。
+`IDEMPOTENCY_OUTCOME_UNKNOWN` 会返回安全诊断字段：`failureStage`、已 commit/总附件数、当前附件序号、原始安全错误码、HTTP 状态、上游错误码和 `upstreamRequestId`。这些诊断会与 `uncertain` 幂等项一起持久化，同 UUID 回读结果一致；账本回读只重建这组允许字段，不保存表单、文件名、`uploadKey`、用户 ID 或临时 URL。失败阶段仅限 `attachment_context`、`attachment_commit`、`form_build` 和 `approval_create`。若审批已返回实例 ID，仅随后的幂等账本写入失败，服务保留成功结果并标记 `idempotencyPersistence=failed`，同时尽力持久化最小实例恢复记录，不再吞掉实例 ID。
 
 ## OAuth 端点
 

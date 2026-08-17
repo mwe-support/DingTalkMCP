@@ -16,7 +16,7 @@ interface DingTalkApiClientOptions {
   timeoutMs?: number;
 }
 
-const requestIdMetadata = new WeakMap<object, string>();
+const responseMetadata = new WeakMap<object, { requestId?: string; status: number }>();
 
 export interface DingTalkUserProfile {
   name: string;
@@ -28,7 +28,11 @@ export interface DingTalkDepartmentProfile {
 }
 
 export function getDingTalkRequestId(value: unknown): string | undefined {
-  return typeof value === "object" && value !== null ? requestIdMetadata.get(value) : undefined;
+  return typeof value === "object" && value !== null ? responseMetadata.get(value)?.requestId : undefined;
+}
+
+export function getDingTalkResponseStatus(value: unknown): number | undefined {
+  return typeof value === "object" && value !== null ? responseMetadata.get(value)?.status : undefined;
 }
 
 export class DingTalkApiClient {
@@ -189,9 +193,12 @@ export class DingTalkApiClient {
       });
     }
 
-    const successfulRequestId = response.headers.get("x-acs-request-id");
-    if (successfulRequestId !== null && typeof payload === "object" && payload !== null) {
-      requestIdMetadata.set(payload, successfulRequestId);
+    if (typeof payload === "object" && payload !== null) {
+      const successfulRequestId = response.headers.get("x-acs-request-id") ?? undefined;
+      responseMetadata.set(payload, {
+        ...(successfulRequestId === undefined ? {} : { requestId: successfulRequestId }),
+        status: response.status,
+      });
     }
     return payload as T;
   }

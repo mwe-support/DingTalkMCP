@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { errorPayload } from "../src/core/errors.js";
-import { DingTalkApiClient, getDingTalkRequestId } from "../src/dingtalk/client.js";
+import { DingTalkApiClient, getDingTalkRequestId, getDingTalkResponseStatus } from "../src/dingtalk/client.js";
 
 describe("DingTalkApiClient", () => {
   it("preserves the successful upstream request id as non-serialized metadata", async () => {
@@ -17,6 +17,7 @@ describe("DingTalkApiClient", () => {
     const result = await client.request({ method: "POST", path: "/v1.0/workflow/processInstances", body: {} });
 
     expect(getDingTalkRequestId(result)).toBe("upstream-success-1");
+    expect(getDingTalkResponseStatus(result)).toBe(200);
     expect(JSON.stringify(result)).toBe('{"instanceId":"pi-1"}');
   });
 

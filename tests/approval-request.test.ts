@@ -6,7 +6,7 @@ import { ApprovalService } from "../src/approval/service.js";
 import type { ApprovalAuditEvent } from "../src/core/audit.js";
 import { ApprovalMcpError } from "../src/core/errors.js";
 import { InMemoryIdempotencyLedger, type IdempotencyLedger } from "../src/core/idempotency.js";
-import type { DingTalkApiClient } from "../src/dingtalk/client.js";
+import { DingTalkApiClient } from "../src/dingtalk/client.js";
 import { createApprovalMcpServer } from "../src/mcp/create-server.js";
 
 const closeables: Array<{ close(): Promise<void> }> = [];
@@ -983,6 +983,57 @@ describe("approval_request public MCP contract", () => {
     expect(request.mock.calls.filter(([input]) => input.path === "/v1.0/workflow/processInstances")).toHaveLength(1);
   });
 
+  it("retains 2xx response metadata when DingTalk omits the created instance ID", async () => {
+    const metadataClient = new DingTalkApiClient({
+      tokenProvider: { getToken: vi.fn().mockResolvedValue("token"), invalidate: vi.fn() },
+      fetch: vi.fn<typeof fetch>().mockResolvedValue(
+        new Response(JSON.stringify({ success: true }), {
+          status: 200,
+          headers: { "content-type": "application/json", "x-acs-request-id": "upstream-2xx-without-id" },
+        }),
+      ),
+    });
+    const invalidCreatePayload = await metadataClient.request({
+      method: "POST",
+      path: "/v1.0/workflow/processInstances",
+      body: {},
+    });
+    const { client, request } = await connectedApplicantClient();
+    request.mockImplementation(async (input: { path: string }) => {
+      if (input.path === "/v1.0/workflow/forms/schemas/processCodes") return expenseSchemaResponse();
+      if (input.path === "/v1.0/workflow/processInstances") return invalidCreatePayload;
+      throw new Error(`Unexpected DingTalk request: ${input.path}`);
+    });
+    const arguments_ = {
+      action: "submit",
+      template: "expense_reimbursement",
+      deptId: 42,
+      fields: expenseFields(),
+      confirm: true,
+      requestId: "b1b1b1b1-b1b1-41b1-81b1-b1b1b1b1b1b1",
+    } as const;
+
+    const first = await client.callTool({ name: "approval_request", arguments: arguments_ });
+    const repeated = await client.callTool({ name: "approval_request", arguments: arguments_ });
+    const expectedDiagnostic = {
+      failureStage: "approval_create",
+      committedAttachmentCount: 0,
+      totalAttachmentCount: 0,
+      causeCode: "INVALID_RESPONSE",
+      causeRetryable: false,
+      httpStatus: 200,
+      upstreamRequestId: "upstream-2xx-without-id",
+    };
+
+    expect(first.structuredContent).toMatchObject({
+      error: { code: "IDEMPOTENCY_OUTCOME_UNKNOWN", details: expectedDiagnostic },
+    });
+    expect(repeated.structuredContent).toMatchObject({
+      error: { code: "IDEMPOTENCY_OUTCOME_UNKNOWN", details: expectedDiagnostic },
+    });
+    expect(request.mock.calls.filter(([input]) => input.path === "/v1.0/workflow/processInstances")).toHaveLength(1);
+  });
+
   it("keeps submission idempotency blocked when an attachment committed before a definite start rejection", async () => {
     const { client, request, approvalAuditEvents } = await connectedApplicantClient({
       agentId: 123456,
@@ -1033,7 +1084,7 @@ describe("approval_request public MCP contract", () => {
       causeRetryable: false,
       httpStatus: 400,
       upstreamCode: "InvalidParameter",
-      requestId: "upstream-create-rejected-1",
+      upstreamRequestId: "upstream-create-rejected-1",
     };
     expect(first.structuredContent).toMatchObject({
       error: { code: "IDEMPOTENCY_OUTCOME_UNKNOWN", details: expectedDiagnostic },
@@ -1099,7 +1150,7 @@ describe("approval_request public MCP contract", () => {
       causeRetryable: true,
       httpStatus: 503,
       upstreamCode: "ServiceUnavailable",
-      requestId: "upstream-commit-2",
+      upstreamRequestId: "upstream-commit-2",
     };
 
     expect(first.structuredContent).toMatchObject({
@@ -1136,17 +1187,17 @@ describe("approval_request public MCP contract", () => {
       throw new Error(`Unexpected DingTalk request: ${input.path}`);
     });
 
-    const result = await client.callTool({
-      name: "approval_request",
-      arguments: {
-        action: "submit",
-        template: "expense_reimbursement",
-        deptId: 42,
-        fields: expenseFields(),
-        confirm: true,
-        requestId: "b0b0b0b0-b0b0-40b0-80b0-b0b0b0b0b0b0",
-      },
-    });
+    const arguments_ = {
+      action: "submit",
+      template: "expense_reimbursement",
+      deptId: 42,
+      fields: expenseFields(),
+      confirm: true,
+      requestId: "b0b0b0b0-b0b0-40b0-80b0-b0b0b0b0b0b0",
+    } as const;
+    const result = await client.callTool({ name: "approval_request", arguments: arguments_ });
+    const restarted = await connectedApplicantClient({ idempotencyLedger: ledger });
+    const recovered = await restarted.client.callTool({ name: "approval_request", arguments: arguments_ });
 
     expect(result.isError).not.toBe(true);
     expect(result.structuredContent).toMatchObject({
@@ -1155,11 +1206,82 @@ describe("approval_request public MCP contract", () => {
         currentStatus: "SUBMITTED",
         data: {
           idempotencyPersistence: "failed",
+          idempotencyRecoveryPersisted: true,
+          retryWithSameRequestId: false,
+        },
+      },
+    });
+    expect(recovered.isError).not.toBe(true);
+    expect(recovered.structuredContent).toMatchObject({
+      result: {
+        processInstanceId: "pi-ledger-partial-1",
+        currentStatus: "SUBMITTED",
+        data: {
+          recoveredFromIdempotency: true,
+          idempotencyPersistence: "failed",
           retryWithSameRequestId: false,
         },
       },
     });
     expect(request.mock.calls.filter(([input]) => input.path === "/v1.0/workflow/processInstances")).toHaveLength(1);
+    expect(restarted.request).not.toHaveBeenCalledWith(expect.objectContaining({
+      path: "/v1.0/workflow/processInstances",
+    }));
+  });
+
+  it("replays only allowlisted diagnostic fields from an uncertain ledger entry", async () => {
+    const ledger: IdempotencyLedger = {
+      reserve: async (_key, fingerprint) => ({
+        created: false as const,
+        entry: {
+          fingerprint,
+          status: "uncertain" as const,
+          updatedAt: "2026-08-17T00:00:00.000Z",
+          result: {
+            failureStage: "approval_create",
+            committedAttachmentCount: 1,
+            totalAttachmentCount: 1,
+            causeCode: "DINGTALK_API_ERROR",
+            causeRetryable: false,
+            httpStatus: 400,
+            upstreamCode: "InvalidParameter",
+            upstreamRequestId: "safe-upstream-id",
+            unreviewedFutureField: "must-not-be-replayed",
+          },
+        },
+      }),
+      get: async () => undefined,
+      put: async () => undefined,
+      delete: async () => undefined,
+    };
+    const { client, request } = await connectedApplicantClient({ idempotencyLedger: ledger });
+
+    const result = await client.callTool({
+      name: "approval_request",
+      arguments: {
+        action: "submit",
+        template: "expense_reimbursement",
+        deptId: 42,
+        fields: expenseFields(),
+        confirm: true,
+        requestId: "b2b2b2b2-b2b2-42b2-82b2-b2b2b2b2b2b2",
+      },
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: "IDEMPOTENCY_OUTCOME_UNKNOWN",
+        details: {
+          failureStage: "approval_create",
+          upstreamRequestId: "safe-upstream-id",
+        },
+      },
+    });
+    expect(JSON.stringify(result.structuredContent)).not.toContain("unreviewedFutureField");
+    expect(JSON.stringify(result.structuredContent)).not.toContain("must-not-be-replayed");
+    expect(request).not.toHaveBeenCalledWith(expect.objectContaining({
+      path: "/v1.0/workflow/processInstances",
+    }));
   });
 
   it("prepares bounded direct-to-DingTalk attachment uploads without receiving file bytes", async () => {
