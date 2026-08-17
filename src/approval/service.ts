@@ -1366,23 +1366,31 @@ export class ApprovalService {
       if (reservation.entry.status === "succeeded") {
         return reservation.entry.result as ApprovalRequestEnvelope;
       }
+      const previousDiagnostic = asRecord(reservation.entry.result);
       throw new ApprovalMcpError(
         "IDEMPOTENCY_OUTCOME_UNKNOWN",
         "A previous approval submission may have committed attachments or reached DingTalk.",
+        previousDiagnostic === undefined ? {} : { details: previousDiagnostic },
       );
     }
     let sideEffectCommitted = false;
+    let committedAttachmentCount = 0;
+    let failureStage: ApprovalSubmissionFailureStage = "attachment_context";
+    let attachmentIndex: number | undefined;
     try {
       const committedAttachments: Array<ApprovalAttachmentFormValue & { field: ApprovalAttachmentField }> = [];
       if (input.uploads.length > 0) {
+        failureStage = "attachment_context";
         const currentSpace = await this.#resolveApprovalAttachmentSpace();
-        for (const upload of input.uploads) {
+        for (const [index, upload] of input.uploads.entries()) {
           if (scalarText(upload.spaceId) !== currentSpace.spaceId) {
             throw new ApprovalMcpError(
               "INVALID_INPUT",
               "The uploaded attachment spaceId does not belong to the authenticated applicant's approval space.",
             );
           }
+          failureStage = "attachment_commit";
+          attachmentIndex = index + 1;
           const payload = await this.#api.request({
             method: "POST",
             path: `/v1.0/storage/spaces/${encodeURIComponent(currentSpace.spaceId)}/files/commit`,
@@ -1395,6 +1403,7 @@ export class ApprovalService {
             },
           });
           sideEffectCommitted = true;
+          committedAttachmentCount = index + 1;
           committedAttachments.push(normalizeCommittedAttachment(upload, currentSpace.spaceId, payload));
         }
       }
@@ -1410,12 +1419,15 @@ export class ApprovalService {
         });
         byField[attachment.field] = list;
       }
+      failureStage = "form_build";
+      attachmentIndex = undefined;
       const formComponentValues = buildApprovalFormComponentValues(
         input.template,
         input.fields,
         input.applicant,
         byField,
       );
+      failureStage = "approval_create";
       const upstreamResult = await this.#api.request({
         method: "POST",
         path: "/v1.0/workflow/processInstances",
@@ -1440,22 +1452,41 @@ export class ApprovalService {
         safeNextActions: ["comment", "revoke"],
         data: { dryRun: false, upstreamResult, committedAttachments },
       };
-      await this.#idempotencyLedger.put(ledgerKey, {
-        fingerprint: input.fingerprint,
-        status: "succeeded",
-        result,
-        updatedAt: new Date().toISOString(),
-      });
+      try {
+        await this.#idempotencyLedger.put(ledgerKey, {
+          fingerprint: input.fingerprint,
+          status: "succeeded",
+          result,
+          updatedAt: new Date().toISOString(),
+        });
+      } catch {
+        return {
+          ...result,
+          data: {
+            ...(asRecord(result.data) ?? {}),
+            idempotencyPersistence: "failed",
+            retryWithSameRequestId: false,
+          },
+        };
+      }
       return result;
     } catch (error) {
       if (!sideEffectCommitted && isDefiniteMutationRejection(error)) {
         await this.#idempotencyLedger.delete(ledgerKey);
         throw error;
       }
+      const diagnostic = approvalSubmissionDiagnostic({
+        error,
+        failureStage,
+        committedAttachmentCount,
+        totalAttachmentCount: input.uploads.length,
+        attachmentIndex,
+      });
       try {
         await this.#idempotencyLedger.put(ledgerKey, {
           fingerprint: input.fingerprint,
           status: "uncertain",
+          result: diagnostic,
           updatedAt: new Date().toISOString(),
         });
       } catch {
@@ -1464,7 +1495,7 @@ export class ApprovalService {
       throw new ApprovalMcpError(
         "IDEMPOTENCY_OUTCOME_UNKNOWN",
         "The approval submission result is uncertain; inspect DingTalk before using a new requestId.",
-        { cause: error },
+        { cause: error, details: diagnostic },
       );
     }
   }
@@ -1911,6 +1942,36 @@ function omit<T extends object, K extends keyof T>(input: T, keys: readonly K[])
     T,
     K
   >;
+}
+
+type ApprovalSubmissionFailureStage =
+  | "attachment_context"
+  | "attachment_commit"
+  | "form_build"
+  | "approval_create";
+
+function approvalSubmissionDiagnostic(input: {
+  error: unknown;
+  failureStage: ApprovalSubmissionFailureStage;
+  committedAttachmentCount: number;
+  totalAttachmentCount: number;
+  attachmentIndex?: number | undefined;
+}): Record<string, unknown> {
+  const known = input.error instanceof ApprovalMcpError ? input.error : undefined;
+  const httpStatus = typeof known?.details?.status === "number" && Number.isInteger(known.details.status)
+    ? known.details.status
+    : undefined;
+  return withoutUndefined({
+    failureStage: input.failureStage,
+    committedAttachmentCount: input.committedAttachmentCount,
+    totalAttachmentCount: input.totalAttachmentCount,
+    attachmentIndex: input.attachmentIndex,
+    causeCode: known?.code ?? "INTERNAL_ERROR",
+    causeRetryable: known?.retryable ?? false,
+    httpStatus,
+    upstreamCode: scalarText(known?.details?.upstreamCode),
+    requestId: text(known?.details?.requestId),
+  });
 }
 
 function isDefiniteMutationRejection(error: unknown): boolean {

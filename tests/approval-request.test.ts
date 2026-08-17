@@ -984,7 +984,7 @@ describe("approval_request public MCP contract", () => {
   });
 
   it("keeps submission idempotency blocked when an attachment committed before a definite start rejection", async () => {
-    const { client, request } = await connectedApplicantClient({
+    const { client, request, approvalAuditEvents } = await connectedApplicantClient({
       agentId: 123456,
       callerUnionId: "union-1",
     });
@@ -996,7 +996,11 @@ describe("approval_request public MCP contract", () => {
       }
       if (input.path === "/v1.0/workflow/processInstances") {
         throw new ApprovalMcpError("DINGTALK_API_ERROR", "DingTalk rejected the approval.", {
-          details: { status: 400, upstreamCode: "InvalidParameter" },
+          details: {
+            status: 400,
+            upstreamCode: "InvalidParameter",
+            requestId: "upstream-create-rejected-1",
+          },
           retryable: false,
         });
       }
@@ -1021,9 +1025,140 @@ describe("approval_request public MCP contract", () => {
     const first = await client.callTool({ name: "approval_request", arguments: arguments_ });
     const repeated = await client.callTool({ name: "approval_request", arguments: arguments_ });
 
-    expect(first.structuredContent).toMatchObject({ error: { code: "IDEMPOTENCY_OUTCOME_UNKNOWN" } });
-    expect(repeated.structuredContent).toMatchObject({ error: { code: "IDEMPOTENCY_OUTCOME_UNKNOWN" } });
+    const expectedDiagnostic = {
+      failureStage: "approval_create",
+      committedAttachmentCount: 1,
+      totalAttachmentCount: 1,
+      causeCode: "DINGTALK_API_ERROR",
+      causeRetryable: false,
+      httpStatus: 400,
+      upstreamCode: "InvalidParameter",
+      requestId: "upstream-create-rejected-1",
+    };
+    expect(first.structuredContent).toMatchObject({
+      error: { code: "IDEMPOTENCY_OUTCOME_UNKNOWN", details: expectedDiagnostic },
+    });
+    expect(repeated.structuredContent).toMatchObject({
+      error: { code: "IDEMPOTENCY_OUTCOME_UNKNOWN", details: expectedDiagnostic },
+    });
+    const serialized = JSON.stringify(first.structuredContent);
+    expect(serialized).not.toContain("invoice.pdf");
+    expect(serialized).not.toContain("upload-side-effect");
     expect(request.mock.calls.filter(([input]) => input.path.endsWith("/files/commit"))).toHaveLength(1);
+    expect(request.mock.calls.filter(([input]) => input.path === "/v1.0/workflow/processInstances")).toHaveLength(1);
+    expect(approvalAuditEvents).toContainEqual(expect.objectContaining({
+      action: "start",
+      outcome: "uncertain",
+      errorCode: "IDEMPOTENCY_OUTCOME_UNKNOWN",
+      upstreamRequestId: "upstream-create-rejected-1",
+    }));
+  });
+
+  it("reports the failed attachment commit index without exposing attachment credentials", async () => {
+    const { client, request } = await connectedApplicantClient({
+      agentId: 123456,
+      callerUnionId: "union-1",
+    });
+    let commitCall = 0;
+    request.mockImplementation(async (input: { path: string }) => {
+      if (input.path === "/v1.0/workflow/forms/schemas/processCodes") return expenseSchemaResponse();
+      if (input.path === "/v1.0/workflow/processInstances/spaces/infos/query") return { result: { spaceId: 9988 } };
+      if (input.path === "/v1.0/storage/spaces/9988/files/commit") {
+        commitCall++;
+        if (commitCall === 1) {
+          return { dentry: { id: "file-first", name: "first.pdf", extension: "pdf", size: 1024, spaceId: 9988 } };
+        }
+        throw new ApprovalMcpError("DINGTALK_API_ERROR", "DingTalk storage unavailable.", {
+          details: { status: 503, upstreamCode: "ServiceUnavailable", requestId: "upstream-commit-2" },
+          retryable: true,
+        });
+      }
+      throw new Error(`Unexpected DingTalk request: ${input.path}`);
+    });
+    const arguments_ = {
+      action: "submit",
+      template: "expense_reimbursement",
+      deptId: 42,
+      fields: expenseFields(),
+      uploads: [
+        { field: "invoice", fileName: "first.pdf", fileSize: 1024, uploadKey: "secret-first", spaceId: "9988" },
+        { field: "other", fileName: "second.pdf", fileSize: 2048, uploadKey: "secret-second", spaceId: "9988" },
+      ],
+      confirm: true,
+      requestId: "afafafaf-afaf-4faf-8faf-afafafafafaf",
+    } as const;
+
+    const first = await client.callTool({ name: "approval_request", arguments: arguments_ });
+    const repeated = await client.callTool({ name: "approval_request", arguments: arguments_ });
+    const expectedDiagnostic = {
+      failureStage: "attachment_commit",
+      attachmentIndex: 2,
+      committedAttachmentCount: 1,
+      totalAttachmentCount: 2,
+      causeCode: "DINGTALK_API_ERROR",
+      causeRetryable: true,
+      httpStatus: 503,
+      upstreamCode: "ServiceUnavailable",
+      requestId: "upstream-commit-2",
+    };
+
+    expect(first.structuredContent).toMatchObject({
+      error: { code: "IDEMPOTENCY_OUTCOME_UNKNOWN", details: expectedDiagnostic },
+    });
+    expect(repeated.structuredContent).toMatchObject({
+      error: { code: "IDEMPOTENCY_OUTCOME_UNKNOWN", details: expectedDiagnostic },
+    });
+    const serialized = JSON.stringify(first.structuredContent);
+    expect(serialized).not.toContain("first.pdf");
+    expect(serialized).not.toContain("second.pdf");
+    expect(serialized).not.toContain("secret-first");
+    expect(serialized).not.toContain("secret-second");
+    expect(commitCall).toBe(2);
+  });
+
+  it("preserves a created instance ID when only succeeded-ledger persistence fails", async () => {
+    const backing = new InMemoryIdempotencyLedger();
+    const ledger: IdempotencyLedger = {
+      reserve: (key, fingerprint) => backing.reserve(key, fingerprint),
+      get: (key) => backing.get(key),
+      put: async (key, entry) => {
+        if (entry.status === "succeeded") {
+          throw new ApprovalMcpError("IDEMPOTENCY_LEDGER_ERROR", "Ledger unavailable.");
+        }
+        await backing.put(key, entry);
+      },
+      delete: (key) => backing.delete(key),
+    };
+    const { client, request } = await connectedApplicantClient({ idempotencyLedger: ledger });
+    request.mockImplementation(async (input: { path: string }) => {
+      if (input.path === "/v1.0/workflow/forms/schemas/processCodes") return expenseSchemaResponse();
+      if (input.path === "/v1.0/workflow/processInstances") return { instanceId: "pi-ledger-partial-1" };
+      throw new Error(`Unexpected DingTalk request: ${input.path}`);
+    });
+
+    const result = await client.callTool({
+      name: "approval_request",
+      arguments: {
+        action: "submit",
+        template: "expense_reimbursement",
+        deptId: 42,
+        fields: expenseFields(),
+        confirm: true,
+        requestId: "b0b0b0b0-b0b0-40b0-80b0-b0b0b0b0b0b0",
+      },
+    });
+
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      result: {
+        processInstanceId: "pi-ledger-partial-1",
+        currentStatus: "SUBMITTED",
+        data: {
+          idempotencyPersistence: "failed",
+          retryWithSameRequestId: false,
+        },
+      },
+    });
     expect(request.mock.calls.filter(([input]) => input.path === "/v1.0/workflow/processInstances")).toHaveLength(1);
   });
 
