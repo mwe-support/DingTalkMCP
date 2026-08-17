@@ -112,7 +112,7 @@ approval_request  # 申请人：准备附件、提交、撤销
 2. MCP 返回钉钉签名的 HTTPS `PUT` 地址和请求头；Agent 直接把文件上传到钉钉，文件字节不经过 MCP。
 3. Agent 调用 `action=submit`，提交 `uploadKey`、`spaceId`、文件名和大小；MCP 提交文件元数据并发起审批。
 
-单文件最大 20 MiB、每单最多 10 个、合计最大 50 MiB。费用报销仅允许附件字段 `invoice`/`other`，付款申请仅允许 `attachment`。实际提交必须 `confirm=true` 且提供稳定 UUID `requestId`；附件提交或审批创建结果不确定时会失败关闭，禁止自动换 UUID 重试。
+单文件最大 20 MiB、每单最多 10 个、合计最大 50 MiB。费用报销仅允许附件字段 `invoice`/`other`，付款申请仅允许 `attachment`。实际提交和撤销必须 `confirm=true` 且提供稳定 UUID `requestId`；幂等命名空间绑定 OAuth 申请人。附件提交、审批创建或撤销结果不确定时会失败关闭，禁止自动换 UUID 重试。
 
 ## OAuth 端点
 

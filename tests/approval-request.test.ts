@@ -3,6 +3,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ApprovalService } from "../src/approval/service.js";
+import { InMemoryIdempotencyLedger, type IdempotencyLedger } from "../src/core/idempotency.js";
 import type { DingTalkApiClient } from "../src/dingtalk/client.js";
 import { createApprovalMcpServer } from "../src/mcp/create-server.js";
 
@@ -149,13 +150,21 @@ describe("approval_request public MCP contract", () => {
           payee: "测试收款单位",
           currency: "CNY",
           applicationDate: "2026-08-17",
-          lines: [{
-            purpose: "项目采购",
-            amount: 880,
-            reason: "合同付款",
-            expenseDepartment: "研发部",
-            beneficiaryBankAccount: "6222000000000000",
-          }],
+          lines: [
+            {
+              purpose: "项目采购A",
+              amount: 0.1,
+              reason: "合同付款",
+              expenseDepartment: "研发部",
+              beneficiaryBankAccount: "6222000000000000",
+            },
+            {
+              purpose: "项目采购B",
+              amount: 0.2,
+              reason: "合同付款",
+              expenseDepartment: "研发部",
+            },
+          ],
         },
         confirm: false,
         dryRun: true,
@@ -174,7 +183,7 @@ describe("approval_request public MCP contract", () => {
             processCode: "PROC-5E238117-7121-4CB3-8219-9F11A2E42BE4",
             formComponentValues: expect.arrayContaining([
               expect.objectContaining({ id: "TextField_RI2SYQ7VHQO0", value: "FK-20260817-001" }),
-              expect.objectContaining({ id: "MoneyField_HLOCQW4U3UO0", value: "880" }),
+              expect.objectContaining({ id: "MoneyField_HLOCQW4U3UO0", value: "0.3" }),
             ]),
           },
         },
@@ -245,6 +254,109 @@ describe("approval_request public MCP contract", () => {
     expect(result.isError).toBe(true);
     expect(result.structuredContent).toMatchObject({ error: { code: "INSUFFICIENT_SCOPE" } });
     expect(request).not.toHaveBeenCalled();
+  });
+
+  it("revokes only an allowlisted request template and replays the persisted result idempotently", async () => {
+    const { client, request } = await connectedApplicantClient();
+    request.mockImplementation(async (input: { path: string }) => {
+      if (input.path === "/v1.0/workflow/processInstances") {
+        return {
+          result: {
+            processInstanceId: "pi-revoke-1",
+            processCode: "PROC-2DB91B79-3CDD-421D-A223-0489A7BAB2C0",
+            originatorUserId: "user-1",
+            status: "RUNNING",
+            tasks: [],
+          },
+        };
+      }
+      if (input.path === "/v1.0/workflow/processInstances/terminate") return { success: true };
+      throw new Error(`Unexpected DingTalk request: ${input.path}`);
+    });
+    const arguments_ = {
+      action: "revoke",
+      processInstanceId: "pi-revoke-1",
+      requestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      confirm: true,
+    } as const;
+
+    const first = await client.callTool({ name: "approval_request", arguments: arguments_ });
+    const repeated = await client.callTool({ name: "approval_request", arguments: arguments_ });
+
+    expect(first.isError).not.toBe(true);
+    expect(repeated.structuredContent).toEqual(first.structuredContent);
+    expect(first.structuredContent).toMatchObject({
+      result: {
+        processInstanceId: "pi-revoke-1",
+        action: "revoke",
+        template: "expense_reimbursement",
+        currentStatus: "REVOKED",
+      },
+    });
+    expect(request.mock.calls.filter(([input]) => input.path.endsWith("/terminate"))).toHaveLength(1);
+  });
+
+  it("refuses to revoke a process outside the exact request-template allowlist", async () => {
+    const { client, request } = await connectedApplicantClient();
+    request.mockResolvedValue({
+      result: {
+        processInstanceId: "pi-other-1",
+        processCode: "PROC-UNREVIEWED",
+        originatorUserId: "user-1",
+        status: "RUNNING",
+      },
+    });
+
+    const result = await client.callTool({
+      name: "approval_request",
+      arguments: {
+        action: "revoke",
+        processInstanceId: "pi-other-1",
+        requestId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        confirm: true,
+      },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({ error: { code: "PROCESS_CODE_NOT_ALLOWED" } });
+    expect(request).not.toHaveBeenCalledWith(expect.objectContaining({
+      path: "/v1.0/workflow/processInstances/terminate",
+    }));
+  });
+
+  it("namespaces submission idempotency by the OAuth-bound applicant", async () => {
+    const ledger = new InMemoryIdempotencyLedger();
+    const first = await connectedApplicantClient({
+      callerUserId: "user-1",
+      applicantName: "张三",
+      idempotencyLedger: ledger,
+    });
+    const second = await connectedApplicantClient({
+      callerUserId: "user-2",
+      applicantName: "李四",
+      idempotencyLedger: ledger,
+    });
+    for (const [fixture, instanceId] of [[first, "pi-user-1"], [second, "pi-user-2"]] as const) {
+      fixture.request.mockImplementation(async (input: { path: string }) => {
+        if (input.path === "/v1.0/workflow/forms/schemas/processCodes") return expenseSchemaResponse();
+        if (input.path === "/v1.0/workflow/processInstances") return { instanceId };
+        throw new Error(`Unexpected DingTalk request: ${input.path}`);
+      });
+    }
+    const arguments_ = {
+      action: "submit",
+      template: "expense_reimbursement",
+      deptId: 42,
+      fields: expenseFields(),
+      confirm: true,
+      requestId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    } as const;
+
+    const firstResult = await first.client.callTool({ name: "approval_request", arguments: arguments_ });
+    const secondResult = await second.client.callTool({ name: "approval_request", arguments: arguments_ });
+
+    expect(firstResult.structuredContent).toMatchObject({ result: { processInstanceId: "pi-user-1" } });
+    expect(secondResult.structuredContent).toMatchObject({ result: { processInstanceId: "pi-user-2" } });
   });
 
   it("prepares bounded direct-to-DingTalk attachment uploads without receiving file bytes", async () => {
@@ -471,6 +583,9 @@ async function connectedApplicantClient(options: {
   callerUnionId?: string;
   uploadHostSuffixes?: string[];
   callerScopes?: Array<"approval:read" | "approval:decide" | "approval:create">;
+  callerUserId?: string;
+  applicantName?: string;
+  idempotencyLedger?: IdempotencyLedger;
 } = {}): Promise<{
   client: Client;
   request: ReturnType<typeof vi.fn>;
@@ -481,7 +596,11 @@ async function connectedApplicantClient(options: {
     if (input.path === "/v1.0/workflow/forms/schemas/processCodes") return expenseSchemaResponse();
     throw new Error(`Unexpected DingTalk request: ${input.path}`);
   });
-  const getUserProfile = vi.fn().mockResolvedValue({ name: "张三", departmentIds: [42] });
+  const callerUserId = options.callerUserId ?? "user-1";
+  const getUserProfile = vi.fn().mockResolvedValue({
+    name: options.applicantName ?? "张三",
+    departmentIds: [42],
+  });
   const getDepartmentProfile = vi.fn().mockResolvedValue({ name: "研发部" });
   const api = { request, getUserProfile, getDepartmentProfile } as unknown as Pick<
     DingTalkApiClient,
@@ -489,9 +608,13 @@ async function connectedApplicantClient(options: {
   >;
   const service = new ApprovalService({
     api,
-    callerUserId: "user-1",
-    writeUserIds: ["user-1"],
-    ...options,
+    callerUserId,
+    writeUserIds: [callerUserId],
+    ...(options.agentId === undefined ? {} : { agentId: options.agentId }),
+    ...(options.callerUnionId === undefined ? {} : { callerUnionId: options.callerUnionId }),
+    ...(options.uploadHostSuffixes === undefined ? {} : { uploadHostSuffixes: options.uploadHostSuffixes }),
+    ...(options.callerScopes === undefined ? {} : { callerScopes: options.callerScopes }),
+    ...(options.idempotencyLedger === undefined ? {} : { idempotencyLedger: options.idempotencyLedger }),
   });
   const server = createApprovalMcpServer(service);
   const client = new Client({ name: "approval-request-test", version: "1.0.0" });

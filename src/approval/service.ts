@@ -17,6 +17,7 @@ import { array, asRecord, normalizeProcessInstance, text, unwrapResult } from ".
 import type { ApprovalCaller, McpScope } from "../auth/types.js";
 import {
   APPROVAL_REQUEST_CONTRACTS,
+  approvalRequestTemplateForProcessCode,
   assertApprovalRequestTemplateSchema,
   assertAttachmentFieldAllowed,
   buildApprovalFormComponentValues,
@@ -63,6 +64,7 @@ export interface RevokeProcessInstanceInput {
   confirm: boolean;
   dryRun?: boolean | undefined;
   processInstanceId: string;
+  requestId?: string | undefined;
   operatingUserId?: string | undefined;
   remark?: string | undefined;
 }
@@ -162,6 +164,7 @@ export type ApprovalRequestInput =
   | {
       action: "revoke";
       processInstanceId: string;
+      requestId: string;
       confirm: boolean;
       dryRun?: boolean | undefined;
       remark?: string | undefined;
@@ -205,6 +208,10 @@ export class ApprovalService {
   readonly #startRequests = new Map<string, { fingerprint: string; promise: Promise<unknown> }>();
   readonly #decisionRequests = new Map<string, { fingerprint: string; promise: Promise<unknown> }>();
   readonly #approvalRequestSubmissions = new Map<
+    string,
+    { fingerprint: string; promise: Promise<ApprovalRequestEnvelope> }
+  >();
+  readonly #approvalRequestRevocations = new Map<
     string,
     { fingerprint: string; promise: Promise<ApprovalRequestEnvelope> }
   >();
@@ -364,20 +371,66 @@ export class ApprovalService {
     this.#assertScope("approval:read");
     if (input.action === "revoke") {
       this.#assertScope("approval:create");
-      const upstreamResult = await this.revokeProcessInstance({
+      const current = await this.getProcessInstanceDetail(input.processInstanceId);
+      const template = approvalRequestTemplateForProcessCode(current.normalized.processCode);
+      if (template === undefined) {
+        throw new ApprovalMcpError(
+          "PROCESS_CODE_NOT_ALLOWED",
+          "approval_request can revoke only an instance of an allowlisted request template.",
+        );
+      }
+      const actorUserId = this.#requireCallerUserId();
+      const fingerprint = createHash("sha256").update(stableStringify({
+        actorUserId,
         processInstanceId: input.processInstanceId,
-        confirm: input.confirm,
-        ...(input.dryRun === undefined ? {} : { dryRun: input.dryRun }),
-        ...(input.remark === undefined ? {} : { remark: input.remark }),
-      });
-      return {
-        processInstanceId: input.processInstanceId,
-        action: "revoke",
-        currentStatus: input.dryRun === true ? "REVOCABLE" : "REVOKED",
+        remark: input.remark,
+      })).digest("hex");
+      if (input.dryRun === true) {
+        const upstreamResult = await this.revokeProcessInstance({
+          processInstanceId: input.processInstanceId,
+          requestId: input.requestId,
+          confirm: input.confirm,
+          dryRun: true,
+          ...(input.remark === undefined ? {} : { remark: input.remark }),
+        });
+        return {
+          processInstanceId: input.processInstanceId,
+          action: "revoke",
+          template,
+          currentStatus: "REVOCABLE",
+          auditCorrelationId,
+          safeNextActions: ["revoke"],
+          data: { dryRun: true, upstreamResult },
+        };
+      }
+      const existing = this.#approvalRequestRevocations.get(input.requestId);
+      if (existing !== undefined) {
+        if (existing.fingerprint !== fingerprint) {
+          throw new ApprovalMcpError(
+            "IDEMPOTENCY_CONFLICT",
+            "The requestId was already used with a different approval revocation payload.",
+          );
+        }
+        return existing.promise;
+      }
+      const revocation = this.#revokeApprovalRequestIdempotently({
+        actorUserId,
         auditCorrelationId,
-        safeNextActions: input.dryRun === true ? ["revoke"] : [],
-        data: { dryRun: input.dryRun === true, upstreamResult },
-      };
+        fingerprint,
+        input,
+        template,
+      }).catch((error: unknown) => {
+        if (!(error instanceof ApprovalMcpError) || error.code !== "IDEMPOTENCY_OUTCOME_UNKNOWN") {
+          this.#approvalRequestRevocations.delete(input.requestId);
+        }
+        throw error;
+      });
+      this.#approvalRequestRevocations.set(input.requestId, { fingerprint, promise: revocation });
+      if (this.#approvalRequestRevocations.size > 1000) {
+        const oldest = this.#approvalRequestRevocations.keys().next().value as string | undefined;
+        if (oldest !== undefined && oldest !== input.requestId) this.#approvalRequestRevocations.delete(oldest);
+      }
+      return revocation;
     }
     this.#assertScope("approval:create");
     const contract = APPROVAL_REQUEST_CONTRACTS[input.template];
@@ -431,7 +484,7 @@ export class ApprovalService {
           draft,
           uploadInstructions,
           clientInstruction:
-            "The Agent client must PUT each file directly to uploadUrl using the exact returned headers, without sending file bytes to this MCP server. After every PUT succeeds, call approval_request action=submit with the matching field, fileName, fileSize, uploadKey, and spaceId.",
+            "The Agent client must PUT each file directly to uploadUrl using the exact returned headers, without sending file bytes to this MCP server or following upload redirects. After every PUT succeeds, call approval_request action=submit with the matching field, fileName, fileSize, uploadKey, and spaceId.",
         },
       };
     }
@@ -458,6 +511,7 @@ export class ApprovalService {
         throw new ApprovalMcpError("IDEMPOTENCY_KEY_REQUIRED", "Submitting an approval requires a stable requestId UUID.");
       }
       const fingerprintInput = {
+        actorUserId,
         template: input.template,
         deptId: input.deptId,
         fields,
@@ -710,6 +764,7 @@ export class ApprovalService {
         action: "revoke",
         actorUserId,
         processInstanceId: input.processInstanceId,
+        ...(input.requestId === undefined ? {} : { requestId: input.requestId }),
       },
       async () => {
         this.#assertConfirmedActor(input.confirm, actorUserId);
@@ -718,7 +773,7 @@ export class ApprovalService {
           method: "POST",
           path: "/v1.0/workflow/processInstances/terminate",
           body: {
-            ...omit(input, ["confirm", "dryRun", "operatingUserId"]),
+            ...omit(input, ["confirm", "dryRun", "operatingUserId", "requestId"]),
             operatingUserId: actorUserId,
             isSystem: false,
           },
@@ -1110,7 +1165,7 @@ export class ApprovalService {
     }>;
     auditCorrelationId: string;
   }): Promise<ApprovalRequestEnvelope> {
-    const ledgerKey = `approval-request:${input.requestId}`;
+    const ledgerKey = `approval-request:${input.originatorUserId}:${input.requestId}`;
     const reservation = await this.#idempotencyLedger.reserve(ledgerKey, input.fingerprint);
     if (!reservation.created) {
       if (reservation.entry.fingerprint !== input.fingerprint) {
@@ -1221,6 +1276,75 @@ export class ApprovalService {
       throw new ApprovalMcpError(
         "IDEMPOTENCY_OUTCOME_UNKNOWN",
         "The approval submission result is uncertain; inspect DingTalk before using a new requestId.",
+        { cause: error },
+      );
+    }
+  }
+
+  async #revokeApprovalRequestIdempotently(input: {
+    actorUserId: string;
+    auditCorrelationId: string;
+    fingerprint: string;
+    input: Extract<ApprovalRequestInput, { action: "revoke" }>;
+    template: ApprovalRequestTemplate;
+  }): Promise<ApprovalRequestEnvelope> {
+    const ledgerKey = `approval-request-revoke:${input.actorUserId}:${input.input.requestId}`;
+    const reservation = await this.#idempotencyLedger.reserve(ledgerKey, input.fingerprint);
+    if (!reservation.created) {
+      if (reservation.entry.fingerprint !== input.fingerprint) {
+        throw new ApprovalMcpError(
+          "IDEMPOTENCY_CONFLICT",
+          "The requestId was already used with a different approval revocation payload.",
+        );
+      }
+      if (reservation.entry.status === "succeeded") {
+        return reservation.entry.result as ApprovalRequestEnvelope;
+      }
+      throw new ApprovalMcpError(
+        "IDEMPOTENCY_OUTCOME_UNKNOWN",
+        "A previous approval revocation may have reached DingTalk; inspect the instance before retrying.",
+      );
+    }
+    try {
+      const upstreamResult = await this.revokeProcessInstance({
+        processInstanceId: input.input.processInstanceId,
+        requestId: input.input.requestId,
+        confirm: input.input.confirm,
+        ...(input.input.remark === undefined ? {} : { remark: input.input.remark }),
+      });
+      const result: ApprovalRequestEnvelope = {
+        processInstanceId: input.input.processInstanceId,
+        action: "revoke",
+        template: input.template,
+        currentStatus: "REVOKED",
+        auditCorrelationId: input.auditCorrelationId,
+        safeNextActions: [],
+        data: { dryRun: false, upstreamResult },
+      };
+      await this.#idempotencyLedger.put(ledgerKey, {
+        fingerprint: input.fingerprint,
+        status: "succeeded",
+        result,
+        updatedAt: new Date().toISOString(),
+      });
+      return result;
+    } catch (error) {
+      if (isKnownPreWriteRejection(error)) {
+        await this.#idempotencyLedger.delete(ledgerKey);
+        throw error;
+      }
+      try {
+        await this.#idempotencyLedger.put(ledgerKey, {
+          fingerprint: input.fingerprint,
+          status: "uncertain",
+          updatedAt: new Date().toISOString(),
+        });
+      } catch {
+        // The pending reservation still prevents an unsafe automatic replay.
+      }
+      throw new ApprovalMcpError(
+        "IDEMPOTENCY_OUTCOME_UNKNOWN",
+        "The approval revocation result is uncertain; inspect DingTalk before using a new requestId.",
         { cause: error },
       );
     }
@@ -1524,7 +1648,7 @@ function stringRecord(value: unknown): Record<string, string> | undefined {
 }
 
 function assertUploadFileName(fileName: string): void {
-  if (fileName !== fileName.trim() || fileName.endsWith(".") || /[\t*"<>|]/u.test(fileName)) {
+  if (fileName !== fileName.trim() || fileName.endsWith(".") || /[\u0000-\u001f\\/:*"<>|]/u.test(fileName)) {
     throw new ApprovalMcpError("INVALID_INPUT", "The attachment fileName is not accepted by DingTalk storage.");
   }
 }

@@ -18,7 +18,7 @@
 - 不接受审批人、抄送人、流程节点或申请人参数，完全沿用 OA 后台流程。
 - 每次 `prepare`/`submit` 前读取线上模板 Schema，精确核对模板类型、控件 ID/名称/类型，以及代码使用的固定选项键；任何漂移均失败关闭。
 - `approval_request` 要求 `approval:read` 与独立的 `approval:create` OAuth scope。写操作仍要求明确 `confirm=true`。
-- `submit` 使用稳定 UUID `requestId` 和持久幂等账本；附件提交或审批创建结果不确定时禁止自动重放。
+- `submit` 和实际 `revoke` 均使用稳定 UUID `requestId` 和持久幂等账本；账本命名空间绑定 OAuth 申请人。附件提交、审批创建或撤销结果不确定时禁止自动重放。
 
 ## 附件直传链路
 
@@ -26,7 +26,7 @@ MCP 服务端不接收文件字节，不解析文件，也不执行 OCR：
 
 1. `prepare` 校验表单与附件元数据，并向钉钉申请审批空间和签名上传信息。
 2. MCP 只向 Agent 返回经过 HTTPS Host 允许列表校验的 `PUT uploadUrl`、请求头、`uploadKey` 和 `spaceId`。
-3. Agent 直接把文件上传到钉钉。
+3. Agent 直接把文件上传到钉钉，不跟随上传重定向。
 4. `submit` 重新确认当前用户的审批空间，提交 `uploadKey`，取得 `fileId` 后写入审批附件控件并发起审批。
 
 限制为单文件 20 MiB、每单 10 个文件、合计 50 MiB。上传 URL 默认只允许 `.aliyuncs.com`，可通过 `APPROVAL_UPLOAD_HOST_SUFFIXES` 收紧或调整。

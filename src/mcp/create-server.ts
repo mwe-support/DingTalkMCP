@@ -158,6 +158,7 @@ const approvalRequestRevokeSchema = z
   .object({
     action: z.literal("revoke"),
     processInstanceId,
+    requestId: z.string().uuid(),
     confirm: z.boolean(),
     dryRun: z.boolean().optional(),
     remark: z.string().max(1024).optional(),

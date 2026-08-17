@@ -13,9 +13,18 @@ export const MWE_COMPANIES = [
   "深圳市玛威尔科创集团有限公司",
 ] as const;
 
+const moneyAmountSchema = z
+  .number()
+  .positive()
+  .finite()
+  .max(1_000_000_000)
+  .refine((value) => Math.abs(value * 100 - Math.round(value * 100)) < 1e-8, {
+    message: "Money amounts may contain at most two decimal places.",
+  });
+
 const expenseItemSchema = z
   .object({
-    amount: z.number().positive().finite(),
+    amount: moneyAmountSchema,
     category: z.enum(["AI费用", "其它"]),
     expenseDepartment: z.string().trim().min(1).max(100),
     remark: z.string().trim().min(1).max(500),
@@ -35,7 +44,7 @@ export const expenseReimbursementFieldsSchema = z
 const paymentLineSchema = z
   .object({
     purpose: z.string().trim().min(1).max(200),
-    amount: z.number().positive().finite(),
+    amount: moneyAmountSchema,
     reason: z.string().trim().min(1).max(500),
     expenseDepartment: z.string().trim().min(1).max(100),
     beneficiaryBankAccount: z.string().trim().max(100).optional(),
@@ -175,6 +184,15 @@ export function parseApprovalRequestFields(
   return parsed.data;
 }
 
+export function approvalRequestTemplateForProcessCode(
+  processCode: string | undefined,
+): ApprovalRequestTemplate | undefined {
+  if (processCode === undefined) return undefined;
+  return APPROVAL_REQUEST_TEMPLATES.find(
+    (template) => APPROVAL_REQUEST_CONTRACTS[template].processCode === processCode,
+  );
+}
+
 export function assertApprovalRequestTemplateSchema(template: ApprovalRequestTemplate, payload: unknown): void {
   const contract = APPROVAL_REQUEST_CONTRACTS[template];
   const result = asRecord(unwrapResult(payload));
@@ -258,7 +276,7 @@ function buildExpenseValues(
       name: "表格",
       value: JSON.stringify(fields.items.map((item, index) => ({
         rowValue: [
-          { label: "费用金额", value: String(item.amount), key: "MoneyField_1C6K3U65P03K" },
+          { label: "费用金额", value: formatMoney(item.amount), key: "MoneyField_1C6K3U65P03K" },
           {
             label: "费用项目",
             value: item.category,
@@ -297,7 +315,7 @@ function buildExpenseValues(
 }
 
 function buildPaymentValues(fields: PaymentRequestFields): Array<Record<string, unknown>> {
-  const totalAmount = fields.lines.reduce((sum, line) => sum + line.amount, 0);
+  const totalAmount = fields.lines.reduce((sum, line) => sum + Math.round(line.amount * 100), 0) / 100;
   const values: Array<Record<string, unknown>> = [
     { id: "TextField_RI2SYQ7VHQO0", name: "单据编号", value: fields.documentNumber },
     ...(fields.counterparty === undefined
@@ -305,7 +323,7 @@ function buildPaymentValues(fields: PaymentRequestFields): Array<Record<string, 
       : [{ id: "TextField_35CD4YZ76JA0", name: "往来单位", value: fields.counterparty }]),
     { id: "TextField_1V3MQHOZF3A80", name: "收款单位", value: fields.payee },
     { id: "TextField_1MCTJ1KMMFWG0", name: "币别", value: fields.currency },
-    { id: "MoneyField_HLOCQW4U3UO0", name: "申请付款总金额", value: String(totalAmount) },
+    { id: "MoneyField_HLOCQW4U3UO0", name: "申请付款总金额", value: formatMoney(totalAmount) },
     { id: "DDDateField_1JQDDBINCMW00", name: "申请日期", value: fields.applicationDate },
     {
       id: "TableField_GO15CA9H0480",
@@ -330,7 +348,7 @@ function buildPaymentValues(fields: PaymentRequestFields): Array<Record<string, 
 function paymentRow(line: z.infer<typeof paymentLineSchema>): Array<Record<string, unknown>> {
   return [
     row("付款用途", line.purpose, "TextField_A3QJPP1NBZ40"),
-    row("申请付款金额", String(line.amount), "TextField_1MPQDLBMHWWW0"),
+    row("申请付款金额", formatMoney(line.amount), "TextField_1MPQDLBMHWWW0"),
     row("付款原因", line.reason, "TextField_NRXU1FWNI6O0"),
     row("费用承担部门", line.expenseDepartment, "TextField_K81R7TZF70W0"),
     row("对方银行账号", line.beneficiaryBankAccount, "TextField_1RUOBECSTA2O0"),
@@ -345,6 +363,10 @@ function paymentRow(line: z.infer<typeof paymentLineSchema>): Array<Record<strin
 
 function row(label: string, value: string | undefined, key: string): Record<string, unknown> | undefined {
   return value === undefined || value === "" ? undefined : { label, value, key };
+}
+
+function formatMoney(value: number): string {
+  return String(Math.round(value * 100) / 100);
 }
 
 function selected(id: string, name: string, label: string, key: string): Record<string, unknown> {
