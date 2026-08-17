@@ -93,6 +93,33 @@ describe("pending approval event index", () => {
     expect(page.items).toHaveLength(1);
     expect(page.items[0]).toMatchObject({ processInstanceId: "pi-restart", taskId: "202" });
   });
+
+  it("reconciles an instance-only start with a task-specific terminal event", async () => {
+    const root = await mkdtemp(join(tmpdir(), "approval-inbox-mixed-task-id-"));
+    const index = new DirectoryPendingApprovalIndex(root, { now: () => 1_800_000_000_000 });
+    await index.apply({
+      eventId: "event-instance-only-start",
+      corpId: "corp-1",
+      processInstanceId: "pi-mixed-1",
+      processCode: "PROC-MIXED",
+      staffId: "user-1",
+      type: "start",
+      eventTime: 1_799_999_999_000,
+    });
+    await index.apply({
+      eventId: "event-task-specific-finish",
+      corpId: "corp-1",
+      processInstanceId: "pi-mixed-1",
+      processCode: "PROC-MIXED",
+      taskId: "909",
+      staffId: "user-1",
+      type: "finish",
+      result: "agree",
+      eventTime: 1_800_000_000_000,
+    });
+
+    await expect(index.list({ userId: "user-1", page: 1, limit: 20 })).resolves.toMatchObject({ items: [] });
+  });
 });
 
 describe("DingTalk task-change event adapter", () => {

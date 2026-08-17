@@ -80,7 +80,17 @@ export class DirectoryPendingApprovalIndex implements PendingApprovalIndex {
       state.seenEvents[event.eventId] = event.eventTime;
       state.lastEventAt = Math.max(state.lastEventAt ?? 0, event.eventTime);
       const key = itemKey(event.staffId, event.processInstanceId, event.taskId);
+      const instanceOnlyKey = itemKey(event.staffId, event.processInstanceId, undefined);
       if (event.type === "start") {
+        if (event.taskId !== undefined) {
+          delete state.items[instanceOnlyKey];
+        } else if (Object.values(state.items).some((item) =>
+          item.userId === event.staffId &&
+          item.processInstanceId === event.processInstanceId &&
+          item.taskId !== undefined
+        )) {
+          return;
+        }
         state.items[key] = {
           processInstanceId: event.processInstanceId,
           processCode: event.processCode,
@@ -94,6 +104,7 @@ export class DirectoryPendingApprovalIndex implements PendingApprovalIndex {
       }
       if (event.taskId !== undefined) {
         delete state.items[key];
+        delete state.items[instanceOnlyKey];
         return;
       }
       for (const [candidateKey, item] of Object.entries(state.items)) {
