@@ -13,6 +13,7 @@ import type { AuditPseudonymizer } from "../auth/security-audit.js";
 import type { McpScope } from "../auth/types.js";
 import { approvalToolAction, type ApprovalToolAction } from "../core/tool-action.js";
 import { createApprovalMcpServer } from "../mcp/create-server.js";
+import { APPROVAL_MCP_VERSION } from "../version.js";
 import {
   DEFAULT_AUDIT_WRITE_TIMEOUT_MS,
   runAuditWriteWithinTimeout,
@@ -51,9 +52,21 @@ export async function startApprovalHttpServer(
   // original client address for the SDK OAuth endpoint rate limiters.
   app.set("trust proxy", 1);
 
+  app.use("/mcp", (_request, response, next) => {
+    response.setHeader("x-mcp-server-version", APPROVAL_MCP_VERSION);
+    response.setHeader("x-mcp-tools-revision", APPROVAL_MCP_VERSION);
+    next();
+  });
   app.use(options.auth.router);
   app.get("/healthz", (_request, response) => {
-    response.json({ status: "ok", service: "mwe-dingtalk-approval-mcp", transport: "streamable-http" });
+    response.setHeader("cache-control", "no-store");
+    response.json({
+      status: "ok",
+      service: "mwe-dingtalk-approval-mcp",
+      transport: "streamable-http",
+      version: APPROVAL_MCP_VERSION,
+      toolsRevision: APPROVAL_MCP_VERSION,
+    });
   });
 
   const requireReadAccess = options.auth.requireAccess(["approval:read"]);

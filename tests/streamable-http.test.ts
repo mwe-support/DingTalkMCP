@@ -8,6 +8,7 @@ import { JoseMcpTokenCodec } from "../src/auth/jwt-codec.js";
 import { createMcpAuthorization, InMemoryAuthorizationStore } from "../src/auth/mcp-authorization.js";
 import type { DingTalkApiClient } from "../src/dingtalk/client.js";
 import { startApprovalHttpServer, type RunningApprovalHttpServer } from "../src/transports/http-server.js";
+import { APPROVAL_MCP_VERSION } from "../src/version.js";
 
 const resource = "https://dingtalk.mwexk.com/mcp";
 const running: RunningApprovalHttpServer[] = [];
@@ -17,6 +18,26 @@ afterEach(async () => {
 });
 
 describe("self-hosted Streamable HTTP transport", () => {
+  it("exposes the current server version without caching MCP discovery", async () => {
+    const { baseUrl, accessToken } = await fixture();
+
+    const health = await fetch(new URL("/healthz", baseUrl));
+    expect(health.headers.get("cache-control")).toBe("no-store");
+    await expect(health.json()).resolves.toMatchObject({
+      status: "ok",
+      version: APPROVAL_MCP_VERSION,
+      toolsRevision: APPROVAL_MCP_VERSION,
+    });
+
+    const initialized = await mcpRequest(baseUrl, initializeRequest(), accessToken);
+    expect(initialized.headers.get("cache-control")).toContain("no-cache");
+    expect(initialized.headers.get("x-mcp-server-version")).toBe(APPROVAL_MCP_VERSION);
+    expect(initialized.headers.get("x-mcp-tools-revision")).toBe(APPROVAL_MCP_VERSION);
+    expect(await jsonRpcBody(initialized)).toMatchObject({
+      result: { serverInfo: { version: APPROVAL_MCP_VERSION } },
+    });
+  });
+
   it("advertises OAuth metadata and rejects unauthenticated MCP requests", async () => {
     const { baseUrl } = await fixture();
 

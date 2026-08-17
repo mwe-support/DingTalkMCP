@@ -111,7 +111,9 @@ export class InMemoryAuthorizationStore implements AuthorizationStore {
   getClient(clientId: string): OAuthClientInformationFull | undefined {
     this.#prune();
     const stored = this.#clients.get(clientId);
-    return stored === undefined ? undefined : structuredClone(stored.client);
+    if (stored === undefined) return undefined;
+    stored.expiresAt = this.#now() + this.#clientTtlSeconds;
+    return structuredClone(stored.client);
   }
 
   registerClient(

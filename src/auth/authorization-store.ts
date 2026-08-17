@@ -60,7 +60,12 @@ export class DirectoryAuthorizationStore implements AuthorizationStore {
   }
 
   getClient(clientId: string): Promise<OAuthClientInformationFull | undefined> {
-    return this.#update((state) => clone(state.clients[clientId]?.client));
+    return this.#update((state) => {
+      const stored = state.clients[clientId];
+      if (stored === undefined) return undefined;
+      stored.expiresAt = this.#now() + this.#clientTtlSeconds;
+      return clone(stored.client);
+    });
   }
 
   registerClient(

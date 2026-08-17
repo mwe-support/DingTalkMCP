@@ -83,6 +83,13 @@ codex mcp login mwe_approval_mcp
 9. 使用详情返回的 `fileId` 测试 `attachmentAction=download`；Agent 客户端负责下载和识别内容。
 10. 写操作先使用 `dryRun=true`；确认任务仍属于当前 OAuth 用户后，再由用户明确授权 `confirm=true`。
 
+## 服务端更新与工具列表刷新
+
+- 同一 OAuth scope 内的服务端更新不需要重新走钉钉登录。客户端应使用既有 refresh token 静默续期，然后重新连接并调用 `initialize`、`tools/list`。
+- access token 默认 10 分钟；轮换 refresh token 为 30 天滚动窗口。活跃客户端注册会滑动续期，停用 30 天后清理。
+- 可先读取 `GET https://dingtalk.mwexk.com/healthz` 的 `version`/`toolsRevision`，或检查 `/mcp` 响应头 `x-mcp-server-version`/`x-mcp-tools-revision`，判断客户端缓存是否落后。
+- 只有 scopes 增加、refresh token 过期或撤销、旧 refresh token 重放导致 family 撤销时，才重新授权。不要用“重新授权”代替普通的断开重连或工具列表刷新。
+
 ## 预期失败含义
 
 |现象|含义|

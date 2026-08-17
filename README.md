@@ -2,7 +2,7 @@
 
 `MWE审批MCP` 是部署在 `https://dingtalk.mwexk.com/mcp` 的自托管钉钉 OA 审批 MCP Server。
 
-当前版本：`0.8.0`。
+当前版本：`0.8.1`。
 
 ## 当前架构
 
@@ -133,7 +133,9 @@ approval_request  # 申请人：准备附件、提交、评论、撤销
 |`/mcp`|OAuth 保护的 Streamable HTTP MCP|
 |`/healthz`|存活检查|
 
-Access token 默认 10 分钟；refresh token 默认 8 小时、每次使用轮换。重放旧 refresh token 会撤销整个 token family。授权事务、客户端注册和 refresh 哈希保存在 `MCP_AUTH_STORE_PATH`，原始 token 不落盘。
+Access token 默认 10 分钟；refresh token 默认 30 天、每次使用轮换且从本次刷新重新计算 30 天窗口。重放旧 refresh token 会撤销整个 token family。授权事务、客户端注册和 refresh 哈希保存在 `MCP_AUTH_STORE_PATH`，原始 token 不落盘；活跃的动态客户端注册会滑动续期，停止使用 30 天后自动清理。
+
+服务端在 OAuth scope 不变时更新，不要求用户重新登录钉钉：客户端应沿用现有 refresh token 静默换取 access token，重新执行 `initialize` 与 `tools/list`。`initialize.serverInfo.version`、`/healthz` 的 `version/toolsRevision` 以及 `/mcp` 的 `x-mcp-server-version`/`x-mcp-tools-revision` 可用于检测工具版本；MCP 响应要求重新验证缓存。只有新增 scope、refresh token 超过滚动窗口、用户主动撤销或检测到 token 重放时，才需要交互式重新授权。服务端不能强制不支持刷新机制的客户端主动清除其本地工具缓存。
 
 ## 开发者后台
 

@@ -44,7 +44,7 @@ describe("loadConfig", () => {
       auditHmacKeyPath: resolve("./secrets/mcp-audit-hmac.key"),
       authStorePath: resolve("./data/auth"),
       accessTokenTtlSeconds: 600,
-      refreshTokenTtlSeconds: 28_800,
+      refreshTokenTtlSeconds: 30 * 24 * 60 * 60,
       transactionTtlSeconds: 300,
       allowedScopes: ["approval:read", "approval:decide", "approval:create"],
     });

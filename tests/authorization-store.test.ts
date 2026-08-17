@@ -79,6 +79,24 @@ describe("DirectoryAuthorizationStore", () => {
     await expect(store.getClient(client.client_id)).resolves.toBeUndefined();
   });
 
+  it("keeps an actively used public client registered with a sliding expiration", async () => {
+    const root = await temporaryRoot();
+    let now = 1_800_000_000;
+    const store = new DirectoryAuthorizationStore(root, {
+      now: () => now,
+      clientTtlSeconds: 60,
+    });
+    const client = publicClient();
+    await store.registerClient(client);
+
+    now += 50;
+    await expect(store.getClient(client.client_id)).resolves.toMatchObject({ client_id: client.client_id });
+    now += 50;
+    await expect(store.getClient(client.client_id)).resolves.toMatchObject({ client_id: client.client_id });
+    now += 61;
+    await expect(store.getClient(client.client_id)).resolves.toBeUndefined();
+  });
+
   it("rejects oversized client metadata and oversized persisted state", async () => {
     const root = await temporaryRoot();
     const store = new DirectoryAuthorizationStore(root, { now: () => 1_800_000_000 });
