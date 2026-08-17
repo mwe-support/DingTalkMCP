@@ -5,6 +5,7 @@ import express from "express";
 import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
 import {
   AccessDeniedError,
+  InsufficientScopeError,
   InvalidClientMetadataError,
   InvalidGrantError,
   InvalidRequestError,
@@ -343,9 +344,39 @@ export function createMcpAuthorization(options: CreateMcpAuthorizationOptions): 
   const resourceMetadataUrl = getOAuthProtectedResourceMetadataUrl(options.resourceUrl);
   return {
     router,
-    requireAccess: (scopes = []) =>
-      requireBearerAuth({ verifier: provider, requiredScopes: [...scopes], resourceMetadataUrl }),
+    requireAccess: (scopes = []) => scopedBearerAuth(provider, scopes, resourceMetadataUrl),
     principal: principalFromAuthInfo,
+  };
+}
+
+function scopedBearerAuth(
+  verifier: DingTalkBackedOAuthProvider,
+  requiredScopes: readonly McpScope[],
+  resourceMetadataUrl: string,
+): RequestHandler {
+  const verifyBearer = requireBearerAuth({ verifier, resourceMetadataUrl });
+  return async (request, response, next) => {
+    await verifyBearer(request, response, (error?: unknown) => {
+      if (error !== undefined) {
+        next(error);
+        return;
+      }
+      const authInfo = request.auth;
+      if (authInfo === undefined) {
+        response.status(500).json({ error: "server_error", error_description: "Bearer verification failed." });
+        return;
+      }
+      if (requiredScopes.every((scope) => authInfo.scopes.includes(scope))) {
+        next();
+        return;
+      }
+      const insufficientScope = new InsufficientScopeError("Insufficient scope");
+      response.setHeader(
+        "WWW-Authenticate",
+        `Bearer error="${insufficientScope.errorCode}", error_description="${insufficientScope.message}", scope="${requiredScopes.join(" ")}", resource_metadata="${resourceMetadataUrl}"`,
+      );
+      response.status(403).json(insufficientScope.toResponseObject());
+    });
   };
 }
 

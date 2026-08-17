@@ -2,7 +2,7 @@
 
 `MWE审批MCP` 是部署在 `https://dingtalk.mwexk.com/mcp` 的自托管钉钉 OA 审批 MCP Server。
 
-当前版本：`0.7.1`。
+当前版本：`0.7.2`。
 
 ## 当前架构
 
@@ -150,7 +150,7 @@ https://dingtalk.mwexk.com/oauth/dingtalk/callback
 `sh-dualstack.trans.dingtalk.com`，因此默认精确允许 `.trans.dingtalk.com`；同时保留
 钉钉可能返回的 `.aliyuncs.com` 存储域。不要把白名单放宽为任意 `.dingtalk.com`。
 
-OAuth 授权范围包含 `approval:read`、`approval:decide` 与 `approval:create`。客户端以较小 scope 连接后，调用发起审批或审批决定动作时，服务端会按 MCP Authorization 规范返回 HTTP 403 `insufficient_scope` challenge，由兼容客户端发起增量授权并要求用户明确同意；不要把缺 scope 仅包装成 HTTP 200 的工具业务错误。
+OAuth 授权范围包含 `approval:read`、`approval:decide` 与 `approval:create`。未认证请求的 HTTP 401 challenge 只声明 `resource_metadata`，由客户端从 metadata 的 `scopes_supported` 选择授权范围；服务端不再用 `scope=approval:read` 覆盖 metadata。客户端以较小 scope 连接后，调用发起审批或审批决定动作时，服务端仍会按 MCP Authorization 规范返回 HTTP 403 `insufficient_scope` challenge，并要求用户明确同意写权限；不要把缺 scope 仅包装成 HTTP 200 的工具业务错误。
 
 ## 本地验证
 

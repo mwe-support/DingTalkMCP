@@ -33,6 +33,7 @@ describe("self-hosted Streamable HTTP transport", () => {
     expect(response.headers.get("www-authenticate")).toContain(
       'resource_metadata="https://dingtalk.mwexk.com/.well-known/oauth-protected-resource/mcp"',
     );
+    expect(response.headers.get("www-authenticate")).not.toContain("scope=");
   });
 
   it("serves initialize, tools/list and an OAuth-bound approval_task call", async () => {
