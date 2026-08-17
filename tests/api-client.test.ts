@@ -20,6 +20,27 @@ describe("DingTalkApiClient", () => {
     expect(JSON.stringify(result)).toBe('{"instanceId":"pi-1"}');
   });
 
+  it("classifies an HTTP 408 mutation response as retryable and outcome-ambiguous", async () => {
+    const tokenProvider = { getToken: vi.fn().mockResolvedValue("token"), invalidate: vi.fn() };
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ code: "RequestTimeout", message: "request timeout" }), {
+        status: 408,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const client = new DingTalkApiClient({ tokenProvider, fetch: fetchMock });
+
+    await expect(client.request({
+      method: "POST",
+      path: "/v1.0/workflow/processInstances",
+      body: {},
+    })).rejects.toMatchObject({
+      code: "DINGTALK_API_ERROR",
+      retryable: true,
+      details: { status: 408, upstreamCode: "RequestTimeout" },
+    });
+  });
+
   it("maps an OAuth unionId to the enterprise userId through the supported application API", async () => {
     const tokenProvider = { getToken: vi.fn().mockResolvedValue("application-token"), invalidate: vi.fn() };
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(

@@ -90,7 +90,7 @@ export class DingTalkApiClient {
             requestId: stringValue(record?.request_id ?? record?.requestid ?? record?.requestId),
             requiredScopes: denied?.requiredScopes,
           },
-          retryable: response.status === 429 || response.status >= 500,
+          retryable: response.status === 408 || response.status === 429 || response.status >= 500,
         },
       );
     }
@@ -185,7 +185,7 @@ export class DingTalkApiClient {
             stringValue(record?.requestid ?? record?.requestId),
           requiredScopes: denied?.requiredScopes,
         },
-        retryable: response.status === 429 || response.status >= 500,
+        retryable: response.status === 408 || response.status === 429 || response.status >= 500,
       });
     }
 
@@ -230,7 +230,7 @@ export class DingTalkApiClient {
           requestId: stringValue(record?.request_id ?? record?.requestid ?? record?.requestId),
           requiredScopes: denied?.requiredScopes,
         },
-        retryable: response.status === 429 || response.status >= 500,
+        retryable: response.status === 408 || response.status === 429 || response.status >= 500,
       });
     }
     return payload;

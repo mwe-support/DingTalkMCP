@@ -1448,7 +1448,7 @@ export class ApprovalService {
       });
       return result;
     } catch (error) {
-      if (!sideEffectCommitted && isKnownPreWriteRejection(error)) {
+      if (!sideEffectCommitted && isDefiniteMutationRejection(error)) {
         await this.#idempotencyLedger.delete(ledgerKey);
         throw error;
       }
@@ -1518,7 +1518,7 @@ export class ApprovalService {
       });
       return result;
     } catch (error) {
-      if (isKnownPreWriteRejection(error)) {
+      if (isDefiniteMutationRejection(error)) {
         await this.#idempotencyLedger.delete(ledgerKey);
         throw error;
       }
@@ -1640,7 +1640,7 @@ export class ApprovalService {
       });
       return result;
     } catch (error) {
-      if (isKnownPreWriteRejection(error)) {
+      if (isDefiniteMutationRejection(error)) {
         await this.#idempotencyLedger.delete(ledgerKey);
         throw error;
       }
@@ -1842,7 +1842,7 @@ export class ApprovalService {
       });
       return result;
     } catch (error) {
-      if (isKnownPreWriteRejection(error)) {
+      if (isDefiniteMutationRejection(error)) {
         await this.#idempotencyLedger.delete(ledgerKey);
         throw error;
       }
@@ -1913,9 +1913,11 @@ function omit<T extends object, K extends keyof T>(input: T, keys: readonly K[])
   >;
 }
 
-function isKnownPreWriteRejection(error: unknown): boolean {
+function isDefiniteMutationRejection(error: unknown): boolean {
   if (!(error instanceof ApprovalMcpError)) return false;
-  if (error.code === "DINGTALK_API_ERROR") return !error.retryable;
+  if (error.code === "DINGTALK_API_ERROR") {
+    return error.details?.status !== 408 && !error.retryable;
+  }
   return PRE_WRITE_REJECTION_CODES.has(error.code);
 }
 
