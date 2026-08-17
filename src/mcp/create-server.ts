@@ -12,6 +12,7 @@ import {
   paymentRequestFieldsSchema,
 } from "../approval/request-templates.js";
 import { ApprovalMcpError, errorPayload } from "../core/errors.js";
+import { approvalToolAction } from "../core/tool-action.js";
 import {
   DEFAULT_AUDIT_WRITE_TIMEOUT_MS,
   type AuditInvocationContext,
@@ -536,7 +537,7 @@ async function auditedPublicToolCall(
   if (options.toolAudit === undefined) return safely(operation);
   const invocationId = randomUUID();
   const startedAt = performance.now();
-  const action = boundedAction(rawArguments);
+  const action = approvalToolAction(rawArguments?.action);
   const publishedTool = requestedToolName === "approval_task" || requestedToolName === "approval_request";
   const base: ToolInvocationAuditEventBase = {
     timestamp: new Date().toISOString(),
@@ -586,21 +587,6 @@ async function auditedPublicToolCall(
     return markAuditPartial(result);
   }
   return result;
-}
-
-function boundedAction(
-  rawArguments: Record<string, unknown> | undefined,
-): "view" | "approve" | "reject" | "prepare" | "submit" | "comment" | "revoke" | undefined {
-  const action = rawArguments?.action;
-  return action === "view" ||
-    action === "approve" ||
-    action === "reject" ||
-    action === "prepare" ||
-    action === "submit" ||
-    action === "comment" ||
-    action === "revoke"
-    ? action
-    : undefined;
 }
 
 function markAuditPartial<T extends Awaited<ReturnType<typeof safely>>>(result: T): T {

@@ -3,6 +3,8 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ApprovalService } from "../src/approval/service.js";
+import type { ApprovalAuditEvent } from "../src/core/audit.js";
+import { ApprovalMcpError } from "../src/core/errors.js";
 import { InMemoryIdempotencyLedger, type IdempotencyLedger } from "../src/core/idempotency.js";
 import type { DingTalkApiClient } from "../src/dingtalk/client.js";
 import { createApprovalMcpServer } from "../src/mcp/create-server.js";
@@ -363,9 +365,15 @@ describe("approval_request public MCP contract", () => {
         processInstanceId: "pi-comment-dry-run",
         action: "comment",
         template: "expense_reimbursement",
-        currentStatus: "COMMENTABLE",
+        currentStatus: "RUNNING",
         safeNextActions: ["comment", "revoke"],
-        data: { dryRun: true, textLength: 6 },
+        data: {
+          dryRun: true,
+          textLength: 6,
+          textPreview: "补充审批说明",
+          attachmentCount: 0,
+          boundCommentUserId: "user-1",
+        },
       },
     });
     expect(request).toHaveBeenCalledTimes(1);
@@ -416,12 +424,12 @@ describe("approval_request public MCP contract", () => {
         processInstanceId: "pi-comment-1",
         action: "comment",
         template: "expense_reimbursement",
-        currentStatus: "COMMENTED",
+        currentStatus: "RUNNING",
         safeNextActions: ["comment", "revoke"],
         data: {
           dryRun: false,
           upstreamResult: { result: true, success: true },
-          postActionRefresh: { ok: true, commentObserved: true },
+          postActionRefresh: { ok: true, commentObserved: true, status: "RUNNING" },
         },
       },
     });
@@ -436,6 +444,160 @@ describe("approval_request public MCP contract", () => {
         commentUserId: "user-1",
       },
     });
+  });
+
+  it("audits and releases the idempotency key for an explicit false comment response", async () => {
+    const { client, request, approvalAuditEvents } = await connectedApplicantClient();
+    request.mockImplementation(async (input: { path: string }) => {
+      if (input.path === "/v1.0/workflow/processInstances") {
+        return {
+          result: {
+            processInstanceId: "pi-comment-rejected",
+            processCode: "PROC-2DB91B79-3CDD-421D-A223-0489A7BAB2C0",
+            originatorUserId: "user-1",
+            status: "RUNNING",
+            tasks: [],
+          },
+        };
+      }
+      if (input.path === "/v1.0/workflow/processInstances/comments") {
+        return { result: false, success: false };
+      }
+      throw new Error(`Unexpected DingTalk request: ${input.path}`);
+    });
+
+    const arguments_ = {
+      action: "comment",
+      processInstanceId: "pi-comment-rejected",
+      text: "不会成功的评论",
+      requestId: "45454545-4545-4545-8545-454545454545",
+      confirm: true,
+    } as const;
+
+    const first = await client.callTool({ name: "approval_request", arguments: arguments_ });
+    const repeated = await client.callTool({ name: "approval_request", arguments: arguments_ });
+
+    expect(first.structuredContent).toMatchObject({ error: { code: "APPROVAL_COMMENT_REJECTED" } });
+    expect(repeated.structuredContent).toMatchObject({ error: { code: "APPROVAL_COMMENT_REJECTED" } });
+    expect(approvalAuditEvents).toContainEqual(expect.objectContaining({
+      action: "comment",
+      outcome: "rejected",
+      errorCode: "APPROVAL_COMMENT_REJECTED",
+    }));
+    expect(approvalAuditEvents).not.toContainEqual(expect.objectContaining({
+      action: "comment",
+      outcome: "succeeded",
+    }));
+    expect(request.mock.calls.filter(([input]) => input.path.endsWith("/comments"))).toHaveLength(2);
+  });
+
+  it("releases the comment idempotency key after a definite DingTalk rejection", async () => {
+    const { client, request } = await connectedApplicantClient();
+    request.mockImplementation(async (input: { path: string }) => {
+      if (input.path === "/v1.0/workflow/processInstances") {
+        return {
+          result: {
+            processInstanceId: "pi-comment-denied",
+            processCode: "PROC-2DB91B79-3CDD-421D-A223-0489A7BAB2C0",
+            originatorUserId: "user-1",
+            status: "RUNNING",
+            tasks: [],
+          },
+        };
+      }
+      if (input.path === "/v1.0/workflow/processInstances/comments") {
+        throw new ApprovalMcpError("DINGTALK_API_ERROR", "Comment rejected.", { retryable: false });
+      }
+      throw new Error(`Unexpected DingTalk request: ${input.path}`);
+    });
+    const arguments_ = {
+      action: "comment",
+      processInstanceId: "pi-comment-denied",
+      text: "确定性拒绝",
+      requestId: "67676767-6767-4767-8767-676767676767",
+      confirm: true,
+    } as const;
+
+    const first = await client.callTool({ name: "approval_request", arguments: arguments_ });
+    const repeated = await client.callTool({ name: "approval_request", arguments: arguments_ });
+
+    expect(first.structuredContent).toMatchObject({ error: { code: "DINGTALK_API_ERROR", retryable: false } });
+    expect(repeated.structuredContent).toMatchObject({ error: { code: "DINGTALK_API_ERROR", retryable: false } });
+    expect(request.mock.calls.filter(([input]) => input.path.endsWith("/comments"))).toHaveLength(2);
+  });
+
+  it("rejects reuse of a successful comment requestId with different text", async () => {
+    const { client, request } = await connectedApplicantClient();
+    request.mockImplementation(async (input: { path: string }) => {
+      if (input.path === "/v1.0/workflow/processInstances") {
+        return {
+          result: {
+            processInstanceId: "pi-comment-conflict",
+            processCode: "PROC-2DB91B79-3CDD-421D-A223-0489A7BAB2C0",
+            originatorUserId: "user-1",
+            status: "RUNNING",
+            tasks: [],
+            operationRecords: [],
+          },
+        };
+      }
+      if (input.path === "/v1.0/workflow/processInstances/comments") return { result: true, success: true };
+      throw new Error(`Unexpected DingTalk request: ${input.path}`);
+    });
+    const base = {
+      action: "comment",
+      processInstanceId: "pi-comment-conflict",
+      requestId: "89898989-8989-4989-8989-898989898989",
+      confirm: true,
+    } as const;
+
+    const first = await client.callTool({
+      name: "approval_request",
+      arguments: { ...base, text: "第一次评论" },
+    });
+    const conflict = await client.callTool({
+      name: "approval_request",
+      arguments: { ...base, text: "不同的第二次评论" },
+    });
+
+    expect(first.isError).not.toBe(true);
+    expect(conflict.structuredContent).toMatchObject({ error: { code: "IDEMPOTENCY_CONFLICT" } });
+    expect(request.mock.calls.filter(([input]) => input.path.endsWith("/comments"))).toHaveLength(1);
+  });
+
+  it("blocks automatic replay after a retryable comment outcome becomes unknown", async () => {
+    const { client, request } = await connectedApplicantClient();
+    request.mockImplementation(async (input: { path: string }) => {
+      if (input.path === "/v1.0/workflow/processInstances") {
+        return {
+          result: {
+            processInstanceId: "pi-comment-unknown",
+            processCode: "PROC-2DB91B79-3CDD-421D-A223-0489A7BAB2C0",
+            originatorUserId: "user-1",
+            status: "RUNNING",
+            tasks: [],
+          },
+        };
+      }
+      if (input.path === "/v1.0/workflow/processInstances/comments") {
+        throw new ApprovalMcpError("DINGTALK_API_ERROR", "Comment timed out.", { retryable: true });
+      }
+      throw new Error(`Unexpected DingTalk request: ${input.path}`);
+    });
+    const arguments_ = {
+      action: "comment",
+      processInstanceId: "pi-comment-unknown",
+      text: "结果未知",
+      requestId: "90909090-9090-4090-8090-909090909090",
+      confirm: true,
+    } as const;
+
+    const first = await client.callTool({ name: "approval_request", arguments: arguments_ });
+    const repeated = await client.callTool({ name: "approval_request", arguments: arguments_ });
+
+    expect(first.structuredContent).toMatchObject({ error: { code: "IDEMPOTENCY_OUTCOME_UNKNOWN" } });
+    expect(repeated.structuredContent).toMatchObject({ error: { code: "IDEMPOTENCY_OUTCOME_UNKNOWN" } });
+    expect(request.mock.calls.filter(([input]) => input.path.endsWith("/comments"))).toHaveLength(1);
   });
 
   it("refuses to comment on an approval initiated by another user", async () => {
@@ -865,6 +1027,7 @@ async function connectedApplicantClient(options: {
   request: ReturnType<typeof vi.fn>;
   getUserProfile: ReturnType<typeof vi.fn>;
   getDepartmentProfile: ReturnType<typeof vi.fn>;
+  approvalAuditEvents: ApprovalAuditEvent[];
 }> {
   const request = vi.fn().mockImplementation(async (input: { path: string }) => {
     if (input.path === "/v1.0/workflow/forms/schemas/processCodes") return expenseSchemaResponse();
@@ -882,8 +1045,10 @@ async function connectedApplicantClient(options: {
     DingTalkApiClient,
     "request" | "getUserProfile" | "getDepartmentProfile"
   >;
+  const approvalAuditEvents: ApprovalAuditEvent[] = [];
   const service = new ApprovalService({
     api,
+    audit: { record: (event) => { approvalAuditEvents.push(event); } },
     callerUserId,
     writeUserIds: [callerUserId],
     ...(options.agentId === undefined ? {} : { agentId: options.agentId }),
@@ -898,7 +1063,7 @@ async function connectedApplicantClient(options: {
   await server.connect(serverTransport);
   await client.connect(clientTransport);
   closeables.push(client, server);
-  return { client, request, getUserProfile, getDepartmentProfile };
+  return { client, request, getUserProfile, getDepartmentProfile, approvalAuditEvents };
 }
 
 function expenseFields(): Record<string, unknown> {

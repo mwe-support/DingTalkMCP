@@ -11,6 +11,7 @@ import type { ApprovalService } from "../approval/service.js";
 import type { McpAuthorizationModule } from "../auth/mcp-authorization.js";
 import type { AuditPseudonymizer } from "../auth/security-audit.js";
 import type { McpScope } from "../auth/types.js";
+import { approvalToolAction, type ApprovalToolAction } from "../core/tool-action.js";
 import { createApprovalMcpServer } from "../mcp/create-server.js";
 import {
   DEFAULT_AUDIT_WRITE_TIMEOUT_MS,
@@ -112,7 +113,7 @@ function actionAwareMcpAccess(options: ApprovalHttpOptions): RequestHandler {
 
 interface ScopeChallengedInvocation {
   toolName: "approval_task" | "approval_request";
-  action?: "view" | "approve" | "reject" | "prepare" | "submit" | "comment" | "revoke";
+  action?: ApprovalToolAction;
   requiredScopes: McpScope[];
 }
 
@@ -127,7 +128,7 @@ function inspectRequestScopes(body: unknown): {
   for (const message of messages) {
     if (!isRecord(message) || message.method !== "tools/call" || !isRecord(message.params)) continue;
     const rawArguments = isRecord(message.params.arguments) ? message.params.arguments : undefined;
-    const action = boundedAction(rawArguments?.action);
+    const action = approvalToolAction(rawArguments?.action);
     if (message.params.name === "approval_request") {
       requiresCreation = true;
       invocations.push({
@@ -201,13 +202,6 @@ async function auditScopeRejections(
     }
   }
   return partial ? "partial" : "complete";
-}
-
-function boundedAction(value: unknown): ScopeChallengedInvocation["action"] {
-  return value === "view" || value === "approve" || value === "reject" || value === "prepare" ||
-    value === "submit" || value === "comment" || value === "revoke"
-    ? value
-    : undefined;
 }
 
 function jsonRpcId(body: unknown): unknown {

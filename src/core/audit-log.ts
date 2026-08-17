@@ -3,6 +3,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { resolve } from "node:path";
 
 import type { ApprovalAuditEvent, ApprovalAuditSink } from "./audit.js";
+import type { ApprovalToolAction } from "./tool-action.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 export const MAX_AUDIT_RETENTION_DAYS = 30;
@@ -16,7 +17,7 @@ export interface ToolInvocationAuditEventBase {
   transport: "streamable_http";
   toolName: string;
   subjectHash?: string;
-  action?: "view" | "approve" | "reject" | "prepare" | "submit" | "comment" | "revoke";
+  action?: ApprovalToolAction;
 }
 
 export type ToolInvocationAuditEvent = ToolInvocationAuditEventBase &

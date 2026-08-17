@@ -397,16 +397,23 @@ export class ApprovalService {
         );
       }
       if (input.dryRun === true) {
+        const currentStatus = current.normalized.status?.toUpperCase() ?? "UNKNOWN";
         return {
           processInstanceId: input.processInstanceId,
           action: "comment",
           template,
-          currentStatus: "COMMENTABLE",
+          currentStatus,
           auditCorrelationId,
-          safeNextActions: current.normalized.status?.toUpperCase() === "RUNNING"
+          safeNextActions: currentStatus === "RUNNING"
             ? ["comment", "revoke"]
             : ["comment"],
-          data: { dryRun: true, textLength: input.text.length },
+          data: {
+            dryRun: true,
+            textLength: input.text.length,
+            textPreview: input.text.slice(0, 160),
+            attachmentCount: 0,
+            boundCommentUserId: actorUserId,
+          },
         };
       }
       this.#assertConfirmedActor(input.confirm, actorUserId);
@@ -419,9 +426,8 @@ export class ApprovalService {
         actorUserId,
         auditCorrelationId,
         fingerprint,
-        input,
+        request: input,
         template,
-        instanceStatus: current.normalized.status?.toUpperCase(),
       });
     }
     if (input.action === "revoke") {
@@ -1425,18 +1431,17 @@ export class ApprovalService {
     }
   }
 
-  async #commentApprovalRequestIdempotently(input: {
+  async #commentApprovalRequestIdempotently(context: {
     actorUserId: string;
     auditCorrelationId: string;
     fingerprint: string;
-    input: Extract<ApprovalRequestInput, { action: "comment" }>;
+    request: Extract<ApprovalRequestInput, { action: "comment" }>;
     template: ApprovalRequestTemplate;
-    instanceStatus?: string | undefined;
   }): Promise<ApprovalRequestEnvelope> {
-    const ledgerKey = `approval-request-comment:${input.actorUserId}:${input.input.requestId}`;
-    const reservation = await this.#idempotencyLedger.reserve(ledgerKey, input.fingerprint);
+    const ledgerKey = `approval-request-comment:${context.actorUserId}:${context.request.requestId}`;
+    const reservation = await this.#idempotencyLedger.reserve(ledgerKey, context.fingerprint);
     if (!reservation.created) {
-      if (reservation.entry.fingerprint !== input.fingerprint) {
+      if (reservation.entry.fingerprint !== context.fingerprint) {
         throw new ApprovalMcpError(
           "IDEMPOTENCY_CONFLICT",
           "The requestId was already used with a different approval comment payload.",
@@ -1454,62 +1459,86 @@ export class ApprovalService {
       const upstreamResult = await this.#audited(
         {
           action: "comment",
-          actorUserId: input.actorUserId,
-          correlationId: input.auditCorrelationId,
-          processInstanceId: input.input.processInstanceId,
-          requestId: input.input.requestId,
+          actorUserId: context.actorUserId,
+          correlationId: context.auditCorrelationId,
+          processInstanceId: context.request.processInstanceId,
+          requestId: context.request.requestId,
         },
-        () => this.#api.request({
-          method: "POST",
-          path: "/v1.0/workflow/processInstances/comments",
-          body: {
-            processInstanceId: input.input.processInstanceId,
-            text: input.input.text,
-            commentUserId: input.actorUserId,
-          },
-        }),
+        async () => {
+          const result = await this.#api.request({
+            method: "POST",
+            path: "/v1.0/workflow/processInstances/comments",
+            body: {
+              processInstanceId: context.request.processInstanceId,
+              text: context.request.text,
+              commentUserId: context.actorUserId,
+            },
+          });
+          const response = asRecord(result);
+          if (response?.result === false || response?.success === false) {
+            throw new ApprovalMcpError(
+              "APPROVAL_COMMENT_REJECTED",
+              "DingTalk rejected the approval comment.",
+            );
+          }
+          if (response?.result !== true || response.success !== true) {
+            throw new ApprovalMcpError(
+              "INVALID_RESPONSE",
+              "DingTalk did not confirm that the approval comment was added.",
+            );
+          }
+          return result;
+        },
       );
-      const upstream = asRecord(upstreamResult);
-      if (upstream?.result !== true || upstream.success !== true) {
-        throw new ApprovalMcpError(
-          "INVALID_RESPONSE",
-          "DingTalk did not confirm that the approval comment was added.",
-        );
-      }
-      let postActionRefresh = { ok: false, commentObserved: false };
+      let postActionRefresh: {
+        ok: boolean;
+        commentObserved: boolean;
+        status?: string | undefined;
+      } = { ok: false, commentObserved: false };
       try {
-        const refreshed = await this.getProcessInstanceDetail(input.input.processInstanceId);
+        const refreshed = await this.getProcessInstanceDetail(context.request.processInstanceId);
         const commentObserved = refreshed.normalized.operationRecords.some((record) => {
           const operation = asRecord(record);
           return text(operation?.type)?.toUpperCase() === "ADD_REMARK" &&
-            text(operation?.userId) === input.actorUserId &&
-            text(operation?.remark) === input.input.text;
+            text(operation?.userId) === context.actorUserId &&
+            text(operation?.remark) === context.request.text;
         });
-        postActionRefresh = { ok: true, commentObserved };
+        const status = refreshed.normalized.status?.toUpperCase();
+        postActionRefresh = {
+          ok: true,
+          commentObserved,
+          ...(status === undefined ? {} : { status }),
+        };
       } catch {
         // The comment has already succeeded. A failed or eventually-consistent refresh
         // must not turn it into a retryable mutation error that duplicates the comment.
       }
       const result: ApprovalRequestEnvelope = {
-        processInstanceId: input.input.processInstanceId,
+        processInstanceId: context.request.processInstanceId,
         action: "comment",
-        template: input.template,
-        currentStatus: "COMMENTED",
-        auditCorrelationId: input.auditCorrelationId,
-        safeNextActions: input.instanceStatus === "RUNNING" ? ["comment", "revoke"] : ["comment"],
+        template: context.template,
+        currentStatus: postActionRefresh.ok ? postActionRefresh.status ?? "UNKNOWN" : "UNKNOWN",
+        auditCorrelationId: context.auditCorrelationId,
+        safeNextActions: postActionRefresh.ok && postActionRefresh.status === "RUNNING"
+          ? ["comment", "revoke"]
+          : ["comment"],
         data: { dryRun: false, upstreamResult, postActionRefresh },
       };
       await this.#idempotencyLedger.put(ledgerKey, {
-        fingerprint: input.fingerprint,
+        fingerprint: context.fingerprint,
         status: "succeeded",
         result,
         updatedAt: new Date().toISOString(),
       });
       return result;
     } catch (error) {
+      if (isKnownPreWriteRejection(error)) {
+        await this.#idempotencyLedger.delete(ledgerKey);
+        throw error;
+      }
       try {
         await this.#idempotencyLedger.put(ledgerKey, {
-          fingerprint: input.fingerprint,
+          fingerprint: context.fingerprint,
           status: "uncertain",
           updatedAt: new Date().toISOString(),
         });
@@ -1783,6 +1812,7 @@ function isKnownPreWriteRejection(error: unknown): boolean {
 
 const PRE_WRITE_REJECTION_CODES = new Set<ApprovalMcpErrorCode>([
   "APPROVAL_COMMENT_FORBIDDEN",
+  "APPROVAL_COMMENT_REJECTED",
   "CALLER_IDENTITY_MISMATCH",
   "CALLER_IDENTITY_NOT_CONFIGURED",
   "CONFIRMATION_REQUIRED",
