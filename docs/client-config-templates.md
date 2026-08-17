@@ -66,11 +66,12 @@ codex mcp login mwe_approval_mcp
 
 1. 确认 metadata 两个 URL 返回 200。
 2. 添加客户端配置并触发连接。
-3. 若客户端请求 `approval:decide`，先在本站权限页核对客户端名称与决定权限并明确同意；只读 scope 不显示该页。
-4. 浏览器跳转到 `login.dingtalk.com`，使用公司当前账号授权。
-5. 确认回调最终回到客户端 loopback URI，而不是停留在本站 callback。
-6. `tools/list` 应只显示 `approval_task`。
-7. 先用一个该用户确实参与的实例测试：
+3. 初次连接可能只申请 `approval:read`；首次调用发起审批、同意或拒绝动作时，服务端通过 HTTP 403 `insufficient_scope` 分别要求 `approval:create` 或 `approval:decide`，客户端应自动发起增量授权。
+4. 在本站权限页核对客户端名称和新增写权限后明确同意。WorkBuddy 自动打开授权页后不要同时点击手动授权按钮；当前客户端的并行 OAuth 流程会互相覆盖本地 `clientInformation` 与 `pendingOAuth` 状态。
+5. 浏览器跳转到 `login.dingtalk.com`，使用公司当前账号授权。
+6. 确认回调最终回到客户端 loopback URI，而不是停留在本站 callback。
+7. `tools/list` 应只显示 `approval_task` 与 `approval_request`。
+8. 先用一个该用户确实参与的实例测试：
 
    ```json
    {
@@ -79,8 +80,8 @@ codex mcp login mwe_approval_mcp
    }
    ```
 
-8. 使用详情返回的 `fileId` 测试 `attachmentAction=download`；Agent 客户端负责下载和识别内容。
-9. 写操作先使用 `dryRun=true`；确认任务仍属于当前 OAuth 用户后，再由用户明确授权 `confirm=true`。
+9. 使用详情返回的 `fileId` 测试 `attachmentAction=download`；Agent 客户端负责下载和识别内容。
+10. 写操作先使用 `dryRun=true`；确认任务仍属于当前 OAuth 用户后，再由用户明确授权 `confirm=true`。
 
 ## 预期失败含义
 
@@ -91,6 +92,7 @@ codex mcp login mwe_approval_mcp
 |`invalid_scope`|客户端请求了未开放 scope 或只请求 `approval:decide`|
 |钉钉登录后 `access_denied`|corpId 不匹配、身份接口失败或 unionId 无法映射企业 userId|
 |`APPROVAL_VIEW_FORBIDDEN`|登录用户不是该审批的可验证参与人|
-|`INSUFFICIENT_SCOPE`|token 没有相应读取/决定 scope|
+|HTTP `403` 且 `error="insufficient_scope"`|token 缺少当前动作的 scope；兼容客户端应发起增量授权|
+|工具结果 `INSUFFICIENT_SCOPE`|客户端未处理 HTTP scope challenge，或请求未经过标准 Streamable HTTP 入口|
 
 真实客户端测试时请保留：客户端版本、触发时间、HTTP 状态、OAuth 标准错误码。不要复制 token、授权码、PKCE verifier 或带签名的附件 URL。

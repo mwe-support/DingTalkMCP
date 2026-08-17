@@ -85,6 +85,66 @@ describe("self-hosted Streamable HTTP transport", () => {
     });
   });
 
+  it("challenges approval_request calls for the incremental create scope", async () => {
+    const { baseUrl, accessToken, auditEvents } = await fixture();
+
+    const response = await mcpRequest(
+      baseUrl,
+      {
+        jsonrpc: "2.0",
+        id: 4,
+        method: "tools/call",
+        params: {
+          name: "approval_request",
+          arguments: { action: "prepare", template: "expense_reimbursement" },
+        },
+      },
+      accessToken,
+    );
+
+    expect(response.status).toBe(403);
+    expect(response.headers.get("www-authenticate")).toContain('error="insufficient_scope"');
+    expect(response.headers.get("www-authenticate")).toContain('scope="approval:read approval:create"');
+    expect(response.headers.get("www-authenticate")).toContain(
+      'resource_metadata="https://dingtalk.mwexk.com/.well-known/oauth-protected-resource/mcp"',
+    );
+    expect(auditEvents).toEqual([
+      expect.objectContaining({ phase: "started", toolName: "approval_request", action: "prepare" }),
+      expect.objectContaining({
+        phase: "completed",
+        toolName: "approval_request",
+        action: "prepare",
+        outcome: "rejected",
+        httpStatus: 403,
+        errorCode: "INSUFFICIENT_SCOPE",
+      }),
+    ]);
+  });
+
+  it("challenges approval decisions for the incremental decide scope", async () => {
+    const { baseUrl, readOnlyAccessToken } = await fixture();
+
+    for (const action of ["approve", "reject"]) {
+      const response = await mcpRequest(
+        baseUrl,
+        {
+          jsonrpc: "2.0",
+          id: 5,
+          method: "tools/call",
+          params: {
+            name: "approval_task",
+            arguments: { action, processInstanceId: "pi-oauth-1", confirm: true },
+          },
+        },
+        readOnlyAccessToken,
+      );
+
+      expect(response.status).toBe(403);
+      expect(response.headers.get("www-authenticate")).toContain('error="insufficient_scope"');
+      expect(response.headers.get("www-authenticate")).toContain('scope="approval:read approval:decide"');
+    }
+  });
+
   it("does not expose the retired DingTalk platform route", async () => {
     const { baseUrl, accessToken } = await fixture();
     const response = await fetch(new URL("/platform/tools/approval_task", baseUrl), {
@@ -142,7 +202,9 @@ describe("self-hosted Streamable HTTP transport", () => {
 async function fixture(): Promise<{
   baseUrl: URL;
   accessToken: string;
+  readOnlyAccessToken: string;
   request: ReturnType<typeof vi.fn>;
+  auditEvents: Array<Record<string, unknown>>;
 }> {
   const { privateKey } = generateKeyPairSync("ed25519");
   const codec = await JoseMcpTokenCodec.create({
@@ -179,6 +241,16 @@ async function fixture(): Promise<{
     clientId: "real-client-test",
     scopes: ["approval:read", "approval:decide"],
   });
+  const readOnlyAccessToken = await codec.issue({
+    principal: {
+      subject: "union-1",
+      tenantId: "corp-1",
+      userId: "user-1",
+      authenticatedAt: Math.floor(Date.now() / 1000),
+    },
+    clientId: "read-only-client-test",
+    scopes: ["approval:read"],
+  });
   const request = vi.fn().mockResolvedValue({
     result: {
       processInstanceId: "pi-oauth-1",
@@ -189,6 +261,7 @@ async function fixture(): Promise<{
       formComponentValues: [],
     },
   });
+  const auditEvents: Array<Record<string, unknown>> = [];
   const server = await startApprovalHttpServer(
     new ApprovalService({ api: { request } as unknown as Pick<DingTalkApiClient, "request"> }),
     {
@@ -197,11 +270,18 @@ async function fixture(): Promise<{
       allowedHosts: [],
       allowedOrigins: ["https://dingtalk.mwexk.com"],
       auth,
+      toolAudit: { record: (event) => void auditEvents.push(event as unknown as Record<string, unknown>) },
     },
   );
   running.push(server);
   const address = server.httpServer.address() as AddressInfo;
-  return { baseUrl: new URL(`http://127.0.0.1:${address.port}`), accessToken, request };
+  return {
+    baseUrl: new URL(`http://127.0.0.1:${address.port}`),
+    accessToken,
+    readOnlyAccessToken,
+    request,
+    auditEvents,
+  };
 }
 
 function initializeRequest(): Record<string, unknown> {

@@ -1,16 +1,24 @@
+import { randomUUID } from "node:crypto";
 import type { Server } from "node:http";
 
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import type { NextFunction, Request, Response } from "express";
+import type { NextFunction, Request, RequestHandler, Response } from "express";
 
 import type { ApprovalService } from "../approval/service.js";
 import type { McpAuthorizationModule } from "../auth/mcp-authorization.js";
 import type { AuditPseudonymizer } from "../auth/security-audit.js";
+import type { McpScope } from "../auth/types.js";
 import { createApprovalMcpServer } from "../mcp/create-server.js";
-import type { AuditInvocationContext, ToolInvocationAuditSink } from "../core/audit-log.js";
+import {
+  DEFAULT_AUDIT_WRITE_TIMEOUT_MS,
+  runAuditWriteWithinTimeout,
+  type AuditInvocationContext,
+  type ToolInvocationAuditEventBase,
+  type ToolInvocationAuditSink,
+} from "../core/audit-log.js";
 
 export interface ApprovalHttpOptions {
   host: string;
@@ -47,13 +55,14 @@ export async function startApprovalHttpServer(
     response.json({ status: "ok", service: "mwe-dingtalk-approval-mcp", transport: "streamable-http" });
   });
 
-  const requireMcpAccess = options.auth.requireAccess(["approval:read"]);
+  const requireReadAccess = options.auth.requireAccess(["approval:read"]);
+  const requireActionAccess = actionAwareMcpAccess(options);
   const requireTrustedOrigin = trustedOriginMiddleware(options.allowedOrigins);
-  app.post("/mcp", requireTrustedOrigin, requireMcpAccess, async (request, response) => {
+  app.post("/mcp", requireTrustedOrigin, requireReadAccess, requireActionAccess, async (request, response) => {
     await handleMcpRequest(service, options, request, response);
   });
-  app.get("/mcp", requireMcpAccess, methodNotAllowed);
-  app.delete("/mcp", requireMcpAccess, methodNotAllowed);
+  app.get("/mcp", requireReadAccess, methodNotAllowed);
+  app.delete("/mcp", requireReadAccess, methodNotAllowed);
 
   const httpServer = app.listen(options.port, options.host);
   await new Promise<void>((resolve, reject) => {
@@ -68,6 +77,147 @@ export async function startApprovalHttpServer(
         httpServer.close((error) => error === undefined ? resolve() : reject(error));
       }),
   };
+}
+
+function actionAwareMcpAccess(options: ApprovalHttpOptions): RequestHandler {
+  return async (request, response, next) => {
+    const inspection = inspectRequestScopes(request.body);
+    const authInfo = (request as Request & { auth?: AuthInfo }).auth;
+    if (authInfo === undefined) {
+      response.status(401).json({ error: "invalid_token" });
+      return;
+    }
+    const principal = options.auth.principal(authInfo);
+    const missingScopes = inspection.requiredScopes.filter((scope) => !principal.scopes.includes(scope));
+    if (missingScopes.length === 0) {
+      next();
+      return;
+    }
+    const challengedInvocations = inspection.invocations.filter((invocation) =>
+      invocation.requiredScopes.some((scope) => missingScopes.includes(scope))
+    );
+    const auditStatus = await auditScopeRejections(options, principal.tenantId, principal.subject, challengedInvocations);
+    if (auditStatus === "unavailable") {
+      response.status(503).json({
+        jsonrpc: "2.0",
+        error: { code: -32603, message: "Structured audit logging is unavailable." },
+        id: jsonRpcId(request.body),
+      });
+      return;
+    }
+    if (auditStatus === "partial") response.setHeader("x-mcp-audit-status", "partial");
+    options.auth.requireAccess(inspection.requiredScopes)(request, response, next);
+  };
+}
+
+interface ScopeChallengedInvocation {
+  toolName: "approval_task" | "approval_request";
+  action?: "view" | "approve" | "reject" | "prepare" | "submit" | "revoke";
+  requiredScopes: McpScope[];
+}
+
+function inspectRequestScopes(body: unknown): {
+  requiredScopes: McpScope[];
+  invocations: ScopeChallengedInvocation[];
+} {
+  const messages = Array.isArray(body) ? body : [body];
+  let requiresDecision = false;
+  let requiresCreation = false;
+  const invocations: ScopeChallengedInvocation[] = [];
+  for (const message of messages) {
+    if (!isRecord(message) || message.method !== "tools/call" || !isRecord(message.params)) continue;
+    const rawArguments = isRecord(message.params.arguments) ? message.params.arguments : undefined;
+    const action = boundedAction(rawArguments?.action);
+    if (message.params.name === "approval_request") {
+      requiresCreation = true;
+      invocations.push({
+        toolName: "approval_request",
+        ...(action === undefined ? {} : { action }),
+        requiredScopes: ["approval:read", "approval:create"],
+      });
+      continue;
+    }
+    if (message.params.name !== "approval_task" || (action !== "approve" && action !== "reject")) continue;
+    requiresDecision = true;
+    invocations.push({
+      toolName: "approval_task",
+      action,
+      requiredScopes: ["approval:read", "approval:decide"],
+    });
+  }
+  return {
+    requiredScopes: [
+      "approval:read",
+      ...(requiresDecision ? ["approval:decide" as const] : []),
+      ...(requiresCreation ? ["approval:create" as const] : []),
+    ],
+    invocations,
+  };
+}
+
+async function auditScopeRejections(
+  options: ApprovalHttpOptions,
+  tenantId: string,
+  subject: string,
+  invocations: ScopeChallengedInvocation[],
+): Promise<"complete" | "partial" | "unavailable"> {
+  if (options.toolAudit === undefined || invocations.length === 0) return "complete";
+  const subjectHash = options.auditPseudonymizer?.subject(tenantId, subject);
+  let partial = false;
+  for (const invocation of invocations) {
+    const startedAt = performance.now();
+    const base: ToolInvocationAuditEventBase = {
+      timestamp: new Date().toISOString(),
+      invocationId: randomUUID(),
+      transport: "streamable_http",
+      toolName: invocation.toolName,
+      ...(subjectHash === undefined ? {} : { subjectHash }),
+      ...(invocation.action === undefined ? {} : { action: invocation.action }),
+    };
+    try {
+      await runAuditWriteWithinTimeout(
+        () => options.toolAudit?.record({ ...base, phase: "started" }),
+        DEFAULT_AUDIT_WRITE_TIMEOUT_MS,
+      );
+    } catch {
+      return "unavailable";
+    }
+    try {
+      await runAuditWriteWithinTimeout(
+        () => options.toolAudit?.record({
+          ...base,
+          timestamp: new Date().toISOString(),
+          phase: "completed",
+          outcome: "rejected",
+          httpStatus: 403,
+          durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
+          auditStatus: "complete",
+          errorCode: "INSUFFICIENT_SCOPE",
+        }),
+        DEFAULT_AUDIT_WRITE_TIMEOUT_MS,
+      );
+    } catch {
+      partial = true;
+    }
+  }
+  return partial ? "partial" : "complete";
+}
+
+function boundedAction(value: unknown): ScopeChallengedInvocation["action"] {
+  return value === "view" || value === "approve" || value === "reject" || value === "prepare" ||
+    value === "submit" || value === "revoke"
+    ? value
+    : undefined;
+}
+
+function jsonRpcId(body: unknown): unknown {
+  return isRecord(body) && (typeof body.id === "string" || typeof body.id === "number" || body.id === null)
+    ? body.id
+    : null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 async function handleMcpRequest(
