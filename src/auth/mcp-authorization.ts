@@ -8,6 +8,7 @@ import {
   InsufficientScopeError,
   InvalidClientMetadataError,
   InvalidGrantError,
+  InvalidTokenError,
   InvalidRequestError,
   InvalidScopeError,
   InvalidTargetError,
@@ -637,8 +638,12 @@ class DingTalkBackedOAuthProvider implements OAuthServerProvider {
     }
   }
 
-  verifyAccessToken(token: string): Promise<AuthInfo> {
-    return this.#options.tokenCodec.verifyAccessToken(token);
+  async verifyAccessToken(token: string): Promise<AuthInfo> {
+    try {
+      return await this.#options.tokenCodec.verifyAccessToken(token);
+    } catch {
+      throw new InvalidTokenError("Access token is invalid or expired.");
+    }
   }
 
   async revokeToken(_client: OAuthClientInformationFull, request: OAuthTokenRevocationRequest): Promise<void> {

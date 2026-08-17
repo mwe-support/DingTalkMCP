@@ -41,6 +41,24 @@ describe("createMcpAuthorization", () => {
     });
   });
 
+  it("returns an OAuth 401 challenge for an invalid or expired access token", async () => {
+    const { baseUrl } = await fixture();
+
+    const response = await fetch(new URL("/whoami", baseUrl), {
+      headers: { authorization: "Bearer expired-or-invalid-token" },
+    });
+
+    expect(response.status).toBe(401);
+    expect(response.headers.get("www-authenticate")).toContain('error="invalid_token"');
+    expect(response.headers.get("www-authenticate")).toContain(
+      'resource_metadata="https://dingtalk.mwexk.com/.well-known/oauth-protected-resource/mcp"',
+    );
+    await expect(response.json()).resolves.toMatchObject({
+      error: "invalid_token",
+      error_description: "Access token is invalid or expired.",
+    });
+  });
+
   it("completes DingTalk-backed OAuth with PKCE and protects a resource-bound route", async () => {
     const { baseUrl, securityEvents, store } = await fixture();
     const touchClient = vi.spyOn(store, "touchClient");
