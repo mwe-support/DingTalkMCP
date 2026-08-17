@@ -6,6 +6,7 @@ export const APPROVAL_TOOL_ACTIONS = [
   "submit",
   "comment",
   "revoke",
+  "list_pending",
 ] as const;
 
 export type ApprovalToolAction = (typeof APPROVAL_TOOL_ACTIONS)[number];

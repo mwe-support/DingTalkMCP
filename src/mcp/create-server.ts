@@ -558,7 +558,7 @@ async function auditedPublicToolCall(
   if (options.toolAudit === undefined) return safely(operation);
   const invocationId = randomUUID();
   const startedAt = performance.now();
-  const action = approvalToolAction(rawArguments?.action);
+  const action = requestedToolName === "approval_inbox" ? "list_pending" : approvalToolAction(rawArguments?.action);
   const publishedTool = requestedToolName === "approval_inbox" || requestedToolName === "approval_task" || requestedToolName === "approval_request";
   const base: ToolInvocationAuditEventBase = {
     timestamp: new Date().toISOString(),

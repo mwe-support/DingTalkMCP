@@ -13,8 +13,8 @@ export interface PendingApprovalEvent {
   eventId: string;
   corpId: string;
   processInstanceId: string;
-  processCode?: string;
-  taskId: string;
+  processCode: string;
+  taskId?: string;
   staffId: string;
   title?: string;
   type: PendingApprovalEventType;
@@ -25,8 +25,8 @@ export interface PendingApprovalEvent {
 
 export interface PendingApprovalItem {
   processInstanceId: string;
-  processCode?: string;
-  taskId: string;
+  processCode: string;
+  taskId?: string;
   userId: string;
   title?: string;
   createdAt: number;
@@ -47,7 +47,6 @@ export interface PendingApprovalPage {
 export interface PendingApprovalIndex {
   apply(event: PendingApprovalEvent): Promise<void>;
   list(input: { userId: string; page: number; limit: number }): Promise<PendingApprovalPage>;
-  remove(input: { userId: string; processInstanceId: string; taskId: string }): Promise<void>;
 }
 
 interface PendingApprovalState {
@@ -84,8 +83,8 @@ export class DirectoryPendingApprovalIndex implements PendingApprovalIndex {
       if (event.type === "start") {
         state.items[key] = {
           processInstanceId: event.processInstanceId,
-          ...(event.processCode === undefined ? {} : { processCode: event.processCode }),
-          taskId: event.taskId,
+          processCode: event.processCode,
+          ...(event.taskId === undefined ? {} : { taskId: event.taskId }),
           userId: event.staffId,
           ...(event.title === undefined ? {} : { title: event.title }),
           createdAt: event.createTime ?? event.eventTime,
@@ -93,7 +92,15 @@ export class DirectoryPendingApprovalIndex implements PendingApprovalIndex {
         };
         return;
       }
-      delete state.items[key];
+      if (event.taskId !== undefined) {
+        delete state.items[key];
+        return;
+      }
+      for (const [candidateKey, item] of Object.entries(state.items)) {
+        if (item.userId === event.staffId && item.processInstanceId === event.processInstanceId) {
+          delete state.items[candidateKey];
+        }
+      }
     });
   }
 
@@ -115,12 +122,6 @@ export class DirectoryPendingApprovalIndex implements PendingApprovalIndex {
         items,
         hasMore: offset + items.length < matching.length,
       };
-    });
-  }
-
-  remove(input: { userId: string; processInstanceId: string; taskId: string }): Promise<void> {
-    return this.#update((state) => {
-      delete state.items[itemKey(input.userId, input.processInstanceId, input.taskId)];
     });
   }
 
@@ -164,11 +165,12 @@ function assertEvent(event: PendingApprovalEvent): void {
     eventId: event.eventId,
     corpId: event.corpId,
     processInstanceId: event.processInstanceId,
-    taskId: event.taskId,
+    processCode: event.processCode,
     staffId: event.staffId,
   })) {
     if (typeof value !== "string" || value.trim() === "") throw new Error(`Invalid pending approval event ${name}.`);
   }
+  if (event.taskId !== undefined && event.taskId.trim() === "") throw new Error("Invalid pending approval event taskId.");
   if (!Number.isSafeInteger(event.eventTime) || event.eventTime <= 0) throw new Error("Invalid pending approval event time.");
 }
 
@@ -178,8 +180,8 @@ function assertPage(input: { userId: string; page: number; limit: number }): voi
   if (!Number.isInteger(input.limit) || input.limit < 1 || input.limit > 20) throw new Error("Pending approval limit must be between 1 and 20.");
 }
 
-function itemKey(userId: string, processInstanceId: string, taskId: string): string {
-  return createHash("sha256").update(`${userId}\0${processInstanceId}\0${taskId}`, "utf8").digest("hex");
+function itemKey(userId: string, processInstanceId: string, taskId: string | undefined): string {
+  return createHash("sha256").update(`${userId}\0${processInstanceId}\0${taskId ?? ""}`, "utf8").digest("hex");
 }
 
 function prune(state: PendingApprovalState, now: number): void {

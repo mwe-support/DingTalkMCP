@@ -77,6 +77,7 @@ describe("pending approval event index", () => {
       eventId: "event-start-restart",
       corpId: "corp-1",
       processInstanceId: "pi-restart",
+      processCode: "PROC-RESTART",
       taskId: "202",
       staffId: "user-1",
       type: "start" as const,
@@ -136,8 +137,41 @@ describe("DingTalk task-change event adapter", () => {
     });
   });
 
+  it("retains an instance-only event when DingTalk omits taskId", () => {
+    const event = parseTaskChangeEvent({
+      specVersion: "1.0",
+      type: "EVENT",
+      headers: {
+        appId: "app-1",
+        connectionId: "connection-1",
+        contentType: "application/json",
+        messageId: "message-without-task",
+        time: "1800000000000",
+        topic: "bpms_task_change",
+        eventType: "bpms_task_change",
+        eventCorpId: "corp-1",
+      },
+      data: JSON.stringify({
+        EventType: "bpms_task_change",
+        CorpId: "corp-1",
+        processInstanceId: "pi-without-task",
+        processCode: "PROC-WITHOUT-TASK",
+        staffId: "user-1",
+        type: "start",
+        EventTime: 1_800_000_000_000,
+      }),
+    }, "corp-1");
+
+    expect(event).toMatchObject({
+      processInstanceId: "pi-without-task",
+      processCode: "PROC-WITHOUT-TASK",
+      staffId: "user-1",
+    });
+    expect(event).not.toHaveProperty("taskId");
+  });
+
   it("acknowledges an event only after the pending index accepts it", async () => {
-    let listener: ((message: Parameters<typeof parseTaskChangeEvent>[0]) => { status: string } | Promise<{ status: string }>) | undefined;
+    let listener: ((message: Parameters<typeof parseTaskChangeEvent>[0]) => { status: string }) | undefined;
     const client: DingTalkEventClient = {
       registerAllEventListener: (value) => {
         listener = value;
@@ -151,11 +185,11 @@ describe("DingTalk task-change event adapter", () => {
       clientId: "client-1",
       clientSecret: "secret-1",
       corpId: "corp-1",
-      index: { apply, list: vi.fn(), remove: vi.fn() },
+      index: { apply, list: vi.fn() },
       clientFactory: () => client,
     });
 
-    const result = await listener?.({
+    const message = {
       specVersion: "1.0",
       type: "EVENT",
       headers: {
@@ -172,14 +206,21 @@ describe("DingTalk task-change event adapter", () => {
         EventType: "bpms_task_change",
         CorpId: "corp-1",
         processInstanceId: "pi-stream-2",
+        processCode: "PROC-2",
         taskId: 505,
         staffId: "user-1",
         type: "start",
         EventTime: 1_800_000_000_000,
       }),
-    });
+    };
 
-    expect(result).toEqual({ status: "SUCCESS" });
+    const firstResult = listener?.(message);
+
+    expect(firstResult).toEqual({ status: "LATER" });
+    expect(firstResult).not.toBeInstanceOf(Promise);
+    await vi.waitFor(() => expect(apply).toHaveBeenCalledTimes(1));
+    await Promise.resolve();
+    expect(listener?.(message)).toEqual({ status: "SUCCESS" });
     expect(apply).toHaveBeenCalledWith(expect.objectContaining({
       processInstanceId: "pi-stream-2",
       taskId: "505",
@@ -292,13 +333,14 @@ describe("approval_inbox public MCP contract", () => {
     expect(request).not.toHaveBeenCalled();
   });
 
-  it("removes an event-index entry that no longer belongs to an active caller task", async () => {
+  it("filters a stale entry without shifting the offset-based event page", async () => {
     const root = await mkdtemp(join(tmpdir(), "approval-inbox-stale-"));
     const index = new DirectoryPendingApprovalIndex(root, { now: () => 1_800_000_000_000 });
     await index.apply({
       eventId: "event-stale-1",
       corpId: "corp-1",
       processInstanceId: "pi-stale-1",
+      processCode: "PROC-STALE",
       taskId: "606",
       staffId: "user-1",
       type: "start",
@@ -327,8 +369,149 @@ describe("approval_inbox public MCP contract", () => {
     const result = await client.callTool({ name: "approval_inbox", arguments: { limit: 20 } });
 
     expect(result.structuredContent).toMatchObject({
-      result: { data: { items: [], staleRemoved: 1, verificationFailures: 0 } },
+      result: { data: { items: [], staleDetected: 1, verificationFailures: 0 } },
     });
-    await expect(index.list({ userId: "user-1", page: 1, limit: 20 })).resolves.toMatchObject({ items: [] });
+    await expect(index.list({ userId: "user-1", page: 1, limit: 20 })).resolves.toMatchObject({
+      items: [{ processInstanceId: "pi-stale-1", taskId: "606" }],
+    });
+  });
+
+  it("does not skip a valid second page after the first candidate is stale", async () => {
+    const root = await mkdtemp(join(tmpdir(), "approval-inbox-stable-page-"));
+    const index = new DirectoryPendingApprovalIndex(root, { now: () => 1_800_000_000_000 });
+    await index.apply({
+      eventId: "event-valid-second",
+      corpId: "corp-1",
+      processInstanceId: "pi-valid-second",
+      processCode: "PROC-PAGE",
+      taskId: "802",
+      staffId: "user-1",
+      type: "start",
+      eventTime: 1_799_999_999_000,
+      createTime: 1_799_999_999_000,
+    });
+    await index.apply({
+      eventId: "event-stale-first",
+      corpId: "corp-1",
+      processInstanceId: "pi-stale-first",
+      processCode: "PROC-PAGE",
+      taskId: "801",
+      staffId: "user-1",
+      type: "start",
+      eventTime: 1_800_000_000_000,
+      createTime: 1_800_000_000_000,
+    });
+    const request = vi.fn().mockImplementation(({ query }: { query: { processInstanceId: string } }) =>
+      Promise.resolve(query.processInstanceId === "pi-stale-first"
+        ? {
+            result: {
+              processInstanceId: "pi-stale-first",
+              status: "COMPLETED",
+              tasks: [{ taskId: "801", userId: "user-1", status: "COMPLETED" }],
+            },
+          }
+        : {
+            result: {
+              processInstanceId: "pi-valid-second",
+              processCode: "PROC-PAGE",
+              status: "RUNNING",
+              tasks: [{ taskId: "802", userId: "user-1", status: "RUNNING" }],
+            },
+          }));
+    const service = new ApprovalService({
+      api: { request } as unknown as Pick<DingTalkApiClient, "request">,
+      callerUserId: "user-1",
+      callerScopes: ["approval:read"],
+      pendingIndex: index,
+    });
+    const server = createApprovalMcpServer(service);
+    const client = new Client({ name: "approval-inbox-stable-page-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    closeables.push(client, server);
+
+    const first = await client.callTool({ name: "approval_inbox", arguments: { page: 1, limit: 1 } });
+    const second = await client.callTool({ name: "approval_inbox", arguments: { page: 2, limit: 1 } });
+
+    expect(first.structuredContent).toMatchObject({
+      result: { data: { items: [], staleDetected: 1, hasMore: true } },
+    });
+    expect(second.structuredContent).toMatchObject({
+      result: { data: { items: [{ processInstanceId: "pi-valid-second", taskId: "802" }] } },
+    });
+  });
+
+  it("returns an instance-only item when the source event had no taskId", async () => {
+    const root = await mkdtemp(join(tmpdir(), "approval-inbox-no-task-"));
+    const index = new DirectoryPendingApprovalIndex(root, { now: () => 1_800_000_000_000 });
+    await index.apply({
+      eventId: "event-no-task-1",
+      corpId: "corp-1",
+      processInstanceId: "pi-no-task-1",
+      processCode: "PROC-NO-TASK",
+      staffId: "user-1",
+      type: "start",
+      eventTime: 1_800_000_000_000,
+    });
+    const request = vi.fn().mockResolvedValue({
+      result: {
+        processInstanceId: "pi-no-task-1",
+        processCode: "PROC-NO-TASK",
+        status: "RUNNING",
+        tasks: [{ taskId: "707", userId: "user-1", status: "RUNNING" }],
+      },
+    });
+    const service = new ApprovalService({
+      api: { request } as unknown as Pick<DingTalkApiClient, "request">,
+      callerUserId: "user-1",
+      callerScopes: ["approval:read"],
+      pendingIndex: index,
+    });
+    const server = createApprovalMcpServer(service);
+    const client = new Client({ name: "approval-inbox-no-task-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    closeables.push(client, server);
+
+    const result = await client.callTool({ name: "approval_inbox", arguments: { limit: 1 } });
+    const structured = result.structuredContent as {
+      result?: { data?: { items?: Array<Record<string, unknown>> } };
+    };
+    expect(structured.result?.data?.items).toEqual([
+      expect.objectContaining({
+        processInstanceId: "pi-no-task-1",
+        processCode: "PROC-NO-TASK",
+        taskIdUnavailable: true,
+      }),
+    ]);
+    expect(structured.result?.data?.items?.[0]).not.toHaveProperty("taskId");
+  });
+
+  it("records list_pending as the bounded audit action", async () => {
+    const root = await mkdtemp(join(tmpdir(), "approval-inbox-audit-"));
+    const events: Array<Record<string, unknown>> = [];
+    const service = new ApprovalService({
+      api: { request: vi.fn() } as unknown as Pick<DingTalkApiClient, "request">,
+      callerUserId: "user-1",
+      callerScopes: ["approval:read"],
+      pendingIndex: new DirectoryPendingApprovalIndex(root, { now: () => 1_800_000_000_000 }),
+    });
+    const server = createApprovalMcpServer(service, {
+      toolAudit: { record: (event) => void events.push(event as unknown as Record<string, unknown>) },
+    });
+    const client = new Client({ name: "approval-inbox-audit-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    closeables.push(client, server);
+
+    await client.callTool({ name: "approval_inbox", arguments: {} });
+
+    expect(events).toEqual([
+      expect.objectContaining({ phase: "started", toolName: "approval_inbox", action: "list_pending" }),
+      expect.objectContaining({ phase: "completed", toolName: "approval_inbox", action: "list_pending" }),
+    ]);
   });
 });

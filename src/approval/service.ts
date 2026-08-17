@@ -410,43 +410,40 @@ export class ApprovalService {
     });
     const items: Array<{
       processInstanceId: string;
-      taskId: string;
-      processCode?: string;
+      taskId?: string;
+      taskIdUnavailable?: true;
+      processCode: string;
       title?: string;
       currentStatus: string;
       taskStatus: string;
       createdAt: number;
       updatedAt: number;
     }> = [];
-    let staleRemoved = 0;
+    let staleDetected = 0;
     let verificationFailures = 0;
     for (const candidate of page.items) {
       try {
         const detail = await this.getProcessInstanceDetail(candidate.processInstanceId);
-        const activeTask = detail.normalized.tasks
+        const activeTasks = detail.normalized.tasks
           .map(asRecord)
-          .find((task) => {
+          .filter((task) => {
             const taskStatus = text(task?.status)?.toUpperCase();
-            return text(task?.taskId) === candidate.taskId &&
+            return (candidate.taskId === undefined || text(task?.taskId) === candidate.taskId) &&
               text(task?.userId ?? task?.actionerUserId) === callerUserId &&
               taskStatus !== undefined &&
               ACTIVE_TASK_STATUSES.has(taskStatus);
           });
-        if (activeTask === undefined) {
-          staleRemoved++;
-          await this.#pendingIndex.remove({
-            userId: callerUserId,
-            processInstanceId: candidate.processInstanceId,
-            taskId: candidate.taskId,
-          });
+        if (activeTasks.length === 0) {
+          staleDetected++;
           continue;
         }
+        const activeTask = activeTasks[0] as Record<string, unknown>;
         items.push({
           processInstanceId: candidate.processInstanceId,
-          taskId: candidate.taskId,
-          ...(detail.normalized.processCode ?? candidate.processCode) === undefined
-            ? {}
-            : { processCode: detail.normalized.processCode ?? candidate.processCode },
+          ...(candidate.taskId === undefined
+            ? { taskIdUnavailable: true as const }
+            : { taskId: candidate.taskId }),
+          processCode: detail.normalized.processCode ?? candidate.processCode,
           ...(candidate.title === undefined ? {} : { title: candidate.title }),
           currentStatus: detail.normalized.status?.toUpperCase() ?? "UNKNOWN",
           taskStatus: text(activeTask.status)?.toUpperCase() ?? "UNKNOWN",
@@ -472,7 +469,7 @@ export class ApprovalService {
         limit: page.limit,
         hasMore: page.hasMore,
         items,
-        staleRemoved,
+        staleDetected,
         verificationFailures,
       },
     };

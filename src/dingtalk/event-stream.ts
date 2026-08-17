@@ -20,7 +20,7 @@ export interface DingTalkStreamEventEnvelope {
 
 export interface DingTalkEventClient {
   registerAllEventListener(
-    listener: (message: DingTalkStreamEventEnvelope, signal?: AbortSignal) => { status: string } | Promise<{ status: string }>,
+    listener: (message: DingTalkStreamEventEnvelope) => { status: string },
   ): DingTalkEventClient;
   connect(): Promise<void>;
   disconnect(): void;
@@ -59,11 +59,21 @@ export async function startDingTalkApprovalEventStream(
     maxPendingEventHandlers: 20,
     subscriptions: [{ type: "EVENT", topic: "*" }],
   });
-  client.registerAllEventListener(async (message) => {
+  const eventStates = new Map<string, { state: "pending" | "complete"; updatedAt: number }>();
+  client.registerAllEventListener((message) => {
     try {
       const event = parseTaskChangeEvent(message, options.corpId);
-      if (event !== undefined) await options.index.apply(event);
-      return { status: "SUCCESS" };
+      if (event === undefined) return { status: "SUCCESS" };
+      pruneEventStates(eventStates, Date.now());
+      const current = eventStates.get(event.eventId);
+      if (current?.state === "complete") return { status: "SUCCESS" };
+      if (current?.state === "pending") return { status: "LATER" };
+      eventStates.set(event.eventId, { state: "pending", updatedAt: Date.now() });
+      void Promise.resolve()
+        .then(() => options.index.apply(event))
+        .then(() => eventStates.set(event.eventId, { state: "complete", updatedAt: Date.now() }))
+        .catch(() => eventStates.delete(event.eventId));
+      return { status: "LATER" };
     } catch {
       return { status: "LATER" };
     }
@@ -88,7 +98,7 @@ export function parseTaskChangeEvent(
   }
   const eventTime = integerValue(payload.EventTime ?? payload.eventTime ?? message.headers.eventBornTime ?? message.headers.time);
   const processInstanceId = requiredString(payload.processInstanceId, "processInstanceId");
-  const taskId = requiredScalar(payload.taskId, "taskId");
+  const taskId = optionalScalar(payload.taskId);
   const staffId = requiredString(payload.staffId, "staffId");
   const eventId = stringValue(payload.eventId ?? message.headers.eventId ?? message.headers.messageId);
   if (eventId === undefined) throw new Error("DingTalk task-change event is missing eventId.");
@@ -96,15 +106,15 @@ export function parseTaskChangeEvent(
   if (result !== undefined && result !== "agree" && result !== "refuse" && result !== "redirect") {
     throw new Error("DingTalk task-change event has an unsupported result.");
   }
-  const processCode = stringValue(payload.processCode);
+  const processCode = requiredString(payload.processCode, "processCode");
   const title = stringValue(payload.title);
   const createTime = optionalInteger(payload.createTime);
   return {
     eventId,
     corpId,
     processInstanceId,
-    ...(processCode === undefined ? {} : { processCode }),
-    taskId,
+    processCode,
+    ...(taskId === undefined ? {} : { taskId }),
     staffId,
     ...(title === undefined ? {} : { title }),
     type: rawType,
@@ -128,9 +138,9 @@ function requiredString(value: unknown, name: string): string {
   return parsed;
 }
 
-function requiredScalar(value: unknown, name: string): string {
+function optionalScalar(value: unknown): string | undefined {
   if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return String(value);
-  return requiredString(value, name);
+  return stringValue(value);
 }
 
 function stringValue(value: unknown): string | undefined {
@@ -153,6 +163,35 @@ function optionalInteger(value: unknown): number | undefined {
 }
 
 async function defaultClientFactory(): Promise<(config: DingTalkEventClientConfig) => DingTalkEventClient> {
-  const { DWClient } = await import("dingtalk-stream");
-  return (config) => new DWClient(config) as unknown as DingTalkEventClient;
+  const { DWClient, EventAck } = await import("dingtalk-stream");
+  return (config) => {
+    const sdkClient = new DWClient(config);
+    let adapter: DingTalkEventClient;
+    adapter = {
+      registerAllEventListener: (listener) => {
+        sdkClient.registerAllEventListener((message) => {
+          const result = listener(message as DingTalkStreamEventEnvelope);
+          return { status: result.status === "SUCCESS" ? EventAck.SUCCESS : EventAck.LATER };
+        });
+        return adapter;
+      },
+      connect: () => sdkClient.connect(),
+      disconnect: () => sdkClient.disconnect(),
+    };
+    return adapter;
+  };
+}
+
+function pruneEventStates(
+  states: Map<string, { state: "pending" | "complete"; updatedAt: number }>,
+  now: number,
+): void {
+  for (const [eventId, value] of states) {
+    if (now - value.updatedAt > 5 * 60 * 1000) states.delete(eventId);
+  }
+  while (states.size > 10_000) {
+    const oldest = states.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    states.delete(oldest);
+  }
 }
