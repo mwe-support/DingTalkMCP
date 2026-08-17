@@ -14,6 +14,83 @@ afterEach(async () => {
 });
 
 describe("approval_request public MCP contract", () => {
+  it("auto-selects the authenticated applicant's only department when deptId is omitted", async () => {
+    const { client, getUserProfile, getDepartmentProfile } = await connectedApplicantClient();
+
+    const result = await client.callTool({
+      name: "approval_request",
+      arguments: {
+        action: "prepare",
+        template: "expense_reimbursement",
+        fields: expenseFields(),
+      },
+    });
+
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      result: {
+        action: "prepare",
+        data: { draft: { deptId: 42 } },
+      },
+    });
+    expect(getUserProfile).toHaveBeenCalledWith("user-1");
+    expect(getDepartmentProfile).toHaveBeenCalledWith(42);
+  });
+
+  it("canonicalizes WorkBuddy's stale root deptId for a single-department applicant", async () => {
+    const { client, getDepartmentProfile } = await connectedApplicantClient();
+
+    const result = await client.callTool({
+      name: "approval_request",
+      arguments: {
+        action: "prepare",
+        template: "expense_reimbursement",
+        deptId: 1,
+        fields: expenseFields(),
+      },
+    });
+
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      result: {
+        action: "prepare",
+        data: { draft: { deptId: 42 } },
+      },
+    });
+    expect(getDepartmentProfile).toHaveBeenCalledWith(42);
+    expect(getDepartmentProfile).not.toHaveBeenCalledWith(1);
+  });
+
+  it("returns real department choices when a multi-department applicant omits deptId", async () => {
+    const { client, getDepartmentProfile } = await connectedApplicantClient({
+      departmentIds: [42, 84],
+      departmentNames: { 42: "研发部", 84: "项目部" },
+    });
+
+    const result = await client.callTool({
+      name: "approval_request",
+      arguments: {
+        action: "prepare",
+        template: "expense_reimbursement",
+        fields: expenseFields(),
+      },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: "DEPARTMENT_SELECTION_REQUIRED",
+        details: {
+          departments: [
+            { deptId: 42, name: "研发部" },
+            { deptId: 84, name: "项目部" },
+          ],
+        },
+      },
+    });
+    expect(getDepartmentProfile).toHaveBeenCalledTimes(2);
+  });
+
   it("dry-runs an expense reimbursement with the server-derived applicant and department", async () => {
     const { client, request, getUserProfile, getDepartmentProfile } = await connectedApplicantClient();
 
@@ -613,6 +690,8 @@ async function connectedApplicantClient(options: {
   callerScopes?: Array<"approval:read" | "approval:decide" | "approval:create">;
   callerUserId?: string;
   applicantName?: string;
+  departmentIds?: number[];
+  departmentNames?: Record<number, string>;
   idempotencyLedger?: IdempotencyLedger;
 } = {}): Promise<{
   client: Client;
@@ -627,9 +706,11 @@ async function connectedApplicantClient(options: {
   const callerUserId = options.callerUserId ?? "user-1";
   const getUserProfile = vi.fn().mockResolvedValue({
     name: options.applicantName ?? "张三",
-    departmentIds: [42],
+    departmentIds: options.departmentIds ?? [42],
   });
-  const getDepartmentProfile = vi.fn().mockResolvedValue({ name: "研发部" });
+  const getDepartmentProfile = vi.fn().mockImplementation(async (deptId: number) => ({
+    name: options.departmentNames?.[deptId] ?? "研发部",
+  }));
   const api = { request, getUserProfile, getDepartmentProfile } as unknown as Pick<
     DingTalkApiClient,
     "request" | "getUserProfile" | "getDepartmentProfile"

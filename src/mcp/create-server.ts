@@ -112,7 +112,7 @@ const approvalRequestExpensePrepareSchema = z
   .object({
     action: z.literal("prepare"),
     template: z.literal("expense_reimbursement"),
-    deptId: z.number().int().positive(),
+    deptId: z.number().int().positive().optional(),
     fields: expenseReimbursementFieldsSchema,
     attachments: z.array(expenseAttachmentSchema).max(10).optional(),
     confirm: z.boolean().optional(),
@@ -123,7 +123,7 @@ const approvalRequestPaymentPrepareSchema = z
   .object({
     action: z.literal("prepare"),
     template: z.literal("payment_request"),
-    deptId: z.number().int().positive(),
+    deptId: z.number().int().positive().optional(),
     fields: paymentRequestFieldsSchema,
     attachments: z.array(paymentAttachmentSchema).max(10).optional(),
     confirm: z.boolean().optional(),
@@ -134,7 +134,7 @@ const approvalRequestExpenseSubmitSchema = z
   .object({
     action: z.literal("submit"),
     template: z.literal("expense_reimbursement"),
-    deptId: z.number().int().positive(),
+    deptId: z.number().int().positive().optional(),
     fields: expenseReimbursementFieldsSchema,
     uploads: z.array(expenseUploadSchema).max(10).optional(),
     confirm: z.boolean(),
@@ -146,7 +146,7 @@ const approvalRequestPaymentSubmitSchema = z
   .object({
     action: z.literal("submit"),
     template: z.literal("payment_request"),
-    deptId: z.number().int().positive(),
+    deptId: z.number().int().positive().optional(),
     fields: paymentRequestFieldsSchema,
     uploads: z.array(paymentUploadSchema).max(10).optional(),
     confirm: z.boolean(),
@@ -488,7 +488,7 @@ function createPublicApprovalMcpServer(
         name: "approval_request",
         title: "Prepare, submit, or revoke an approval request",
         description:
-          "One applicant-facing tool for the exact allowed templates: expense reimbursement and payment request. Overtime and all other templates are denied. It never accepts approver, CC, flow-node, processCode, or applicant identity overrides. Attachment bytes must be uploaded directly by the Agent client to the returned DingTalk upload URL; the MCP server never receives, parses, or OCRs file content.",
+          "One applicant-facing tool for the exact allowed templates: expense reimbursement and payment request. Overtime and all other templates are denied. The server derives the applicant and automatically selects the only authenticated department; pass optional deptId only when the returned department choices require disambiguation. It never accepts approver, CC, flow-node, processCode, or applicant identity overrides. Attachment bytes must be uploaded directly by the Agent client to the returned DingTalk upload URL; the MCP server never receives, parses, or OCRs file content.",
         inputSchema: { ...z.toJSONSchema(approvalRequestSchema), type: "object" },
         annotations: writeAnnotations,
       },

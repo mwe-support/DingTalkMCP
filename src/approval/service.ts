@@ -139,7 +139,7 @@ export type ApprovalRequestInput =
   | {
       action: "prepare";
       template: ApprovalRequestTemplate;
-      deptId: number;
+      deptId?: number | undefined;
       fields: unknown;
       attachments?: Array<{ field: ApprovalAttachmentField; fileName: string; fileSize: number }> | undefined;
       confirm?: boolean | undefined;
@@ -148,7 +148,7 @@ export type ApprovalRequestInput =
   | {
       action: "submit";
       template: ApprovalRequestTemplate;
-      deptId: number;
+      deptId?: number | undefined;
       fields: unknown;
       uploads?: Array<{
         field: ApprovalAttachmentField;
@@ -448,7 +448,7 @@ export class ApprovalService {
     const formComponentValues = buildApprovalFormComponentValues(input.template, fields, applicant);
     const draft = {
       processCode: contract.processCode,
-      deptId: input.deptId,
+      deptId: applicant.deptId,
       formComponentValues,
     };
     if (input.action === "prepare") {
@@ -515,7 +515,7 @@ export class ApprovalService {
       const fingerprintInput = {
         actorUserId,
         template: input.template,
-        deptId: input.deptId,
+        deptId: applicant.deptId,
         fields,
         uploads,
       };
@@ -542,7 +542,7 @@ export class ApprovalService {
           requestId: input.requestId,
           fingerprint,
           template: input.template,
-          deptId: input.deptId,
+          deptId: applicant.deptId,
           processCode: contract.processCode,
           originatorUserId: actorUserId,
           fields,
@@ -1079,7 +1079,8 @@ export class ApprovalService {
     return this.#callerUserId;
   }
 
-  async #resolveApplicantContext(deptId: number): Promise<{
+  async #resolveApplicantContext(deptId?: number): Promise<{
+    deptId: number;
     applicantName: string;
     departmentName: string;
   }> {
@@ -1091,14 +1092,31 @@ export class ApprovalService {
       );
     }
     const user = await this.#api.getUserProfile(callerUserId);
-    if (!user.departmentIds.includes(deptId)) {
+    const departmentIds = [...new Set(user.departmentIds)];
+    const resolvedDeptId = departmentIds.length === 1
+      ? departmentIds[0]
+      : deptId !== undefined && departmentIds.includes(deptId)
+        ? deptId
+        : undefined;
+    if (resolvedDeptId === undefined) {
+      const departments = await Promise.all(departmentIds.map(async (candidateDeptId) => {
+        const department = await this.#api.getDepartmentProfile?.(candidateDeptId);
+        if (department === undefined) {
+          throw new ApprovalMcpError(
+            "CONFIGURATION_ERROR",
+            "The DingTalk directory adapter required for approval requests is unavailable.",
+          );
+        }
+        return { deptId: candidateDeptId, name: department.name };
+      }));
       throw new ApprovalMcpError(
-        "INVALID_INPUT",
-        "The requested department does not belong to the authenticated DingTalk applicant.",
+        "DEPARTMENT_SELECTION_REQUIRED",
+        "The authenticated DingTalk applicant belongs to multiple departments; retry with one returned deptId.",
+        { details: { departments } },
       );
     }
-    const department = await this.#api.getDepartmentProfile(deptId);
-    return { applicantName: user.name, departmentName: department.name };
+    const department = await this.#api.getDepartmentProfile(resolvedDeptId);
+    return { deptId: resolvedDeptId, applicantName: user.name, departmentName: department.name };
   }
 
   async #prepareApprovalUploads(

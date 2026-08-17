@@ -2,7 +2,7 @@
 
 `MWE审批MCP` 是部署在 `https://dingtalk.mwexk.com/mcp` 的自托管钉钉 OA 审批 MCP Server。
 
-当前版本：`0.7.3`。
+当前版本：`0.7.4`。
 
 ## 当前架构
 
@@ -85,7 +85,6 @@ approval_request  # 申请人：准备附件、提交、撤销
 {
   "action": "submit",
   "template": "payment_request",
-  "deptId": 42,
   "fields": {
     "documentNumber": "FK-20260817-001",
     "payee": "收款单位",
@@ -103,6 +102,8 @@ approval_request  # 申请人：准备附件、提交、撤销
   "requestId": "稳定复用的UUID"
 }
 ```
+
+`deptId` 为可选部门提示，不是客户端提供的身份或权限依据。服务端始终查询 OAuth 申请人的实时通讯录：账号只属于一个部门时自动使用该部门，并规范化客户端遗留的根部门 `1`；账号属于多个部门且无法唯一确定时返回 `DEPARTMENT_SELECTION_REQUIRED` 及安全的部门 ID/名称候选，Agent 再用候选中的 `deptId` 重试。
 
 费用报销字段为 `date`、`reason`、`counterparty` 和至少一条 `items`；每条明细包含 `amount`、`category`（仅 `AI费用` 或 `其它`）、`expenseDepartment`、`remark`。
 

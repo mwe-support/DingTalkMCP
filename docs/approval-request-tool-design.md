@@ -14,7 +14,7 @@
 ## 安全边界
 
 - 申请人 `userId` 和 `unionId` 来自本站 OAuth 绑定身份；客户端不能覆盖。
-- `deptId` 必须属于该申请人的钉钉部门列表，部门显示名由服务端查询。
+- `deptId` 是可选的部门消歧提示，不是身份参数。服务端始终查询申请人的钉钉部门列表：单部门时自动选取并忽略客户端遗留的错误提示；多部门且未提供有效选择时返回 `DEPARTMENT_SELECTION_REQUIRED` 和部门 ID/名称候选。
 - 不接受审批人、抄送人、流程节点或申请人参数，完全沿用 OA 后台流程。
 - 每次 `prepare`/`submit` 前读取线上模板 Schema，精确核对模板类型、控件 ID/名称/类型，以及代码使用的固定选项键；任何漂移均失败关闭。
 - `approval_request` 要求 `approval:read` 与独立的 `approval:create` OAuth scope。写操作仍要求明确 `confirm=true`。
