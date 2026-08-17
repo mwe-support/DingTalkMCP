@@ -106,7 +106,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApprovalMcpCon
       ".alicdn.com",
       ".aliyuncs.com",
     ]),
-    uploadHostSuffixes: csv(env.APPROVAL_UPLOAD_HOST_SUFFIXES, [".aliyuncs.com"]),
+    uploadHostSuffixes: csv(env.APPROVAL_UPLOAD_HOST_SUFFIXES, [".trans.dingtalk.com", ".aliyuncs.com"]),
     idempotencyLedgerPath: resolve(env.APPROVAL_IDEMPOTENCY_LEDGER_PATH?.trim() || "./data/approval-idempotency"),
     auditLogPath: resolve(env.APPROVAL_AUDIT_LOG_PATH?.trim() || "./data/audit"),
     auth: {

@@ -392,7 +392,6 @@ describe("approval_request public MCP contract", () => {
     const { client, request } = await connectedApplicantClient({
       agentId: 123456,
       callerUnionId: "union-1",
-      uploadHostSuffixes: [".aliyuncs.com"],
     });
     request.mockImplementation(async (input: { path: string }) => {
       if (input.path === "/v1.0/workflow/forms/schemas/processCodes") return expenseSchemaResponse();
@@ -403,7 +402,7 @@ describe("approval_request public MCP contract", () => {
         return {
           uploadKey: "upload-key-1",
           headerSignatureInfo: {
-            resourceUrls: ["https://mwe-approval.oss-cn-shenzhen.aliyuncs.com/upload-1"],
+            resourceUrls: ["https://sh-dualstack.trans.dingtalk.com/upload-1"],
             headers: { Authorization: "signed-upload-header" },
             expirationSeconds: 900,
           },
@@ -439,7 +438,7 @@ describe("approval_request public MCP contract", () => {
             uploadKey: "upload-key-1",
             spaceId: "9988",
             method: "PUT",
-            uploadUrl: "https://mwe-approval.oss-cn-shenzhen.aliyuncs.com/upload-1",
+            uploadUrl: "https://sh-dualstack.trans.dingtalk.com/upload-1",
             headers: { Authorization: "signed-upload-header" },
             expiresInSeconds: 900,
           }],

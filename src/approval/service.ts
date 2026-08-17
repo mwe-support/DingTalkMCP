@@ -224,7 +224,9 @@ export class ApprovalService {
     this.#callerUnionId = options.callerUnionId;
     this.#agentId = options.agentId;
     this.#uploadHostSuffixes = new Set(
-      [...(options.uploadHostSuffixes ?? [".aliyuncs.com"])].map((suffix) => suffix.trim().toLowerCase()).filter(Boolean),
+      [...(options.uploadHostSuffixes ?? [".trans.dingtalk.com", ".aliyuncs.com"])]
+        .map((suffix) => suffix.trim().toLowerCase())
+        .filter(Boolean),
     );
     this.#callerScopes = options.callerScopes === undefined ? undefined : new Set(options.callerScopes);
     this.#allowedProcessCodes = new Set(options.allowedProcessCodes ?? []);

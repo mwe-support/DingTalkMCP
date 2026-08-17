@@ -33,7 +33,7 @@ describe("loadConfig", () => {
     const config = loadConfig(requiredEnvironment);
 
     expect(config.agentId).toBeUndefined();
-    expect(config.uploadHostSuffixes).toEqual([".aliyuncs.com"]);
+    expect(config.uploadHostSuffixes).toEqual([".trans.dingtalk.com", ".aliyuncs.com"]);
     expect(config.auth).toEqual({
       publicUrl: "https://dingtalk.mwexk.com/mcp",
       issuerUrl: "https://dingtalk.mwexk.com/",

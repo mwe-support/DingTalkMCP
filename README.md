@@ -146,6 +146,10 @@ https://dingtalk.mwexk.com/oauth/dingtalk/callback
 - 附件直传所需的 `Storage.UploadInfo.Read` 与 `Storage.File.Write` 权限。
 - H5 微应用能力及其 AgentId；将正整数配置为 `DINGTALK_AGENT_ID`。未配置时，无附件审批仍可使用，附件 `prepare` 会明确失败。
 
+附件上传 URL 必须经过 HTTPS 主机白名单校验。2026-08-17 的企业实测返回
+`sh-dualstack.trans.dingtalk.com`，因此默认精确允许 `.trans.dingtalk.com`；同时保留
+钉钉可能返回的 `.aliyuncs.com` 存储域。不要把白名单放宽为任意 `.dingtalk.com`。
+
 OAuth 授权范围新增 `approval:create`。已有客户端令牌不会自动获得该权限；需要在 WorkBuddy/Codex 重新发起授权并明确同意后，才能准备、提交或撤销申请。
 
 ## 本地验证
