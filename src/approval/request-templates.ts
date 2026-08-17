@@ -114,6 +114,8 @@ export const APPROVAL_REQUEST_CONTRACTS: Record<ApprovalRequestTemplate, Templat
       expected("DDSelectField_84QMA8HYTJC0", "往来单位", "DDSelectField"),
       expected("DDAttachment_1JK87WWW283K0", "发票附件", "DDAttachment"),
       expected("DDAttachment_1W8BOLL7YX5S0", "其他附件", "DDAttachment"),
+      expected("RelateField_QX0TTZEV3340", "关联审批单", "RelateField"),
+      expected("InvoiceField_1WLDY3UBS5R40", "发票", "InvoiceField"),
     ],
     expectedOptions: {
       DDSelectField_1IST0QT47LS00: companyOptions([

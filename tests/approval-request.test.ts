@@ -691,6 +691,8 @@ function expenseSchemaResponse(): Record<string, unknown> {
           component("DDSelectField", "DDSelectField_84QMA8HYTJC0", "往来单位"),
           component("DDAttachment", "DDAttachment_1JK87WWW283K0", "发票附件"),
           component("DDAttachment", "DDAttachment_1W8BOLL7YX5S0", "其他附件"),
+          component("RelateField", "RelateField_QX0TTZEV3340", "关联审批单"),
+          component("InvoiceField", "InvoiceField_1WLDY3UBS5R40", "发票"),
         ],
       },
     },
