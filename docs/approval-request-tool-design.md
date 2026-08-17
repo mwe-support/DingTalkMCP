@@ -20,6 +20,7 @@
 - `approval_request` 要求 `approval:read` 与独立的 `approval:create` OAuth scope。写操作仍要求明确 `confirm=true`。
 - `submit` 和实际 `revoke` 均使用稳定 UUID `requestId` 和持久幂等账本；账本命名空间绑定 OAuth 申请人。附件提交、审批创建或撤销结果不确定时禁止自动重放。
 - `comment` 仅允许操作当前 OAuth 用户本人发起且属于模板允许列表的实例，评论人由服务端注入；文本限制 1–1024 字符，真实写入要求 `confirm=true` 和稳定 UUID `requestId`，结果不确定时禁止自动重放。
+- 钉钉单实例详情在生产环境可能不返回 `processCode`。评论和撤销校验在有 code 时必须精确匹配；code 缺失时必须同时匹配模板标题与已审查的唯一控件 ID 签名，否则继续默认拒绝。
 
 ## 草稿能力边界
 

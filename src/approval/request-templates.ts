@@ -91,6 +91,7 @@ export type ApprovalAttachmentField = "invoice" | "other" | "attachment";
 interface TemplateContract {
   processCode: string;
   title: string;
+  instanceSignature: ReadonlyArray<string>;
   expectedComponents: ReadonlyArray<{ id: string; label: string; componentName: string }>;
   expectedOptions: Readonly<Partial<Record<string, ReadonlyArray<{ value: string; key: string }>>>>;
   attachmentComponents: Partial<Record<ApprovalAttachmentField, { id: string; label: string }>>;
@@ -100,6 +101,14 @@ export const APPROVAL_REQUEST_CONTRACTS: Record<ApprovalRequestTemplate, Templat
   expense_reimbursement: {
     processCode: "PROC-2DB91B79-3CDD-421D-A223-0489A7BAB2C0",
     title: "费用报销",
+    instanceSignature: [
+      "DDSelectField_N9CRRWAYASW0",
+      "DDDateField_B36N2UVUDK80",
+      "DDSelectField_1K2BNOEQRS800",
+      "TextareaField_GBCO39RRKFK0",
+      "TableField_2LQYVLLD4ZC0",
+      "DDSelectField_84QMA8HYTJC0",
+    ],
     expectedComponents: [
       expected("DDSelectField_N9CRRWAYASW0", "申请员工", "DDSelectField"),
       expected("DDSelectField_1IST0QT47LS00", "公司", "DDSelectField"),
@@ -137,6 +146,14 @@ export const APPROVAL_REQUEST_CONTRACTS: Record<ApprovalRequestTemplate, Templat
   payment_request: {
     processCode: "PROC-5E238117-7121-4CB3-8219-9F11A2E42BE4",
     title: "付款申请",
+    instanceSignature: [
+      "TextField_RI2SYQ7VHQO0",
+      "TextField_1V3MQHOZF3A80",
+      "TextField_1MCTJ1KMMFWG0",
+      "MoneyField_HLOCQW4U3UO0",
+      "DDDateField_1JQDDBINCMW00",
+      "TableField_GO15CA9H0480",
+    ],
     expectedComponents: [
       expected("TextField_RI2SYQ7VHQO0", "单据编号", "TextField"),
       expected("DDSelectField_1L4KRXZU5OAO0", "公司", "DDSelectField"),
@@ -193,6 +210,28 @@ export function approvalRequestTemplateForProcessCode(
   return APPROVAL_REQUEST_TEMPLATES.find(
     (template) => APPROVAL_REQUEST_CONTRACTS[template].processCode === processCode,
   );
+}
+
+export function approvalRequestTemplateForInstance(instance: {
+  processCode?: string | undefined;
+  title?: string | undefined;
+  formComponentValues: unknown[];
+}): ApprovalRequestTemplate | undefined {
+  if (instance.processCode !== undefined) {
+    return approvalRequestTemplateForProcessCode(instance.processCode);
+  }
+  if (instance.title === undefined) return undefined;
+  const componentIds = new Set(
+    instance.formComponentValues
+      .map((value) => text(asRecord(value)?.id))
+      .filter((value): value is string => value !== undefined),
+  );
+  const matches = APPROVAL_REQUEST_TEMPLATES.filter((template) => {
+    const contract = APPROVAL_REQUEST_CONTRACTS[template];
+    return instance.title?.includes(contract.title) === true &&
+      contract.instanceSignature.every((id) => componentIds.has(id));
+  });
+  return matches.length === 1 ? matches[0] : undefined;
 }
 
 export function assertApprovalRequestTemplateSchema(template: ApprovalRequestTemplate, payload: unknown): void {

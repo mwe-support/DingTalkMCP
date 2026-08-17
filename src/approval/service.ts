@@ -17,7 +17,7 @@ import { array, asRecord, normalizeProcessInstance, text, unwrapResult } from ".
 import type { ApprovalCaller, McpScope } from "../auth/types.js";
 import {
   APPROVAL_REQUEST_CONTRACTS,
-  approvalRequestTemplateForProcessCode,
+  approvalRequestTemplateForInstance,
   assertApprovalRequestTemplateSchema,
   assertAttachmentFieldAllowed,
   buildApprovalFormComponentValues,
@@ -67,6 +67,8 @@ export interface RevokeProcessInstanceInput {
   requestId?: string | undefined;
   operatingUserId?: string | undefined;
   remark?: string | undefined;
+  /** Server-verified fallback used only when DingTalk omits processCode from instance detail. */
+  verifiedProcessCode?: string | undefined;
 }
 
 interface ApprovalServiceOptions {
@@ -382,13 +384,15 @@ export class ApprovalService {
     if (input.action === "comment") {
       this.#assertScope("approval:create");
       const current = await this.getProcessInstanceDetail(input.processInstanceId);
-      const template = approvalRequestTemplateForProcessCode(current.normalized.processCode);
+      const template = approvalRequestTemplateForInstance(current.normalized);
       if (template === undefined) {
         throw new ApprovalMcpError(
           "PROCESS_CODE_NOT_ALLOWED",
           "approval_request can comment only on an instance of an allowlisted request template.",
         );
       }
+      const verifiedProcessCode = APPROVAL_REQUEST_CONTRACTS[template].processCode;
+      this.#assertProcessAllowed(verifiedProcessCode);
       const actorUserId = this.#requireCallerUserId();
       if (current.normalized.originatorUserId !== actorUserId) {
         throw new ApprovalMcpError(
@@ -433,13 +437,15 @@ export class ApprovalService {
     if (input.action === "revoke") {
       this.#assertScope("approval:create");
       const current = await this.getProcessInstanceDetail(input.processInstanceId);
-      const template = approvalRequestTemplateForProcessCode(current.normalized.processCode);
+      const template = approvalRequestTemplateForInstance(current.normalized);
       if (template === undefined) {
         throw new ApprovalMcpError(
           "PROCESS_CODE_NOT_ALLOWED",
           "approval_request can revoke only an instance of an allowlisted request template.",
         );
       }
+      const verifiedProcessCode = APPROVAL_REQUEST_CONTRACTS[template].processCode;
+      this.#assertProcessAllowed(verifiedProcessCode);
       const actorUserId = this.#requireCallerUserId();
       const fingerprint = createHash("sha256").update(stableStringify({
         actorUserId,
@@ -452,6 +458,7 @@ export class ApprovalService {
           requestId: input.requestId,
           confirm: input.confirm,
           dryRun: true,
+          verifiedProcessCode,
           ...(input.remark === undefined ? {} : { remark: input.remark }),
         });
         return {
@@ -817,7 +824,7 @@ export class ApprovalService {
     const actorUserId = this.#resolveCaller(input.operatingUserId);
     this.#assertActorAllowed(actorUserId);
     if (input.dryRun === true) {
-      await this.#assertRevocable(input.processInstanceId, actorUserId);
+      await this.#assertRevocable(input.processInstanceId, actorUserId, input.verifiedProcessCode);
       return { dryRun: true, action: "revoke", processInstanceId: input.processInstanceId };
     }
     return this.#audited(
@@ -829,12 +836,12 @@ export class ApprovalService {
       },
       async () => {
         this.#assertConfirmedActor(input.confirm, actorUserId);
-        await this.#assertRevocable(input.processInstanceId, actorUserId);
+        await this.#assertRevocable(input.processInstanceId, actorUserId, input.verifiedProcessCode);
         return this.#api.request({
           method: "POST",
           path: "/v1.0/workflow/processInstances/terminate",
           body: {
-            ...omit(input, ["confirm", "dryRun", "operatingUserId", "requestId"]),
+            ...omit(input, ["confirm", "dryRun", "operatingUserId", "requestId", "verifiedProcessCode"]),
             operatingUserId: actorUserId,
             isSystem: false,
           },
@@ -1106,9 +1113,13 @@ export class ApprovalService {
     }
   }
 
-  async #assertRevocable(processInstanceId: string, actorUserId: string): Promise<void> {
+  async #assertRevocable(
+    processInstanceId: string,
+    actorUserId: string,
+    verifiedProcessCode?: string,
+  ): Promise<void> {
     const current = await this.getProcessInstanceDetail(processInstanceId);
-    this.#assertOptionalProcessAllowed(current.normalized.processCode);
+    this.#assertOptionalProcessAllowed(current.normalized.processCode, verifiedProcessCode);
     const status = current.normalized.status?.toUpperCase();
     const originatorMatches = current.normalized.originatorUserId === actorUserId;
     if (status !== "RUNNING" || !originatorMatches) {
@@ -1391,6 +1402,7 @@ export class ApprovalService {
         processInstanceId: input.input.processInstanceId,
         requestId: input.input.requestId,
         confirm: input.input.confirm,
+        verifiedProcessCode: APPROVAL_REQUEST_CONTRACTS[input.template].processCode,
         ...(input.input.remark === undefined ? {} : { remark: input.input.remark }),
       });
       const result: ApprovalRequestEnvelope = {
@@ -1621,15 +1633,16 @@ export class ApprovalService {
     }
   }
 
-  #assertOptionalProcessAllowed(processCode: string | undefined): void {
+  #assertOptionalProcessAllowed(processCode: string | undefined, verifiedProcessCode?: string): void {
     if (this.#allowedProcessCodes.size === 0) return;
-    if (processCode === undefined) {
+    const effectiveProcessCode = processCode ?? verifiedProcessCode;
+    if (effectiveProcessCode === undefined) {
       throw new ApprovalMcpError(
         "PROCESS_CODE_NOT_ALLOWED",
         "The approval processCode is required while the process allowlist is enabled.",
       );
     }
-    this.#assertProcessAllowed(processCode);
+    this.#assertProcessAllowed(effectiveProcessCode);
   }
 
   async #createIdempotently(

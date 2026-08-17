@@ -336,14 +336,17 @@ describe("approval_request public MCP contract", () => {
   });
 
   it("dry-runs a comment on the authenticated applicant's allowlisted approval", async () => {
-    const { client, request } = await connectedApplicantClient();
+    const { client, request } = await connectedApplicantClient({
+      allowedProcessCodes: ["PROC-2DB91B79-3CDD-421D-A223-0489A7BAB2C0"],
+    });
     request.mockResolvedValue({
       result: {
         processInstanceId: "pi-comment-dry-run",
-        processCode: "PROC-2DB91B79-3CDD-421D-A223-0489A7BAB2C0",
+        title: "张三提交的费用报销",
         originatorUserId: "user-1",
         status: "RUNNING",
         tasks: [],
+        formComponentValues: expenseInstanceSignatureValues(),
       },
     });
 
@@ -377,6 +380,101 @@ describe("approval_request public MCP contract", () => {
       },
     });
     expect(request).toHaveBeenCalledTimes(1);
+    expect(request).not.toHaveBeenCalledWith(expect.objectContaining({
+      path: "/v1.0/workflow/processInstances/comments",
+    }));
+  });
+
+  it("recognizes an allowlisted payment instance when DingTalk omits processCode", async () => {
+    const { client, request } = await connectedApplicantClient();
+    request.mockResolvedValue({
+      result: {
+        processInstanceId: "pi-payment-comment-dry-run",
+        title: "张三提交的付款申请",
+        originatorUserId: "user-1",
+        status: "RUNNING",
+        tasks: [],
+        formComponentValues: paymentInstanceSignatureValues(),
+      },
+    });
+
+    const result = await client.callTool({
+      name: "approval_request",
+      arguments: {
+        action: "comment",
+        processInstanceId: "pi-payment-comment-dry-run",
+        text: "付款申请补充说明",
+        requestId: "13131313-1313-4313-8313-131313131313",
+        confirm: false,
+        dryRun: true,
+      },
+    });
+
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      result: { template: "payment_request", currentStatus: "RUNNING" },
+    });
+  });
+
+  it("fails closed when a code-less instance only shares an allowlisted title", async () => {
+    const { client, request } = await connectedApplicantClient();
+    request.mockResolvedValue({
+      result: {
+        processInstanceId: "pi-title-only",
+        title: "张三提交的费用报销",
+        originatorUserId: "user-1",
+        status: "RUNNING",
+        tasks: [],
+        formComponentValues: [{ id: "TextareaField_GBCO39RRKFK0" }],
+      },
+    });
+
+    const result = await client.callTool({
+      name: "approval_request",
+      arguments: {
+        action: "comment",
+        processInstanceId: "pi-title-only",
+        text: "不应通过",
+        requestId: "14141414-1414-4414-8414-141414141414",
+        confirm: false,
+        dryRun: true,
+      },
+    });
+
+    expect(result.structuredContent).toMatchObject({ error: { code: "PROCESS_CODE_NOT_ALLOWED" } });
+    expect(request).not.toHaveBeenCalledWith(expect.objectContaining({
+      path: "/v1.0/workflow/processInstances/comments",
+    }));
+  });
+
+  it("applies the deployment process-code allowlist to a code-less signature match", async () => {
+    const { client, request } = await connectedApplicantClient({
+      allowedProcessCodes: ["PROC-5E238117-7121-4CB3-8219-9F11A2E42BE4"],
+    });
+    request.mockResolvedValue({
+      result: {
+        processInstanceId: "pi-expense-disabled",
+        title: "张三提交的费用报销",
+        originatorUserId: "user-1",
+        status: "RUNNING",
+        tasks: [],
+        formComponentValues: expenseInstanceSignatureValues(),
+      },
+    });
+
+    const result = await client.callTool({
+      name: "approval_request",
+      arguments: {
+        action: "comment",
+        processInstanceId: "pi-expense-disabled",
+        text: "不应通过部署允许列表",
+        requestId: "15151515-1515-4515-8515-151515151515",
+        confirm: false,
+        dryRun: true,
+      },
+    });
+
+    expect(result.structuredContent).toMatchObject({ error: { code: "PROCESS_CODE_NOT_ALLOWED" } });
     expect(request).not.toHaveBeenCalledWith(expect.objectContaining({
       path: "/v1.0/workflow/processInstances/comments",
     }));
@@ -663,16 +761,19 @@ describe("approval_request public MCP contract", () => {
   });
 
   it("revokes only an allowlisted request template and replays the persisted result idempotently", async () => {
-    const { client, request } = await connectedApplicantClient();
+    const { client, request } = await connectedApplicantClient({
+      allowedProcessCodes: ["PROC-2DB91B79-3CDD-421D-A223-0489A7BAB2C0"],
+    });
     request.mockImplementation(async (input: { path: string }) => {
       if (input.path === "/v1.0/workflow/processInstances") {
         return {
           result: {
             processInstanceId: "pi-revoke-1",
-            processCode: "PROC-2DB91B79-3CDD-421D-A223-0489A7BAB2C0",
+            title: "张三提交的费用报销",
             originatorUserId: "user-1",
             status: "RUNNING",
             tasks: [],
+            formComponentValues: expenseInstanceSignatureValues(),
           },
         };
       }
@@ -1021,6 +1122,7 @@ async function connectedApplicantClient(options: {
   applicantName?: string;
   departmentIds?: number[];
   departmentNames?: Record<number, string>;
+  allowedProcessCodes?: string[];
   idempotencyLedger?: IdempotencyLedger;
 } = {}): Promise<{
   client: Client;
@@ -1055,6 +1157,7 @@ async function connectedApplicantClient(options: {
     ...(options.callerUnionId === undefined ? {} : { callerUnionId: options.callerUnionId }),
     ...(options.uploadHostSuffixes === undefined ? {} : { uploadHostSuffixes: options.uploadHostSuffixes }),
     ...(options.callerScopes === undefined ? {} : { callerScopes: options.callerScopes }),
+    ...(options.allowedProcessCodes === undefined ? {} : { allowedProcessCodes: options.allowedProcessCodes }),
     ...(options.idempotencyLedger === undefined ? {} : { idempotencyLedger: options.idempotencyLedger }),
   });
   const server = createApprovalMcpServer(service);
@@ -1073,6 +1176,28 @@ function expenseFields(): Record<string, unknown> {
     counterparty: "测试供应商",
     items: [{ amount: 123.45, category: "AI费用", expenseDepartment: "研发部", remark: "模型调用费用" }],
   };
+}
+
+function expenseInstanceSignatureValues(): Array<Record<string, unknown>> {
+  return [
+    "DDSelectField_N9CRRWAYASW0",
+    "DDDateField_B36N2UVUDK80",
+    "DDSelectField_1K2BNOEQRS800",
+    "TextareaField_GBCO39RRKFK0",
+    "TableField_2LQYVLLD4ZC0",
+    "DDSelectField_84QMA8HYTJC0",
+  ].map((id) => ({ id }));
+}
+
+function paymentInstanceSignatureValues(): Array<Record<string, unknown>> {
+  return [
+    "TextField_RI2SYQ7VHQO0",
+    "TextField_1V3MQHOZF3A80",
+    "TextField_1MCTJ1KMMFWG0",
+    "MoneyField_HLOCQW4U3UO0",
+    "DDDateField_1JQDDBINCMW00",
+    "TableField_GO15CA9H0480",
+  ].map((id) => ({ id }));
 }
 
 function expenseSchemaResponse(): Record<string, unknown> {
