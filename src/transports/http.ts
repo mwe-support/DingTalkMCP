@@ -26,6 +26,7 @@ async function main(): Promise<void> {
   const allowedHosts = csv(process.env.APPROVAL_BACKEND_ALLOWED_HOSTS);
   const auditStore = new DailyJsonLineAuditStore(config.auditLogPath);
   const auditContext = new AuditInvocationContext();
+  const auditHmacKey = (await readFile(config.auth.auditHmacKeyPath, "utf8")).trim();
   const retentionSweep = await startAuditRetentionSweep(auditStore, {
     onError: () => {
       process.stderr.write("Structured audit retention sweep failed.\n");
@@ -35,9 +36,9 @@ async function main(): Promise<void> {
     audit: new BoundedApprovalAuditSink(new RetainedApprovalAuditSink(auditStore), auditStore, {
       invocationContext: auditContext,
     }),
+    inboxCursorSecret: auditHmacKey,
   });
   const privateKeyPem = await readFile(config.auth.signingPrivateKeyPath, "utf8");
-  const auditHmacKey = (await readFile(config.auth.auditHmacKeyPath, "utf8")).trim();
   const auditPseudonymizer = new AuditPseudonymizer(auditHmacKey);
   const tokenCodec = await JoseMcpTokenCodec.create({
     privateKeyPem,

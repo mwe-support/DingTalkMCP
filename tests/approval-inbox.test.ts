@@ -17,6 +17,7 @@ import {
 } from "../src/dingtalk/event-stream.js";
 
 const closeables: Array<{ close(): Promise<void> }> = [];
+const INBOX_CURSOR_SECRET = "test-inbox-cursor-secret-at-least-32-bytes";
 
 afterEach(async () => {
   await Promise.allSettled(closeables.splice(0).map((item) => item.close()));
@@ -509,6 +510,202 @@ describe("DingTalk task-change event adapter", () => {
 });
 
 describe("approval_inbox public MCP contract", () => {
+  it("returns one completed record per process instance while retaining task evidence", async () => {
+    const root = await mkdtemp(join(tmpdir(), "approval-inbox-instance-dedupe-"));
+    const index = new DirectoryApprovalInboxIndex(root, { now: () => 1_800_000_000_000 });
+    for (const [eventId, taskId, eventTime] of [
+      ["event-instance-task-1", "task-1", 1_799_999_999_000],
+      ["event-instance-task-2", "task-2", 1_800_000_000_000],
+    ] as const) {
+      await index.apply({
+        eventId,
+        corpId: "corp-1",
+        processInstanceId: "pi-one-instance",
+        processCode: "PROC-DEDUPE",
+        taskId,
+        staffId: "user-1",
+        type: "finish",
+        result: "agree",
+        eventTime,
+      });
+    }
+    const request = vi.fn().mockResolvedValue({
+      result: {
+        processInstanceId: "pi-one-instance",
+        processCode: "PROC-DEDUPE",
+        status: "COMPLETED",
+        tasks: [
+          { taskId: "task-1", userId: "user-1", status: "COMPLETED", result: "AGREE" },
+          { taskId: "task-2", userId: "user-1", status: "COMPLETED", result: "AGREE" },
+        ],
+      },
+    });
+    const service = new ApprovalService({
+      api: { request } as unknown as Pick<DingTalkApiClient, "request">,
+      callerUserId: "user-1",
+      callerScopes: ["approval:read"],
+      inboxIndex: index,
+    });
+    const server = createApprovalMcpServer(service);
+    const client = new Client({ name: "approval-inbox-instance-dedupe-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    closeables.push(client, server);
+
+    const result = await client.callTool({
+      name: "approval_inbox",
+      arguments: { recordStatus: "completed", page: 1, limit: 20 },
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      result: {
+        data: {
+          items: [{
+            processInstanceId: "pi-one-instance",
+            taskId: "task-2",
+            taskIds: ["task-2", "task-1"],
+            taskCount: 2,
+            decisionResult: "agree",
+            decisionResults: ["agree"],
+          }],
+          hasMore: false,
+        },
+      },
+    });
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it("bounds task ID evidence while retaining full task counts", async () => {
+    const root = await mkdtemp(join(tmpdir(), "approval-inbox-task-evidence-bound-"));
+    const index = new DirectoryApprovalInboxIndex(root, { now: () => 1_800_000_000_000 });
+    for (let task = 1; task <= 25; task++) {
+      await index.apply({
+        eventId: `event-many-tasks-${task}`,
+        corpId: "corp-1",
+        processInstanceId: "pi-many-tasks",
+        processCode: "PROC-MANY-TASKS",
+        taskId: `task-${task}`,
+        staffId: "user-1",
+        type: "finish",
+        result: "agree",
+        eventTime: 1_799_999_900_000 + task,
+      });
+    }
+    const request = vi.fn().mockResolvedValue({
+      result: {
+        processInstanceId: "pi-many-tasks",
+        processCode: "PROC-MANY-TASKS",
+        status: "COMPLETED",
+        tasks: Array.from({ length: 25 }, (_, index) => ({
+          taskId: `task-${index + 1}`,
+          userId: "user-1",
+          status: "COMPLETED",
+          result: "AGREE",
+        })),
+      },
+    });
+    const service = new ApprovalService({
+      api: { request } as unknown as Pick<DingTalkApiClient, "request">,
+      callerUserId: "user-1",
+      callerScopes: ["approval:read"],
+      inboxIndex: index,
+    });
+    const server = createApprovalMcpServer(service);
+    const client = new Client({ name: "approval-inbox-task-evidence-bound-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    closeables.push(client, server);
+
+    const result = await client.callTool({
+      name: "approval_inbox",
+      arguments: { recordStatus: "completed", limit: 20 },
+    });
+    const item = (result.structuredContent as {
+      result?: { data?: { items?: Array<Record<string, unknown>> } };
+    }).result?.data?.items?.[0];
+
+    expect(item).toMatchObject({
+      processInstanceId: "pi-many-tasks",
+      taskCount: 25,
+      verifiedTaskCount: 25,
+      taskIdsTruncated: true,
+    });
+    expect(item?.taskIds).toHaveLength(20);
+  });
+
+  it("rebuilds task and decision evidence from only currently verified tasks", async () => {
+    const root = await mkdtemp(join(tmpdir(), "approval-inbox-partial-stale-evidence-"));
+    const index = new DirectoryApprovalInboxIndex(root, { now: () => 1_800_000_000_000 });
+    await index.apply({
+      eventId: "event-stale-evidence-1",
+      corpId: "corp-1",
+      processInstanceId: "pi-partial-stale",
+      processCode: "PROC-STALE-EVIDENCE",
+      taskId: "task-stale",
+      staffId: "user-1",
+      type: "finish",
+      result: "agree",
+      eventTime: 1_799_999_999_000,
+    });
+    await index.apply({
+      eventId: "event-stale-evidence-2",
+      corpId: "corp-1",
+      processInstanceId: "pi-partial-stale",
+      processCode: "PROC-STALE-EVIDENCE",
+      taskId: "task-current",
+      staffId: "user-1",
+      type: "finish",
+      result: "refuse",
+      eventTime: 1_800_000_000_000,
+    });
+    const request = vi.fn().mockResolvedValue({
+      result: {
+        processInstanceId: "pi-partial-stale",
+        processCode: "PROC-STALE-EVIDENCE",
+        status: "COMPLETED",
+        tasks: [
+          { taskId: "task-stale", userId: "user-1", status: "CANCELED", result: "AGREE" },
+          { taskId: "task-current", userId: "user-1", status: "COMPLETED", result: "REFUSE" },
+        ],
+      },
+    });
+    const service = new ApprovalService({
+      api: { request } as unknown as Pick<DingTalkApiClient, "request">,
+      callerUserId: "user-1",
+      callerScopes: ["approval:read"],
+      inboxIndex: index,
+    });
+    const server = createApprovalMcpServer(service);
+    const client = new Client({ name: "approval-inbox-partial-stale-evidence-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    closeables.push(client, server);
+
+    const result = await client.callTool({
+      name: "approval_inbox",
+      arguments: { recordStatus: "completed" },
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      result: {
+        data: {
+          items: [{
+            processInstanceId: "pi-partial-stale",
+            taskId: "task-current",
+            taskIds: ["task-current"],
+            taskCount: 2,
+            verifiedTaskCount: 1,
+            decisionResult: "refuse",
+            decisionResults: ["refuse"],
+          }],
+        },
+      },
+    });
+  });
+
   it("refreshes completed records from the official instance ID list API", async () => {
     const now = 1_800_000_000_000;
     const root = await mkdtemp(join(tmpdir(), "approval-inbox-openapi-refresh-"));
@@ -545,13 +742,13 @@ describe("approval_inbox public MCP contract", () => {
           title: "Refreshed completed approval",
           status: "RUNNING",
           createTime: now - 10_000,
-          tasks: [{
-            taskId: "refresh-task",
+          tasks: ["refresh-task-1", "refresh-task-2"].map((taskId) => ({
+            taskId,
             userId: "user-1",
             status: "COMPLETED",
             result: "AGREE",
             finishTime: now - 1_000,
-          }],
+          })),
         },
       });
     });
@@ -561,6 +758,7 @@ describe("approval_inbox public MCP contract", () => {
       callerScopes: ["approval:read"],
       inboxIndex: new DirectoryApprovalInboxIndex(root, { now: () => now }),
       inboxProcessCodes: ["PROC-REFRESH"],
+      inboxCursorSecret: INBOX_CURSOR_SECRET,
       corpId: "corp-1",
       now: () => now,
     });
@@ -589,12 +787,13 @@ describe("approval_inbox public MCP contract", () => {
             candidateLimit: 40,
             candidateInstanceCount: 1,
             indexedRecordCount: 1,
+            indexedTaskCount: 2,
             truncated: false,
             failures: 0,
           },
           items: [{
             processInstanceId: "pi-refresh-completed",
-            taskId: "refresh-task",
+            taskCount: 2,
             decisionResult: "agree",
             completedAt: now - 1_000,
           }],
@@ -640,6 +839,7 @@ describe("approval_inbox public MCP contract", () => {
       callerScopes: ["approval:read"],
       inboxIndex: new DirectoryApprovalInboxIndex(root, { now: () => now }),
       inboxProcessCodes: ["PROC-REFRESH"],
+      inboxCursorSecret: INBOX_CURSOR_SECRET,
       corpId: "corp-1",
       now: () => now,
     });
@@ -706,6 +906,7 @@ describe("approval_inbox public MCP contract", () => {
       callerScopes: ["approval:read"],
       inboxIndex: new DirectoryApprovalInboxIndex(root, { now: () => now }),
       inboxProcessCodes: ["PROC-REFRESH"],
+      inboxCursorSecret: INBOX_CURSOR_SECRET,
       corpId: "corp-1",
       now: () => now,
     });
@@ -738,16 +939,33 @@ describe("approval_inbox public MCP contract", () => {
   it("stops an instance-ID refresh at forty candidates", async () => {
     const now = 1_800_000_000_000;
     const root = await mkdtemp(join(tmpdir(), "approval-inbox-refresh-candidate-bound-"));
-    const candidateIds = Array.from({ length: 41 }, (_, index) => `pi-candidate-${index}`);
     let queryCalls = 0;
     let detailCalls = 0;
+    const requestedMaxResults: number[] = [];
     const request = vi.fn().mockImplementation((input: {
       path: string;
+      body?: { nextToken?: number; maxResults?: number };
       query?: { processInstanceId?: string };
     }) => {
       if (input.path === "/v1.0/workflow/processes/instanceIds/query") {
+        const nextToken = input.body?.nextToken ?? 0;
         queryCalls++;
-        return Promise.resolve({ result: { list: candidateIds, nextToken: 1 }, success: true });
+        requestedMaxResults.push(input.body?.maxResults ?? -1);
+        const list = nextToken === 0
+          ? Array.from({ length: 20 }, (_, index) => `pi-candidate-${index}`)
+          : nextToken === 1
+            ? [
+                ...Array.from({ length: 15 }, (_, index) => `pi-candidate-${20 + index}`),
+                ...Array.from({ length: 5 }, (_, index) => `pi-candidate-${index}`),
+              ]
+            : Array.from({ length: 5 }, (_, index) => `pi-candidate-${35 + index}`);
+        return Promise.resolve({
+          result: {
+            list,
+            nextToken: nextToken + 1,
+          },
+          success: true,
+        });
       }
       detailCalls++;
       const processInstanceId = input.query?.processInstanceId ?? "missing";
@@ -773,6 +991,7 @@ describe("approval_inbox public MCP contract", () => {
       callerScopes: ["approval:read"],
       inboxIndex: new DirectoryApprovalInboxIndex(root, { now: () => now }),
       inboxProcessCodes: ["PROC-REFRESH"],
+      inboxCursorSecret: INBOX_CURSOR_SECRET,
       corpId: "corp-1",
       now: () => now,
     });
@@ -797,13 +1016,264 @@ describe("approval_inbox public MCP contract", () => {
         candidateInstanceCount: 40,
         indexedRecordCount: 40,
         truncated: true,
+        nextCursor: expect.stringMatching(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u),
       },
       hasMore: true,
     });
     expect(structured.result?.data?.items).toHaveLength(20);
-    expect(queryCalls).toBe(1);
+    expect(queryCalls).toBe(3);
+    expect(requestedMaxResults).toEqual([20, 20, 5]);
     expect(detailCalls).toBe(60);
-    expect(request).toHaveBeenCalledTimes(61);
+    expect(request).toHaveBeenCalledTimes(63);
+  });
+
+  it("continues a truncated instance-ID refresh from an opaque cursor", async () => {
+    const now = 1_800_000_000_000;
+    const root = await mkdtemp(join(tmpdir(), "approval-inbox-refresh-cursor-"));
+    const requestedTokens: number[] = [];
+    let detailCalls = 0;
+    const request = vi.fn().mockImplementation((input: {
+      path: string;
+      body?: { nextToken?: number };
+      query?: { processInstanceId?: string };
+    }) => {
+      if (input.path === "/v1.0/workflow/processes/instanceIds/query") {
+        const nextToken = input.body?.nextToken ?? 0;
+        requestedTokens.push(nextToken);
+        const start = nextToken * 20;
+        const count = nextToken < 2 ? 20 : 1;
+        return Promise.resolve({
+          result: {
+            list: Array.from({ length: count }, (_, index) => `pi-cursor-${start + index}`),
+            nextToken: nextToken < 2 ? nextToken + 1 : 0,
+          },
+          success: true,
+        });
+      }
+      detailCalls++;
+      const processInstanceId = input.query?.processInstanceId ?? "missing";
+      return Promise.resolve({
+        result: {
+          processInstanceId,
+          processCode: "PROC-REFRESH",
+          status: "COMPLETED",
+          createTime: now - 1_000,
+          tasks: [{
+            taskId: `task-${processInstanceId}`,
+            userId: "user-1",
+            status: "COMPLETED",
+            result: "AGREE",
+            finishTime: now - 500,
+          }],
+        },
+      });
+    });
+    const service = new ApprovalService({
+      api: { request } as unknown as Pick<DingTalkApiClient, "request">,
+      callerUserId: "user-1",
+      callerScopes: ["approval:read"],
+      inboxIndex: new DirectoryApprovalInboxIndex(root, { now: () => now }),
+      inboxProcessCodes: ["PROC-REFRESH"],
+      inboxCursorSecret: INBOX_CURSOR_SECRET,
+      corpId: "corp-1",
+      now: () => now,
+    });
+    const server = createApprovalMcpServer(service);
+    const client = new Client({ name: "approval-inbox-refresh-cursor-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    closeables.push(client, server);
+
+    const first = await client.callTool({
+      name: "approval_inbox",
+      arguments: { recordStatus: "completed", refreshWindowDays: 1, page: 1, limit: 1 },
+    });
+    const firstStructured = first.structuredContent as {
+      result?: { data?: { refresh?: { nextCursor?: string; truncated?: boolean; candidateInstanceCount?: number } } };
+    };
+    const nextCursor = firstStructured.result?.data?.refresh?.nextCursor;
+    expect(firstStructured.result?.data?.refresh).toMatchObject({
+      candidateInstanceCount: 40,
+      truncated: true,
+    });
+    expect(nextCursor).toMatch(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u);
+    const [cursorPayload, cursorSignature] = (nextCursor as string).split(".");
+    const tamperedClaims = JSON.parse(Buffer.from(cursorPayload as string, "base64url").toString("utf8")) as {
+      nextToken: number;
+    };
+    tamperedClaims.nextToken = 999;
+    const tamperedCursor = `${Buffer.from(JSON.stringify(tamperedClaims), "utf8").toString("base64url")}.${cursorSignature}`;
+    const tampered = await client.callTool({
+      name: "approval_inbox",
+      arguments: {
+        recordStatus: "completed",
+        refreshWindowDays: 1,
+        refreshCursor: tamperedCursor,
+        page: 1,
+        limit: 1,
+      },
+    });
+    expect(tampered.isError).toBe(true);
+    expect(tampered.structuredContent).toMatchObject({ error: { code: "INVALID_INPUT" } });
+    expect(requestedTokens).toEqual([0, 1]);
+
+    const second = await client.callTool({
+      name: "approval_inbox",
+      arguments: {
+        recordStatus: "completed",
+        refreshWindowDays: 1,
+        refreshCursor: nextCursor,
+        page: 1,
+        limit: 1,
+      },
+    });
+
+    expect(second.isError).not.toBe(true);
+    expect(second.structuredContent).toMatchObject({
+      result: {
+        data: {
+          refresh: {
+            candidateInstanceCount: 1,
+            indexedRecordCount: 1,
+            truncated: false,
+          },
+        },
+      },
+    });
+    expect((second.structuredContent as { result?: { data?: { refresh?: Record<string, unknown> } } })
+      .result?.data?.refresh).not.toHaveProperty("nextCursor");
+    expect(requestedTokens).toEqual([0, 1, 2]);
+    expect(detailCalls).toBe(43);
+  });
+
+  it("returns a retry cursor when candidate detail verification fails", async () => {
+    const now = 1_800_000_000_000;
+    const root = await mkdtemp(join(tmpdir(), "approval-inbox-refresh-detail-retry-"));
+    const requestedTokens: number[] = [];
+    let failFirstDetail = true;
+    const request = vi.fn().mockImplementation((input: {
+      path: string;
+      body?: { nextToken?: number };
+      query?: { processInstanceId?: string };
+    }) => {
+      if (input.path === "/v1.0/workflow/processes/instanceIds/query") {
+        requestedTokens.push(input.body?.nextToken ?? 0);
+        return Promise.resolve({ result: { list: ["pi-detail-fail", "pi-detail-ok"], nextToken: 0 } });
+      }
+      const processInstanceId = input.query?.processInstanceId ?? "missing";
+      if (processInstanceId === "pi-detail-fail" && failFirstDetail) {
+        failFirstDetail = false;
+        return Promise.reject(new Error("transient detail failure"));
+      }
+      return Promise.resolve({
+        result: {
+          processInstanceId,
+          processCode: "PROC-REFRESH",
+          status: "COMPLETED",
+          tasks: [{
+            taskId: `task-${processInstanceId}`,
+            userId: "user-1",
+            status: "COMPLETED",
+            result: "AGREE",
+            finishTime: now - 500,
+          }],
+        },
+      });
+    });
+    const service = new ApprovalService({
+      api: { request } as unknown as Pick<DingTalkApiClient, "request">,
+      callerUserId: "user-1",
+      callerScopes: ["approval:read"],
+      inboxIndex: new DirectoryApprovalInboxIndex(root, { now: () => now }),
+      inboxProcessCodes: ["PROC-REFRESH"],
+      inboxCursorSecret: INBOX_CURSOR_SECRET,
+      corpId: "corp-1",
+      now: () => now,
+    });
+    const server = createApprovalMcpServer(service);
+    const client = new Client({ name: "approval-inbox-refresh-detail-retry-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    closeables.push(client, server);
+
+    const first = await client.callTool({
+      name: "approval_inbox",
+      arguments: { recordStatus: "completed", refreshWindowDays: 1 },
+    });
+    const firstRefresh = (first.structuredContent as {
+      result?: { data?: { refresh?: { nextCursor?: string } & Record<string, unknown> } };
+    }).result?.data?.refresh;
+    expect(firstRefresh).toMatchObject({
+      failures: 1,
+      indexedRecordCount: 1,
+      truncated: true,
+    });
+    expect(firstRefresh?.nextCursor).toMatch(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u);
+
+    const second = await client.callTool({
+      name: "approval_inbox",
+      arguments: {
+        recordStatus: "completed",
+        refreshWindowDays: 1,
+        refreshCursor: firstRefresh?.nextCursor,
+      },
+    });
+
+    expect(second.structuredContent).toMatchObject({
+      result: {
+        data: {
+          refresh: {
+            failures: 0,
+            indexedRecordCount: 2,
+            truncated: false,
+          },
+          items: expect.arrayContaining([
+            expect.objectContaining({ processInstanceId: "pi-detail-fail" }),
+            expect.objectContaining({ processInstanceId: "pi-detail-ok" }),
+          ]),
+        },
+      },
+    });
+    expect(requestedTokens).toEqual([0, 0]);
+  });
+
+  it("rejects a malformed or context-mismatched refresh cursor before calling DingTalk", async () => {
+    const root = await mkdtemp(join(tmpdir(), "approval-inbox-invalid-refresh-cursor-"));
+    const request = vi.fn();
+    const service = new ApprovalService({
+      api: { request } as unknown as Pick<DingTalkApiClient, "request">,
+      callerUserId: "user-1",
+      callerScopes: ["approval:read"],
+      inboxIndex: new DirectoryApprovalInboxIndex(root, { now: () => 1_800_000_000_000 }),
+      inboxProcessCodes: ["PROC-REFRESH"],
+      inboxCursorSecret: INBOX_CURSOR_SECRET,
+      corpId: "corp-1",
+      now: () => 1_800_000_000_000,
+    });
+    const server = createApprovalMcpServer(service);
+    const client = new Client({ name: "approval-inbox-invalid-refresh-cursor-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    closeables.push(client, server);
+    const malformedCursor = `${Buffer.from(JSON.stringify({ version: 1 }), "utf8").toString("base64url")}.invalidsignature`;
+
+    const missingWindow = await client.callTool({
+      name: "approval_inbox",
+      arguments: { recordStatus: "completed", refreshCursor: malformedCursor },
+    });
+    const mismatched = await client.callTool({
+      name: "approval_inbox",
+      arguments: { recordStatus: "completed", refreshWindowDays: 7, refreshCursor: malformedCursor },
+    });
+
+    expect(missingWindow.isError).toBe(true);
+    expect(missingWindow.structuredContent).toMatchObject({ error: { code: "INVALID_INPUT" } });
+    expect(mismatched.isError).toBe(true);
+    expect(mismatched.structuredContent).toMatchObject({ error: { code: "INVALID_INPUT" } });
+    expect(request).not.toHaveBeenCalled();
   });
 
   it("lists a verified completed task through the same inbox tool", async () => {
@@ -837,7 +1307,7 @@ describe("approval_inbox public MCP contract", () => {
         processInstanceId: "pi-completed-public",
         processCode: "PROC-COMPLETED",
         status: "COMPLETED",
-        tasks: [{ taskId: "304", userId: "user-1", status: "COMPLETED" }],
+        tasks: [{ taskId: "304", userId: "user-1", status: "COMPLETED", result: "AGREE" }],
       },
     });
     const service = new ApprovalService({

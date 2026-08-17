@@ -56,7 +56,7 @@ DWS 的 `list-pending` CLI 只把时间、分页和关键词参数转发给官�
 2. 需要足够短的时间窗口和持续轮询，否则会漏掉短生命周期任务；
 3. 调用成本约为 `模板数 × 时间页数 + 命中的实例详情数`，并受 OpenAPI 频率和权限影响。
 
-所以它只能作为事件索引丢失后的“有限重同步”工具：管理员通过 `APPROVAL_INBOX_PROCESS_CODES` 提供模板白名单，客户端通过 `refreshWindowDays=1..30` 提供时间窗口；单次最多检查 40 个候选实例，结果返回刷新统计并继续标记 `coverage=partial/resyncRequired=true`，不能宣称与官方 DWS 收件箱等价。未配置环境变量时，默认只扫描已精确适配的费用报销与付款申请模板。
+所以它只能作为事件索引丢失后的“有限重同步”工具：管理员通过 `APPROVAL_INBOX_PROCESS_CODES` 提供模板白名单，客户端通过 `refreshWindowDays=1..30` 提供时间窗口；单次最多检查 40 个候选实例。若仍有后续页面或候选详情暂时失败，响应返回短期、HMAC 认证且绑定用户/窗口/状态/模板集合的 opaque `nextCursor`，客户端在同一工具中续传到 `truncated=false`。结果始终标记 `coverage=partial/resyncRequired=true`，不能宣称与官方 DWS 收件箱等价。未配置环境变量时，默认只扫描已精确适配的费用报销与付款申请模板。
 
 ## 4. 官方 DWS 上游 MCP 不应作为自建服务下游
 
@@ -90,7 +90,7 @@ DWS 的源代码显示 OA 服务使用钉钉官方 MCP 网关地址，并通过 
      仅针对精确 processCode 白名单、1–30 天窗口、最多 40 个候选
 ```
 
-工具返回必须包含：`recordStatus`、`processInstanceId`、可用时的 `taskId`、`processCode`、任务状态、事件时间、`coverage`、`nextCursor`/`hasMore`；已处理项还应在事件提供时返回 `decisionResult`。若 5000 条容量边界截断了保留窗口中的旧记录，必须返回 `capacityTruncated=true` 并推进 `coverageSince`。不接受 `userId`、`unionId` 或“代表谁查询”等模型输入；身份来自 MCP OAuth 会话。
+工具返回必须以唯一 `processInstanceId` 为记录粒度；同一实例的多个任务合并为有界 `taskIds`、完整 `taskCount/verifiedTaskCount` 和经详情重建的 `decisionResults`。同时返回 `recordStatus`、可用时的主 `taskId`、`processCode`、任务状态、事件时间、`coverage`、刷新 `nextCursor` 和结果页 `hasMore`；已处理项还应在当前详情提供时返回 `decisionResult`。若 5000 条容量边界截断了保留窗口中的旧记录，必须返回 `capacityTruncated=true` 并推进 `coverageSince`。不接受 `userId`、`unionId` 或“代表谁查询”等模型输入；身份来自 MCP OAuth 会话。
 
 上线测试顺序：
 

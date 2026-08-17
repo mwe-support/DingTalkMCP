@@ -7,6 +7,7 @@ const SEEN_EVENT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_SEEN_EVENTS = 10_000;
 const COMPLETED_ITEM_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_COMPLETED_ITEMS = 5_000;
+const MAX_TASK_EVIDENCE_IDS = 20;
 const MAX_STATE_BYTES = 4 * 1024 * 1024;
 
 export type ApprovalInboxEventType = "start" | "finish" | "cancel";
@@ -38,6 +39,13 @@ export interface ApprovalInboxItem {
   completedAt?: number;
 }
 
+export interface ApprovalInboxInstanceItem extends ApprovalInboxItem {
+  taskIds: string[];
+  taskCount: number;
+  taskIdsTruncated?: true;
+  decisionResults: Array<"agree" | "refuse" | "redirect">;
+}
+
 export interface ApprovalInboxPage {
   coverage: "partial";
   coverageSince: number;
@@ -47,7 +55,7 @@ export interface ApprovalInboxPage {
   limit: number;
   recordStatus: "pending" | "completed";
   capacityTruncated?: true;
-  items: ApprovalInboxItem[];
+  items: ApprovalInboxInstanceItem[];
   hasMore: boolean;
 }
 
@@ -183,9 +191,9 @@ export class DirectoryApprovalInboxIndex implements ApprovalInboxIndex {
       const now = this.#now();
       const recordStatus = input.recordStatus ?? "pending";
       const source = recordStatus === "completed" ? state.completedItems : state.pendingItems;
-      const matching = Object.values(source)
+      const matching = aggregateByProcessInstance(Object.values(source)
         .filter((item) => item.userId === input.userId)
-        .sort((left, right) => right.updatedAt - left.updatedAt || right.createdAt - left.createdAt);
+        .sort((left, right) => right.updatedAt - left.updatedAt || right.createdAt - left.createdAt));
       const offset = (input.page - 1) * input.limit;
       const items = matching.slice(offset, offset + input.limit).map((item) => ({ ...item }));
       const retentionCoverageSince = now - COMPLETED_ITEM_TTL_MS;
@@ -277,6 +285,37 @@ function assertPage(input: { userId: string; page: number; limit: number }): voi
 
 function itemKey(userId: string, processInstanceId: string, taskId: string | undefined): string {
   return createHash("sha256").update(`${userId}\0${processInstanceId}\0${taskId ?? ""}`, "utf8").digest("hex");
+}
+
+function aggregateByProcessInstance(items: ApprovalInboxItem[]): ApprovalInboxInstanceItem[] {
+  const grouped = new Map<string, ApprovalInboxItem[]>();
+  for (const item of items) {
+    const existing = grouped.get(item.processInstanceId);
+    if (existing === undefined) grouped.set(item.processInstanceId, [item]);
+    else existing.push(item);
+  }
+  return [...grouped.values()].map((members) => {
+    const representative = members[0] as ApprovalInboxItem;
+    const allTaskIds = [...new Set(members.flatMap((item) => item.taskId === undefined ? [] : [item.taskId]))];
+    const taskIds = allTaskIds.slice(0, MAX_TASK_EVIDENCE_IDS);
+    const decisionResults = [...new Set(members.flatMap((item) =>
+      item.decisionResult === undefined ? [] : [item.decisionResult]
+    ))];
+    const completedAt = Math.max(...members.flatMap((item) =>
+      item.completedAt === undefined ? [] : [item.completedAt]
+    ));
+    return {
+      ...representative,
+      ...(taskIds.length === 0 ? {} : { taskId: taskIds[0] }),
+      createdAt: Math.min(...members.map((item) => item.createdAt)),
+      updatedAt: Math.max(...members.map((item) => item.updatedAt)),
+      ...(Number.isFinite(completedAt) ? { completedAt } : {}),
+      taskIds,
+      taskCount: members.length,
+      ...(allTaskIds.length > taskIds.length ? { taskIdsTruncated: true as const } : {}),
+      decisionResults,
+    };
+  });
 }
 
 function prune(state: ApprovalInboxState, now: number): void {

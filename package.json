@@ -1,6 +1,6 @@
 {
   "name": "@mwe/dingtalk-approval-mcp",
-  "version": "0.10.1",
+  "version": "0.11.0",
   "private": true,
   "description": "Self-hosted OAuth-protected Streamable HTTP MCP for DingTalk OA approvals.",
   "type": "module",

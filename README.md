@@ -2,7 +2,7 @@
 
 `MWE审批MCP` 是部署在 `https://dingtalk.mwexk.com/mcp` 的自托管钉钉 OA 审批 MCP Server。
 
-当前版本：`0.10.1`。
+当前版本：`0.11.0`。
 
 ## 当前架构
 
@@ -71,7 +71,19 @@ approval_request  # 申请人：准备附件、提交、评论、撤销
 }
 ```
 
-`approval_inbox` 从 `bpms_task_change` 事件索引取候选项，然后逐项调用审批详情确认任务属于登录用户并与请求状态一致，才返回 `processInstanceId` 和可用的 `taskId`；若源事件缺少任务 ID，则仅返回实例 ID，并标记 `taskIdUnavailable=true`。`completed` 保存最近 30 天的 `finish` 事件并返回 `decisionResult=agree|refuse|redirect`，取消事件不会被当作已审批。普通 OA 没有免费的全量回填 API，因此两类响应都固定声明 `coverage=partial` 和 `resyncRequired=true`：它们只覆盖事件连接激活及保留窗口内的任务；若 5000 条容量边界截断更早记录，还会返回 `capacityTruncated=true` 并推进 `coverageSince`。该工具不冒充钉钉官方 DWS 的全历史收件箱。
+若响应中的 `refresh.truncated=true`，继续把同一响应的 `refresh.nextCursor` 原样传回，并保持 `recordStatus` 与 `refreshWindowDays` 不变；循环到 `truncated=false`。cursor 由服务端 HMAC 认证，最多有效 24 小时，绑定当前用户、原时间窗口、状态和模板集合；篡改会失败关闭，且不包含用户、实例或模板明文：
+
+```json
+{
+  "recordStatus": "completed",
+  "refreshWindowDays": 7,
+  "refreshCursor": "上一次响应的 refresh.nextCursor",
+  "page": 1,
+  "limit": 20
+}
+```
+
+`approval_inbox` 从 `bpms_task_change` 事件索引取候选项，然后逐项调用审批详情确认任务属于登录用户并与请求状态一致，才返回唯一 `processInstanceId` 和可用的 `taskId`。同一实例的多个任务事件合并成一条；`taskCount/verifiedTaskCount` 保留完整计数，`taskIds` 最多返回 20 个并用 `taskIdsTruncated=true` 声明截断，`decisionResults` 仅从当前详情仍有效的任务重建。若源事件缺少任务 ID，则仅返回实例 ID，并标记 `taskIdUnavailable=true`。刷新统计中的 `indexedRecordCount` 按唯一实例计数，`indexedTaskCount` 按写入的任务证据计数。候选详情失败时不会越过该页，而是返回可重试 cursor。`completed` 保存最近 30 天的 `finish` 事件并返回 `decisionResult=agree|refuse|redirect`，取消事件不会被当作已审批。普通 OA 没有免费的全量回填 API，因此两类响应都固定声明 `coverage=partial` 和 `resyncRequired=true`：它们只覆盖事件连接激活及保留窗口内的任务；若 5000 条容量边界截断更早记录，还会返回 `capacityTruncated=true` 并推进 `coverageSince`。该工具不冒充钉钉官方 DWS 的全历史收件箱。
 
 读取审批：
 

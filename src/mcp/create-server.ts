@@ -89,10 +89,20 @@ const approvalInboxSchema = z
   .object({
     recordStatus: z.enum(["pending", "completed"]).optional().describe("List pending tasks by default, or tasks already handled by the authenticated approver"),
     refreshWindowDays: z.number().int().min(1).max(30).optional().describe("Optionally refresh the event index through the bounded official instance-ID list scan for configured templates"),
+    refreshCursor: z.string().min(1).max(2048).regex(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u).optional().describe("Signed opaque continuation cursor returned by a prior truncated refresh using the same recordStatus and refreshWindowDays"),
     page: z.number().int().min(1).max(10).optional().describe("1-based event-index page; defaults to 1"),
     limit: z.number().int().min(1).max(20).optional().describe("Return 1 item for a single lookup or up to 20 for a batch"),
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    if (value.refreshCursor !== undefined && value.refreshWindowDays === undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["refreshWindowDays"],
+        message: "refreshWindowDays is required when refreshCursor is provided",
+      });
+    }
+  });
 const approvalRequestAttachmentBaseSchema = z
   .object({
     fileName: z.string().trim().min(1).max(255),
@@ -500,7 +510,7 @@ function createPublicApprovalMcpServer(
         name: "approval_inbox",
         title: "List the current approver's pending or completed approvals",
         description:
-          "Read-only discovery of one or a bounded page of pending or already handled approval tasks for the authenticated DingTalk user. Set recordStatus=completed for handled tasks; pending is the default. Optional refreshWindowDays performs a bounded scan through the official instance-ID list API for configured process codes, then revalidates each candidate against current approval details and the OAuth-bound user. Results are stored in the same bpms_task_change index before processInstanceId and an available taskId are returned; taskIdUnavailable=true marks an instance-only event. Completed history retains finish events for 30 days and can include agree, refuse, or redirect. Cancelled tasks are not completed approvals. Because neither the event index nor a configured-template scan is a complete free inbox backfill, every response declares partial coverage since event activation, retention, and any capacity truncation, plus whether resynchronization is required. Use approval_task for one returned instance.",
+          "Read-only discovery of a bounded page of unique pending or already handled approval instances for the authenticated DingTalk user. Set recordStatus=completed for handled tasks; pending is the default. Multiple task events for one processInstanceId are aggregated with full task counts, at most 20 taskIds, and decisionResults rebuilt from current detail. Optional refreshWindowDays performs a bounded scan through the official instance-ID list API for configured process codes, then revalidates each candidate against current approval details and the OAuth-bound user. When refresh.truncated=true, pass the HMAC-authenticated refresh.nextCursor back as refreshCursor with the same status and window until truncated=false; a detail failure returns a cursor that retries its source page. Results are stored in the same bpms_task_change index; taskIdUnavailable=true marks an instance-only event. Completed history retains finish events for 30 days and can include agree, refuse, or redirect. Cancelled tasks are not completed approvals. Because neither the event index nor a configured-template scan is a complete free inbox backfill, every response declares partial coverage since event activation, retention, and any capacity truncation, plus whether resynchronization is required. Use approval_task for one returned instance.",
         inputSchema: { ...z.toJSONSchema(approvalInboxSchema), type: "object" },
         annotations: readAnnotations,
       },

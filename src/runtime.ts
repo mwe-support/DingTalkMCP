@@ -9,6 +9,7 @@ import { DingTalkTokenProvider } from "./dingtalk/token-provider.js";
 
 export interface ApprovalRuntimeOptions {
   audit?: ApprovalAuditSink;
+  inboxCursorSecret?: string;
 }
 
 export function createApprovalService(config: ApprovalMcpConfig, options: ApprovalRuntimeOptions = {}): ApprovalService {
@@ -39,6 +40,7 @@ export function createApprovalRuntime(
     uploadHostSuffixes: config.uploadHostSuffixes,
     allowedProcessCodes: config.allowedProcessCodes,
     inboxProcessCodes: config.inboxProcessCodes,
+    ...(options.inboxCursorSecret === undefined ? {} : { inboxCursorSecret: options.inboxCursorSecret }),
     corpId: config.auth.corpId,
     audit: options.audit ?? new JsonLineAuditSink(),
     idempotencyLedger: new DirectoryIdempotencyLedger(config.idempotencyLedgerPath),
