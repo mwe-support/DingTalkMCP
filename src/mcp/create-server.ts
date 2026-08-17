@@ -164,11 +164,22 @@ const approvalRequestRevokeSchema = z
     remark: z.string().max(1024).optional(),
   })
   .strict();
+const approvalRequestCommentSchema = z
+  .object({
+    action: z.literal("comment"),
+    processInstanceId,
+    text: z.string().trim().min(1).max(1024),
+    requestId: z.string().uuid(),
+    confirm: z.boolean(),
+    dryRun: z.boolean().optional(),
+  })
+  .strict();
 const approvalRequestSchema = z.union([
   approvalRequestExpensePrepareSchema,
   approvalRequestPaymentPrepareSchema,
   approvalRequestExpenseSubmitSchema,
   approvalRequestPaymentSubmitSchema,
+  approvalRequestCommentSchema,
   approvalRequestRevokeSchema,
 ]);
 
@@ -486,9 +497,9 @@ function createPublicApprovalMcpServer(
       },
       {
         name: "approval_request",
-        title: "Prepare, submit, or revoke an approval request",
+        title: "Prepare, submit, comment on, or revoke an approval request",
         description:
-          "One applicant-facing tool for the exact allowed templates: expense reimbursement and payment request. Overtime and all other templates are denied. The server derives the applicant and automatically selects the only authenticated department; pass optional deptId only when the returned department choices require disambiguation. It never accepts approver, CC, flow-node, processCode, or applicant identity overrides. Attachment bytes must be uploaded directly by the Agent client to the returned DingTalk upload URL; the MCP server never receives, parses, or OCRs file content.",
+          "One applicant-facing tool for the exact allowed templates: expense reimbursement and payment request. It prepares, submits, adds an idempotent text comment to the authenticated applicant's instance, or revokes it. Overtime and all other templates are denied. The server derives the applicant and automatically selects the only authenticated department; pass optional deptId only when the returned department choices require disambiguation. It never accepts approver, CC, flow-node, processCode, applicant identity, or comment-user overrides. Attachment bytes must be uploaded directly by the Agent client to the returned DingTalk upload URL; the MCP server never receives, parses, or OCRs file content. DingTalk exposes no server API for saving these requests to its client draft box; use prepare or submit with dryRun for no-submit validation.",
         inputSchema: { ...z.toJSONSchema(approvalRequestSchema), type: "object" },
         annotations: writeAnnotations,
       },
@@ -579,13 +590,14 @@ async function auditedPublicToolCall(
 
 function boundedAction(
   rawArguments: Record<string, unknown> | undefined,
-): "view" | "approve" | "reject" | "prepare" | "submit" | "revoke" | undefined {
+): "view" | "approve" | "reject" | "prepare" | "submit" | "comment" | "revoke" | undefined {
   const action = rawArguments?.action;
   return action === "view" ||
     action === "approve" ||
     action === "reject" ||
     action === "prepare" ||
     action === "submit" ||
+    action === "comment" ||
     action === "revoke"
     ? action
     : undefined;

@@ -1,4 +1,4 @@
-export type ApprovalAuditAction = "start" | "approve" | "reject" | "revoke";
+export type ApprovalAuditAction = "start" | "approve" | "reject" | "comment" | "revoke";
 export type ApprovalAuditOutcome = "succeeded" | "rejected" | "failed" | "uncertain";
 
 export interface ApprovalAuditContext {

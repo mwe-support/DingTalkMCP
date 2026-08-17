@@ -190,7 +190,7 @@ describe("approval_request public MCP contract", () => {
         action: "submit",
         template: "expense_reimbursement",
         currentStatus: "SUBMITTED",
-        safeNextActions: ["revoke"],
+        safeNextActions: ["comment", "revoke"],
       },
     });
     const startCall = request.mock.calls.find(([input]) => input.path === "/v1.0/workflow/processInstances")?.[0];
@@ -331,6 +331,173 @@ describe("approval_request public MCP contract", () => {
     expect(result.isError).toBe(true);
     expect(result.structuredContent).toMatchObject({ error: { code: "INSUFFICIENT_SCOPE" } });
     expect(request).not.toHaveBeenCalled();
+  });
+
+  it("dry-runs a comment on the authenticated applicant's allowlisted approval", async () => {
+    const { client, request } = await connectedApplicantClient();
+    request.mockResolvedValue({
+      result: {
+        processInstanceId: "pi-comment-dry-run",
+        processCode: "PROC-2DB91B79-3CDD-421D-A223-0489A7BAB2C0",
+        originatorUserId: "user-1",
+        status: "RUNNING",
+        tasks: [],
+      },
+    });
+
+    const result = await client.callTool({
+      name: "approval_request",
+      arguments: {
+        action: "comment",
+        processInstanceId: "pi-comment-dry-run",
+        text: "补充审批说明",
+        requestId: "12121212-1212-4212-8212-121212121212",
+        confirm: false,
+        dryRun: true,
+      },
+    });
+
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      result: {
+        processInstanceId: "pi-comment-dry-run",
+        action: "comment",
+        template: "expense_reimbursement",
+        currentStatus: "COMMENTABLE",
+        safeNextActions: ["comment", "revoke"],
+        data: { dryRun: true, textLength: 6 },
+      },
+    });
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(request).not.toHaveBeenCalledWith(expect.objectContaining({
+      path: "/v1.0/workflow/processInstances/comments",
+    }));
+  });
+
+  it("adds an idempotent comment as the server-bound applicant", async () => {
+    const { client, request } = await connectedApplicantClient();
+    let commentAdded = false;
+    request.mockImplementation(async (input: { path: string }) => {
+      if (input.path === "/v1.0/workflow/processInstances") {
+        return {
+          result: {
+            processInstanceId: "pi-comment-1",
+            processCode: "PROC-2DB91B79-3CDD-421D-A223-0489A7BAB2C0",
+            originatorUserId: "user-1",
+            status: "RUNNING",
+            tasks: [],
+            operationRecords: commentAdded
+              ? [{ type: "ADD_REMARK", userId: "user-1", remark: "补充审批说明" }]
+              : [],
+          },
+        };
+      }
+      if (input.path === "/v1.0/workflow/processInstances/comments") {
+        commentAdded = true;
+        return { result: true, success: true };
+      }
+      throw new Error(`Unexpected DingTalk request: ${input.path}`);
+    });
+    const arguments_ = {
+      action: "comment",
+      processInstanceId: "pi-comment-1",
+      text: "补充审批说明",
+      requestId: "34343434-3434-4434-8434-343434343434",
+      confirm: true,
+    } as const;
+
+    const first = await client.callTool({ name: "approval_request", arguments: arguments_ });
+    const repeated = await client.callTool({ name: "approval_request", arguments: arguments_ });
+
+    expect(first.isError).not.toBe(true);
+    expect(repeated.structuredContent).toEqual(first.structuredContent);
+    expect(first.structuredContent).toMatchObject({
+      result: {
+        processInstanceId: "pi-comment-1",
+        action: "comment",
+        template: "expense_reimbursement",
+        currentStatus: "COMMENTED",
+        safeNextActions: ["comment", "revoke"],
+        data: {
+          dryRun: false,
+          upstreamResult: { result: true, success: true },
+          postActionRefresh: { ok: true, commentObserved: true },
+        },
+      },
+    });
+    const commentCalls = request.mock.calls.filter(([input]) => input.path.endsWith("/comments"));
+    expect(commentCalls).toHaveLength(1);
+    expect(commentCalls[0]?.[0]).toEqual({
+      method: "POST",
+      path: "/v1.0/workflow/processInstances/comments",
+      body: {
+        processInstanceId: "pi-comment-1",
+        text: "补充审批说明",
+        commentUserId: "user-1",
+      },
+    });
+  });
+
+  it("refuses to comment on an approval initiated by another user", async () => {
+    const { client, request } = await connectedApplicantClient();
+    request.mockResolvedValue({
+      result: {
+        processInstanceId: "pi-comment-other-user",
+        processCode: "PROC-2DB91B79-3CDD-421D-A223-0489A7BAB2C0",
+        originatorUserId: "user-2",
+        status: "RUNNING",
+        tasks: [],
+      },
+    });
+
+    const result = await client.callTool({
+      name: "approval_request",
+      arguments: {
+        action: "comment",
+        processInstanceId: "pi-comment-other-user",
+        text: "不应写入",
+        requestId: "56565656-5656-4656-8656-565656565656",
+        confirm: true,
+      },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({ error: { code: "APPROVAL_COMMENT_FORBIDDEN" } });
+    expect(request).not.toHaveBeenCalledWith(expect.objectContaining({
+      path: "/v1.0/workflow/processInstances/comments",
+    }));
+  });
+
+  it("requires explicit confirmation and rejects caller-controlled comment identity", async () => {
+    const { client, request } = await connectedApplicantClient();
+    request.mockResolvedValue({
+      result: {
+        processInstanceId: "pi-comment-confirm",
+        processCode: "PROC-2DB91B79-3CDD-421D-A223-0489A7BAB2C0",
+        originatorUserId: "user-1",
+        status: "RUNNING",
+        tasks: [],
+      },
+    });
+    const base = {
+      action: "comment",
+      processInstanceId: "pi-comment-confirm",
+      text: "补充说明",
+      requestId: "78787878-7878-4878-8878-787878787878",
+      confirm: false,
+    } as const;
+
+    const unconfirmed = await client.callTool({ name: "approval_request", arguments: base });
+    const spoofed = await client.callTool({
+      name: "approval_request",
+      arguments: { ...base, confirm: true, commentUserId: "user-2" },
+    });
+
+    expect(unconfirmed.structuredContent).toMatchObject({ error: { code: "CONFIRMATION_REQUIRED" } });
+    expect(spoofed.structuredContent).toMatchObject({ error: { code: "INVALID_INPUT" } });
+    expect(request).not.toHaveBeenCalledWith(expect.objectContaining({
+      path: "/v1.0/workflow/processInstances/comments",
+    }));
   });
 
   it("revokes only an allowlisted request template and replays the persisted result idempotently", async () => {

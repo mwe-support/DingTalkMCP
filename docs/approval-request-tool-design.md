@@ -2,7 +2,7 @@
 
 ## 范围
 
-`approval_request` 是申请人侧的一体化工具，聚合准备附件、提交审批和撤销审批三个同生命周期动作。首版采用默认拒绝和精确允许列表：
+`approval_request` 是申请人侧的一体化工具，聚合准备附件、提交审批、添加评论和撤销审批等同生命周期动作。采用默认拒绝和精确允许列表：
 
 | 模板键 | OA 模板 | 固定 processCode | 附件字段 |
 |---|---|---|---|
@@ -19,6 +19,15 @@
 - 每次 `prepare`/`submit` 前读取线上模板 Schema，精确核对模板类型、控件 ID/名称/类型，以及代码使用的固定选项键；任何漂移均失败关闭。
 - `approval_request` 要求 `approval:read` 与独立的 `approval:create` OAuth scope。写操作仍要求明确 `confirm=true`。
 - `submit` 和实际 `revoke` 均使用稳定 UUID `requestId` 和持久幂等账本；账本命名空间绑定 OAuth 申请人。附件提交、审批创建或撤销结果不确定时禁止自动重放。
+- `comment` 仅允许操作当前 OAuth 用户本人发起且属于模板允许列表的实例，评论人由服务端注入；文本限制 1–1024 字符，真实写入要求 `confirm=true` 和稳定 UUID `requestId`，结果不确定时禁止自动重放。
+
+## 草稿能力边界
+
+钉钉官方 OA 公开服务端 API 当前没有保存到钉钉客户端草稿箱的接口；`POST /v1.0/workflow/processInstances` 只有正式创建实例语义，也没有草稿参数。项目不发布会造成误解的 `draft` 动作：`prepare` 和 `submit + dryRun=true` 是无提交预检，可验证实时模板、部门、字段与最终请求，但不会生成钉钉草稿箱条目。
+
+## 审批评论
+
+文本评论通过官方 `POST /v1.0/workflow/processInstances/comments` 写入。公开 Schema 不接受 `commentUserId`，服务端使用 OAuth 绑定的申请人 userId；写入前重新读取审批详情，核对发起人与模板允许列表。官方接口支持评论附件元数据，但其公开上传说明依赖 H5/小程序钉盘 JSAPI，首版保持文本评论，不接受未经服务端建立与验证的评论附件身份。
 
 ## 附件直传链路
 

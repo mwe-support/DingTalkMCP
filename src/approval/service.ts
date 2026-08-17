@@ -162,6 +162,14 @@ export type ApprovalRequestInput =
       requestId: string;
     }
   | {
+      action: "comment";
+      processInstanceId: string;
+      text: string;
+      requestId: string;
+      confirm: boolean;
+      dryRun?: boolean | undefined;
+    }
+  | {
       action: "revoke";
       processInstanceId: string;
       requestId: string;
@@ -172,11 +180,11 @@ export type ApprovalRequestInput =
 
 export interface ApprovalRequestEnvelope {
   processInstanceId?: string;
-  action: "prepare" | "submit" | "revoke";
+  action: "prepare" | "submit" | "comment" | "revoke";
   template?: ApprovalRequestTemplate;
   currentStatus: string;
   auditCorrelationId: string;
-  safeNextActions: Array<"prepare" | "submit" | "revoke">;
+  safeNextActions: Array<"prepare" | "submit" | "comment" | "revoke">;
   data: unknown;
 }
 
@@ -371,6 +379,51 @@ export class ApprovalService {
   async approvalRequest(input: ApprovalRequestInput): Promise<ApprovalRequestEnvelope> {
     const auditCorrelationId = randomUUID();
     this.#assertScope("approval:read");
+    if (input.action === "comment") {
+      this.#assertScope("approval:create");
+      const current = await this.getProcessInstanceDetail(input.processInstanceId);
+      const template = approvalRequestTemplateForProcessCode(current.normalized.processCode);
+      if (template === undefined) {
+        throw new ApprovalMcpError(
+          "PROCESS_CODE_NOT_ALLOWED",
+          "approval_request can comment only on an instance of an allowlisted request template.",
+        );
+      }
+      const actorUserId = this.#requireCallerUserId();
+      if (current.normalized.originatorUserId !== actorUserId) {
+        throw new ApprovalMcpError(
+          "APPROVAL_COMMENT_FORBIDDEN",
+          "approval_request can comment only on an approval initiated by the authenticated applicant.",
+        );
+      }
+      if (input.dryRun === true) {
+        return {
+          processInstanceId: input.processInstanceId,
+          action: "comment",
+          template,
+          currentStatus: "COMMENTABLE",
+          auditCorrelationId,
+          safeNextActions: current.normalized.status?.toUpperCase() === "RUNNING"
+            ? ["comment", "revoke"]
+            : ["comment"],
+          data: { dryRun: true, textLength: input.text.length },
+        };
+      }
+      this.#assertConfirmedActor(input.confirm, actorUserId);
+      const fingerprint = createHash("sha256").update(stableStringify({
+        actorUserId,
+        processInstanceId: input.processInstanceId,
+        text: input.text,
+      })).digest("hex");
+      return this.#commentApprovalRequestIdempotently({
+        actorUserId,
+        auditCorrelationId,
+        fingerprint,
+        input,
+        template,
+        instanceStatus: current.normalized.status?.toUpperCase(),
+      });
+    }
     if (input.action === "revoke") {
       this.#assertScope("approval:create");
       const current = await this.getProcessInstanceDetail(input.processInstanceId);
@@ -961,6 +1014,8 @@ export class ApprovalService {
         serverPerformsOcr: false,
         requestTemplates: ["expense_reimbursement", "payment_request"],
         requestTemplateAllowlistExact: true,
+        commentOnOwnRequest: this.#writesEnabled(),
+        saveToDingTalkDraftBox: false,
         uploadAttachments:
           this.#agentId !== undefined && this.#callerUserId !== undefined && this.#callerUnionId !== undefined,
         uploadTransport: "agent_direct_to_dingtalk",
@@ -1269,7 +1324,7 @@ export class ApprovalService {
         template: input.template,
         currentStatus: "SUBMITTED",
         auditCorrelationId: input.auditCorrelationId,
-        safeNextActions: ["revoke"],
+        safeNextActions: ["comment", "revoke"],
         data: { dryRun: false, upstreamResult, committedAttachments },
       };
       await this.#idempotencyLedger.put(ledgerKey, {
@@ -1365,6 +1420,105 @@ export class ApprovalService {
       throw new ApprovalMcpError(
         "IDEMPOTENCY_OUTCOME_UNKNOWN",
         "The approval revocation result is uncertain; inspect DingTalk before using a new requestId.",
+        { cause: error },
+      );
+    }
+  }
+
+  async #commentApprovalRequestIdempotently(input: {
+    actorUserId: string;
+    auditCorrelationId: string;
+    fingerprint: string;
+    input: Extract<ApprovalRequestInput, { action: "comment" }>;
+    template: ApprovalRequestTemplate;
+    instanceStatus?: string | undefined;
+  }): Promise<ApprovalRequestEnvelope> {
+    const ledgerKey = `approval-request-comment:${input.actorUserId}:${input.input.requestId}`;
+    const reservation = await this.#idempotencyLedger.reserve(ledgerKey, input.fingerprint);
+    if (!reservation.created) {
+      if (reservation.entry.fingerprint !== input.fingerprint) {
+        throw new ApprovalMcpError(
+          "IDEMPOTENCY_CONFLICT",
+          "The requestId was already used with a different approval comment payload.",
+        );
+      }
+      if (reservation.entry.status === "succeeded") {
+        return reservation.entry.result as ApprovalRequestEnvelope;
+      }
+      throw new ApprovalMcpError(
+        "IDEMPOTENCY_OUTCOME_UNKNOWN",
+        "A previous approval comment may have reached DingTalk; inspect the instance before retrying.",
+      );
+    }
+    try {
+      const upstreamResult = await this.#audited(
+        {
+          action: "comment",
+          actorUserId: input.actorUserId,
+          correlationId: input.auditCorrelationId,
+          processInstanceId: input.input.processInstanceId,
+          requestId: input.input.requestId,
+        },
+        () => this.#api.request({
+          method: "POST",
+          path: "/v1.0/workflow/processInstances/comments",
+          body: {
+            processInstanceId: input.input.processInstanceId,
+            text: input.input.text,
+            commentUserId: input.actorUserId,
+          },
+        }),
+      );
+      const upstream = asRecord(upstreamResult);
+      if (upstream?.result !== true || upstream.success !== true) {
+        throw new ApprovalMcpError(
+          "INVALID_RESPONSE",
+          "DingTalk did not confirm that the approval comment was added.",
+        );
+      }
+      let postActionRefresh = { ok: false, commentObserved: false };
+      try {
+        const refreshed = await this.getProcessInstanceDetail(input.input.processInstanceId);
+        const commentObserved = refreshed.normalized.operationRecords.some((record) => {
+          const operation = asRecord(record);
+          return text(operation?.type)?.toUpperCase() === "ADD_REMARK" &&
+            text(operation?.userId) === input.actorUserId &&
+            text(operation?.remark) === input.input.text;
+        });
+        postActionRefresh = { ok: true, commentObserved };
+      } catch {
+        // The comment has already succeeded. A failed or eventually-consistent refresh
+        // must not turn it into a retryable mutation error that duplicates the comment.
+      }
+      const result: ApprovalRequestEnvelope = {
+        processInstanceId: input.input.processInstanceId,
+        action: "comment",
+        template: input.template,
+        currentStatus: "COMMENTED",
+        auditCorrelationId: input.auditCorrelationId,
+        safeNextActions: input.instanceStatus === "RUNNING" ? ["comment", "revoke"] : ["comment"],
+        data: { dryRun: false, upstreamResult, postActionRefresh },
+      };
+      await this.#idempotencyLedger.put(ledgerKey, {
+        fingerprint: input.fingerprint,
+        status: "succeeded",
+        result,
+        updatedAt: new Date().toISOString(),
+      });
+      return result;
+    } catch (error) {
+      try {
+        await this.#idempotencyLedger.put(ledgerKey, {
+          fingerprint: input.fingerprint,
+          status: "uncertain",
+          updatedAt: new Date().toISOString(),
+        });
+      } catch {
+        // The pending reservation still prevents an unsafe automatic replay.
+      }
+      throw new ApprovalMcpError(
+        "IDEMPOTENCY_OUTCOME_UNKNOWN",
+        "The approval comment result is uncertain; inspect DingTalk before using a new requestId.",
         { cause: error },
       );
     }
@@ -1628,6 +1782,7 @@ function isKnownPreWriteRejection(error: unknown): boolean {
 }
 
 const PRE_WRITE_REJECTION_CODES = new Set<ApprovalMcpErrorCode>([
+  "APPROVAL_COMMENT_FORBIDDEN",
   "CALLER_IDENTITY_MISMATCH",
   "CALLER_IDENTITY_NOT_CONFIGURED",
   "CONFIRMATION_REQUIRED",

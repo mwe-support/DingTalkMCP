@@ -2,7 +2,7 @@
 
 `MWE审批MCP` 是部署在 `https://dingtalk.mwexk.com/mcp` 的自托管钉钉 OA 审批 MCP Server。
 
-当前版本：`0.7.4`。
+当前版本：`0.8.0`。
 
 ## 当前架构
 
@@ -29,7 +29,7 @@ WorkBuddy / Codex
 
 ```text
 approval_task     # 审批人：查看、同意、拒绝
-approval_request  # 申请人：准备附件、提交、撤销
+approval_request  # 申请人：准备附件、提交、评论、撤销
 ```
 
 读取审批：
@@ -104,6 +104,10 @@ approval_request  # 申请人：准备附件、提交、撤销
 ```
 
 `deptId` 为可选部门提示，不是客户端提供的身份或权限依据。服务端始终查询 OAuth 申请人的实时通讯录：账号只属于一个部门时自动使用该部门，并规范化客户端遗留的根部门 `1`；账号属于多个部门且无法唯一确定时返回 `DEPARTMENT_SELECTION_REQUIRED` 及安全的部门 ID/名称候选，Agent 再用候选中的 `deptId` 重试。
+
+`action=comment` 可对当前 OAuth 用户本人发起且属于精确模板允许列表的审批实例添加文本评论。评论内容为 1–1024 字符，评论人始终由服务端注入；真实写入要求 `confirm=true` 和稳定 UUID `requestId`，重复调用由持久幂等账本去重。首版不接受评论附件元数据，避免客户端伪造钉盘文件身份。
+
+钉钉当前公开的官方 OA 服务端 API 没有“保存到钉钉草稿箱”接口，发起审批接口也没有草稿标志。`prepare` 与 `submit + dryRun=true` 会读取实时模板、校验完整表单并构建最终请求，但不会创建审批实例，也不会在钉钉客户端草稿箱生成条目；项目不会用本地记录冒充钉钉草稿。
 
 费用报销字段为 `date`、`reason`、`counterparty` 和至少一条 `items`；每条明细包含 `amount`、`category`（仅 `AI费用` 或 `其它`）、`expenseDepartment`、`remark`。
 

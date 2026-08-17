@@ -112,7 +112,7 @@ function actionAwareMcpAccess(options: ApprovalHttpOptions): RequestHandler {
 
 interface ScopeChallengedInvocation {
   toolName: "approval_task" | "approval_request";
-  action?: "view" | "approve" | "reject" | "prepare" | "submit" | "revoke";
+  action?: "view" | "approve" | "reject" | "prepare" | "submit" | "comment" | "revoke";
   requiredScopes: McpScope[];
 }
 
@@ -205,7 +205,7 @@ async function auditScopeRejections(
 
 function boundedAction(value: unknown): ScopeChallengedInvocation["action"] {
   return value === "view" || value === "approve" || value === "reject" || value === "prepare" ||
-    value === "submit" || value === "revoke"
+    value === "submit" || value === "comment" || value === "revoke"
     ? value
     : undefined;
 }
