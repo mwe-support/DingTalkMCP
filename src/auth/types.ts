@@ -1,6 +1,6 @@
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 
-export const MCP_SCOPES = ["approval:read", "approval:decide"] as const;
+export const MCP_SCOPES = ["approval:read", "approval:decide", "approval:create"] as const;
 
 export type McpScope = (typeof MCP_SCOPES)[number];
 

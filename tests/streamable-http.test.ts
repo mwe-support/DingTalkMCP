@@ -25,7 +25,7 @@ describe("self-hosted Streamable HTTP transport", () => {
     await expect(metadata.json()).resolves.toMatchObject({
       resource,
       authorization_servers: ["https://dingtalk.mwexk.com/"],
-      scopes_supported: ["approval:read", "approval:decide"],
+      scopes_supported: ["approval:read", "approval:decide", "approval:create"],
     });
 
     const response = await mcpRequest(baseUrl, initializeRequest(), undefined);
@@ -52,7 +52,7 @@ describe("self-hosted Streamable HTTP transport", () => {
       accessToken,
     );
     expect((await jsonRpcBody(listed)) as Record<string, unknown>).toMatchObject({
-      result: { tools: [{ name: "approval_task" }] },
+      result: { tools: [{ name: "approval_task" }, { name: "approval_request" }] },
     });
 
     const called = await mcpRequest(
@@ -158,7 +158,7 @@ async function fixture(): Promise<{
     resourceUrl: new URL(resource),
     redirectUrl: new URL("https://dingtalk.mwexk.com/oauth/dingtalk/callback"),
     expectedCorpId: "corp-1",
-    allowedScopes: ["approval:read", "approval:decide"],
+    allowedScopes: ["approval:read", "approval:decide", "approval:create"],
     accessTokenTtlSeconds: 600,
     refreshTokenTtlSeconds: 28_800,
     transactionTtlSeconds: 300,

@@ -7,6 +7,10 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import * as z from "zod/v4";
 
 import type { ApprovalService } from "../approval/service.js";
+import {
+  expenseReimbursementFieldsSchema,
+  paymentRequestFieldsSchema,
+} from "../approval/request-templates.js";
 import { ApprovalMcpError, errorPayload } from "../core/errors.js";
 import {
   DEFAULT_AUDIT_WRITE_TIMEOUT_MS,
@@ -79,6 +83,92 @@ const approvalTaskSchema = z.union([
   approvalTaskViewDownloadSchema,
   approvalTaskApproveSchema,
   approvalTaskRejectSchema,
+]);
+const approvalRequestAttachmentBaseSchema = z
+  .object({
+    fileName: z.string().trim().min(1).max(255),
+    fileSize: z.number().int().positive().max(20 * 1024 * 1024),
+  })
+  .strict();
+const expenseAttachmentSchema = approvalRequestAttachmentBaseSchema
+  .extend({ field: z.enum(["invoice", "other"]) })
+  .strict();
+const paymentAttachmentSchema = approvalRequestAttachmentBaseSchema
+  .extend({ field: z.literal("attachment") })
+  .strict();
+const expenseUploadSchema = expenseAttachmentSchema
+  .extend({
+    uploadKey: z.string().min(1),
+    spaceId: z.union([z.string().min(1), z.number().int().nonnegative()]),
+  })
+  .strict();
+const paymentUploadSchema = paymentAttachmentSchema
+  .extend({
+    uploadKey: z.string().min(1),
+    spaceId: z.union([z.string().min(1), z.number().int().nonnegative()]),
+  })
+  .strict();
+const approvalRequestExpensePrepareSchema = z
+  .object({
+    action: z.literal("prepare"),
+    template: z.literal("expense_reimbursement"),
+    deptId: z.number().int().positive(),
+    fields: expenseReimbursementFieldsSchema,
+    attachments: z.array(expenseAttachmentSchema).max(10).optional(),
+    confirm: z.boolean().optional(),
+    dryRun: z.boolean().optional(),
+  })
+  .strict();
+const approvalRequestPaymentPrepareSchema = z
+  .object({
+    action: z.literal("prepare"),
+    template: z.literal("payment_request"),
+    deptId: z.number().int().positive(),
+    fields: paymentRequestFieldsSchema,
+    attachments: z.array(paymentAttachmentSchema).max(10).optional(),
+    confirm: z.boolean().optional(),
+    dryRun: z.boolean().optional(),
+  })
+  .strict();
+const approvalRequestExpenseSubmitSchema = z
+  .object({
+    action: z.literal("submit"),
+    template: z.literal("expense_reimbursement"),
+    deptId: z.number().int().positive(),
+    fields: expenseReimbursementFieldsSchema,
+    uploads: z.array(expenseUploadSchema).max(10).optional(),
+    confirm: z.boolean(),
+    dryRun: z.boolean().optional(),
+    requestId: z.string().uuid(),
+  })
+  .strict();
+const approvalRequestPaymentSubmitSchema = z
+  .object({
+    action: z.literal("submit"),
+    template: z.literal("payment_request"),
+    deptId: z.number().int().positive(),
+    fields: paymentRequestFieldsSchema,
+    uploads: z.array(paymentUploadSchema).max(10).optional(),
+    confirm: z.boolean(),
+    dryRun: z.boolean().optional(),
+    requestId: z.string().uuid(),
+  })
+  .strict();
+const approvalRequestRevokeSchema = z
+  .object({
+    action: z.literal("revoke"),
+    processInstanceId,
+    confirm: z.boolean(),
+    dryRun: z.boolean().optional(),
+    remark: z.string().max(1024).optional(),
+  })
+  .strict();
+const approvalRequestSchema = z.union([
+  approvalRequestExpensePrepareSchema,
+  approvalRequestPaymentPrepareSchema,
+  approvalRequestExpenseSubmitSchema,
+  approvalRequestPaymentSubmitSchema,
+  approvalRequestRevokeSchema,
 ]);
 
 export interface ApprovalMcpServerOptions {
@@ -384,19 +474,36 @@ function createPublicApprovalMcpServer(
     { capabilities: { tools: {} } },
   );
   server.setRequestHandler(ListToolsRequestSchema, () => ({
-    tools: [{
-      name: "approval_task",
-      title: "View or decide an approval task",
-      description:
-        "One approver-facing tool for reading an approval instance and deciding its active task. For attachments, use action=view with attachmentAction=download to receive short-lived links; the Agent client must download and identify or OCR files itself. The MCP server never downloads, parses, or OCRs attachment content. Use action=view before approve or reject.",
-      inputSchema: { ...z.toJSONSchema(approvalTaskSchema), type: "object" },
-      annotations: writeAnnotations,
-    }],
+    tools: [
+      {
+        name: "approval_task",
+        title: "View or decide an approval task",
+        description:
+          "One approver-facing tool for reading an approval instance and deciding its active task. For attachments, use action=view with attachmentAction=download to receive short-lived links; the Agent client must download and identify or OCR files itself. The MCP server never downloads, parses, or OCRs attachment content. Use action=view before approve or reject.",
+        inputSchema: { ...z.toJSONSchema(approvalTaskSchema), type: "object" },
+        annotations: writeAnnotations,
+      },
+      {
+        name: "approval_request",
+        title: "Prepare, submit, or revoke an approval request",
+        description:
+          "One applicant-facing tool for the exact allowed templates: expense reimbursement and payment request. Overtime and all other templates are denied. It never accepts approver, CC, flow-node, processCode, or applicant identity overrides. Attachment bytes must be uploaded directly by the Agent client to the returned DingTalk upload URL; the MCP server never receives, parses, or OCRs file content.",
+        inputSchema: { ...z.toJSONSchema(approvalRequestSchema), type: "object" },
+        annotations: writeAnnotations,
+      },
+    ],
   }));
   server.setRequestHandler(CallToolRequestSchema, async (request) =>
     auditedPublicToolCall(options, request.params.name, request.params.arguments, async () => {
       if (request.params.name !== "approval_task") {
-        throw new ApprovalMcpError("INVALID_INPUT", "The requested MCP tool is not published.");
+        if (request.params.name !== "approval_request") {
+          throw new ApprovalMcpError("INVALID_INPUT", "The requested MCP tool is not published.");
+        }
+        const parsed = await approvalRequestSchema.safeParseAsync(request.params.arguments);
+        if (!parsed.success) {
+          throw new ApprovalMcpError("INVALID_INPUT", "approval_request arguments do not match the action contract.");
+        }
+        return service.approvalRequest(parsed.data);
       }
       const parsed = await approvalTaskSchema.safeParseAsync(request.params.arguments);
       if (!parsed.success) {
@@ -418,11 +525,12 @@ async function auditedPublicToolCall(
   const invocationId = randomUUID();
   const startedAt = performance.now();
   const action = boundedAction(rawArguments);
+  const publishedTool = requestedToolName === "approval_task" || requestedToolName === "approval_request";
   const base: ToolInvocationAuditEventBase = {
     timestamp: new Date().toISOString(),
     invocationId,
     transport: "streamable_http",
-    toolName: requestedToolName === "approval_task" ? "approval_task" : "unknown",
+    toolName: publishedTool ? requestedToolName : "unknown",
     ...(options.auditSubjectHash === undefined ? {} : { subjectHash: options.auditSubjectHash }),
     ...(action === undefined ? {} : { action }),
   };
@@ -446,8 +554,8 @@ async function auditedPublicToolCall(
     ? await invoke()
     : await options.auditContext.run(invocationState, invoke);
   const resultErrorCode = toolResultErrorCode(result);
-  const errorCode = requestedToolName === "approval_task" ? resultErrorCode : "UNKNOWN_TOOL";
-  const outcome = requestedToolName === "approval_task" ? toolAuditOutcome(errorCode) : "unknown_tool";
+  const errorCode = publishedTool ? resultErrorCode : "UNKNOWN_TOOL";
+  const outcome = publishedTool ? toolAuditOutcome(errorCode) : "unknown_tool";
   try {
     await runAuditWriteWithinTimeout(
       () => options.toolAudit?.record({
@@ -468,9 +576,18 @@ async function auditedPublicToolCall(
   return result;
 }
 
-function boundedAction(rawArguments: Record<string, unknown> | undefined): "view" | "approve" | "reject" | undefined {
+function boundedAction(
+  rawArguments: Record<string, unknown> | undefined,
+): "view" | "approve" | "reject" | "prepare" | "submit" | "revoke" | undefined {
   const action = rawArguments?.action;
-  return action === "view" || action === "approve" || action === "reject" ? action : undefined;
+  return action === "view" ||
+    action === "approve" ||
+    action === "reject" ||
+    action === "prepare" ||
+    action === "submit" ||
+    action === "revoke"
+    ? action
+    : undefined;
 }
 
 function markAuditPartial<T extends Awaited<ReturnType<typeof safely>>>(result: T): T {

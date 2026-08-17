@@ -16,7 +16,7 @@ export interface ToolInvocationAuditEventBase {
   transport: "streamable_http";
   toolName: string;
   subjectHash?: string;
-  action?: "view" | "approve" | "reject";
+  action?: "view" | "approve" | "reject" | "prepare" | "submit" | "revoke";
 }
 
 export type ToolInvocationAuditEvent = ToolInvocationAuditEventBase &

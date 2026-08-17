@@ -32,6 +32,8 @@ describe("loadConfig", () => {
   it("loads a canonical OAuth resource and bounded token lifetimes", () => {
     const config = loadConfig(requiredEnvironment);
 
+    expect(config.agentId).toBeUndefined();
+    expect(config.uploadHostSuffixes).toEqual([".aliyuncs.com"]);
     expect(config.auth).toEqual({
       publicUrl: "https://dingtalk.mwexk.com/mcp",
       issuerUrl: "https://dingtalk.mwexk.com/",
@@ -44,8 +46,25 @@ describe("loadConfig", () => {
       accessTokenTtlSeconds: 600,
       refreshTokenTtlSeconds: 28_800,
       transactionTtlSeconds: 300,
-      allowedScopes: ["approval:read", "approval:decide"],
+      allowedScopes: ["approval:read", "approval:decide", "approval:create"],
     });
+  });
+
+  it("loads the DingTalk microapp agentId required by direct approval attachment uploads", () => {
+    const config = loadConfig({
+      ...requiredEnvironment,
+      DINGTALK_AGENT_ID: "123456",
+      APPROVAL_UPLOAD_HOST_SUFFIXES: ".aliyuncs.com,.example.invalid",
+    });
+
+    expect(config.agentId).toBe(123456);
+    expect(config.uploadHostSuffixes).toEqual([".aliyuncs.com", ".example.invalid"]);
+  });
+
+  it("rejects an invalid DingTalk agentId", () => {
+    expect(() => loadConfig({ ...requiredEnvironment, DINGTALK_AGENT_ID: "0" })).toThrow(
+      "DINGTALK_AGENT_ID must be a positive safe integer",
+    );
   });
 
   it("rejects an OAuth resource URL that is not the canonical /mcp HTTPS endpoint", () => {

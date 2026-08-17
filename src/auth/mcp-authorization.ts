@@ -411,7 +411,7 @@ class DingTalkBackedOAuthProvider implements OAuthServerProvider {
       scopes,
       expiresAt: this.#now() + this.#options.transactionTtlSeconds,
     });
-    if (scopes.includes("approval:decide")) {
+    if (scopes.some((scope) => scope === "approval:decide" || scope === "approval:create")) {
       renderConsent(response, client, upstreamState, scopes);
       return;
     }
@@ -670,7 +670,15 @@ function renderConsent(
   response.setHeader("referrer-policy", "no-referrer");
   const clientName = escapeHtml(client.client_name ?? client.client_id);
   const scopeItems = scopes.map((scope) => `<li><code>${escapeHtml(scope)}</code></li>`).join("");
-  response.status(200).type("html").send(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>MWE审批MCP 授权</title></head><body><main><h1>MWE审批MCP 权限确认</h1><p>客户端 <strong>${clientName}</strong> 请求以下权限：</p><ul>${scopeItems}</ul><p><strong>approval:decide</strong> 允许客户端代表你同意或拒绝分配给你的审批任务。</p><form method="post" action="/oauth/consent"><input type="hidden" name="consent_token" value="${escapeHtml(consentToken)}"><button type="submit" name="decision" value="approve">同意并使用钉钉登录</button><button type="submit" name="decision" value="deny">拒绝</button></form></main></body></html>`);
+  const writeScopeDescriptions = [
+    ...(scopes.includes("approval:decide")
+      ? ["<p><strong>approval:decide</strong> 允许客户端代表你同意或拒绝分配给你的审批任务。</p>"]
+      : []),
+    ...(scopes.includes("approval:create")
+      ? ["<p><strong>approval:create</strong> 允许客户端代表你准备、提交或撤销精确允许列表中的审批申请。</p>"]
+      : []),
+  ].join("");
+  response.status(200).type("html").send(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>MWE审批MCP 授权</title></head><body><main><h1>MWE审批MCP 权限确认</h1><p>客户端 <strong>${clientName}</strong> 请求以下权限：</p><ul>${scopeItems}</ul>${writeScopeDescriptions}<form method="post" action="/oauth/consent"><input type="hidden" name="consent_token" value="${escapeHtml(consentToken)}"><button type="submit" name="decision" value="approve">同意并使用钉钉登录</button><button type="submit" name="decision" value="deny">拒绝</button></form></main></body></html>`);
 }
 
 function escapeHtml(value: string): string {

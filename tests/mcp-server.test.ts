@@ -69,13 +69,26 @@ const APPROVE_REQUEST_ID = "11111111-1111-4111-8111-111111111111";
 const REJECT_REQUEST_ID = "22222222-2222-4222-8222-222222222222";
 
 describe("approval MCP public contract", () => {
-  it("publishes one role-cohesive approval_task tool instead of endpoint-shaped tools", async () => {
+  it("publishes separate role-cohesive approver and applicant tools", async () => {
     const { client } = await connectedPublicClient();
 
     const tools = await client.listTools();
 
-    expect(tools.tools.map((tool) => tool.name)).toEqual(["approval_task"]);
+    expect(tools.tools.map((tool) => tool.name)).toEqual(["approval_task", "approval_request"]);
     expect(tools.tools[0]?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true });
+    expect(tools.tools[1]?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true });
+    const applicantContract = JSON.stringify(tools.tools[1]?.inputSchema);
+    expect(applicantContract).toContain("expense_reimbursement");
+    expect(applicantContract).toContain("payment_request");
+    expect(applicantContract).toContain("counterparty");
+    expect(applicantContract).toContain("documentNumber");
+    expect(applicantContract).toContain("beneficiaryBankAccount");
+    expect(applicantContract).not.toContain("overtime");
+    expect(applicantContract).not.toContain("processCode");
+    expect(applicantContract).not.toContain("originatorUserId");
+    expect(applicantContract).not.toContain("approvers");
+    expect(applicantContract).not.toContain("ccList");
+    expect(applicantContract).not.toContain("targetSelectActioners");
   });
 
   it("records bounded structured audit events around Streamable HTTP tool semantics", async () => {
@@ -166,11 +179,17 @@ describe("approval MCP public contract", () => {
 
     await client.callTool({ name: "not_a_public_tool", arguments: {} });
     await client.callTool({ name: "approval_task", arguments: { action: "view" } });
+    await client.callTool({
+      name: "approval_request",
+      arguments: { action: "submit", template: "overtime" },
+    });
 
     expect(events).toEqual([
       expect.objectContaining({ phase: "started", toolName: "unknown" }),
       expect.objectContaining({ phase: "completed", outcome: "unknown_tool", errorCode: "UNKNOWN_TOOL" }),
       expect.objectContaining({ phase: "started", toolName: "approval_task", action: "view" }),
+      expect.objectContaining({ phase: "completed", outcome: "rejected", errorCode: "INVALID_INPUT" }),
+      expect.objectContaining({ phase: "started", toolName: "approval_request", action: "submit" }),
       expect.objectContaining({ phase: "completed", outcome: "rejected", errorCode: "INVALID_INPUT" }),
     ]);
   });

@@ -15,8 +15,21 @@ import {
 } from "./attachments.js";
 import { array, asRecord, normalizeProcessInstance, text, unwrapResult } from "./normalize.js";
 import type { ApprovalCaller, McpScope } from "../auth/types.js";
+import {
+  APPROVAL_REQUEST_CONTRACTS,
+  assertApprovalRequestTemplateSchema,
+  assertAttachmentFieldAllowed,
+  buildApprovalFormComponentValues,
+  parseApprovalRequestFields,
+  type ApprovalAttachmentField,
+  type ApprovalAttachmentFormValue,
+  type ApprovalRequestFields,
+  type ApprovalRequestTemplate,
+  type ApplicantFormContext,
+} from "./request-templates.js";
 
-type ApiPort = Pick<DingTalkApiClient, "request">;
+type ApiPort = Pick<DingTalkApiClient, "request"> &
+  Partial<Pick<DingTalkApiClient, "getUserProfile" | "getDepartmentProfile">>;
 
 export interface StartProcessInstanceInput {
   [key: string]: unknown;
@@ -59,6 +72,9 @@ interface ApprovalServiceOptions {
   attachmentLinkPolicy?: AttachmentLinkPolicy;
   writeUserIds?: Iterable<string>;
   callerUserId?: string;
+  callerUnionId?: string;
+  agentId?: number;
+  uploadHostSuffixes?: Iterable<string>;
   allowedProcessCodes?: Iterable<string>;
   audit?: ApprovalAuditSink;
   idempotencyLedger?: IdempotencyLedger;
@@ -117,6 +133,50 @@ export interface ApprovalTaskEnvelope {
   data: unknown;
 }
 
+export type ApprovalRequestInput =
+  | {
+      action: "prepare";
+      template: ApprovalRequestTemplate;
+      deptId: number;
+      fields: unknown;
+      attachments?: Array<{ field: ApprovalAttachmentField; fileName: string; fileSize: number }> | undefined;
+      confirm?: boolean | undefined;
+      dryRun?: boolean | undefined;
+    }
+  | {
+      action: "submit";
+      template: ApprovalRequestTemplate;
+      deptId: number;
+      fields: unknown;
+      uploads?: Array<{
+        field: ApprovalAttachmentField;
+        fileName: string;
+        fileSize: number;
+        uploadKey: string;
+        spaceId: string | number;
+      }> | undefined;
+      confirm: boolean;
+      dryRun?: boolean | undefined;
+      requestId: string;
+    }
+  | {
+      action: "revoke";
+      processInstanceId: string;
+      confirm: boolean;
+      dryRun?: boolean | undefined;
+      remark?: string | undefined;
+    };
+
+export interface ApprovalRequestEnvelope {
+  processInstanceId?: string;
+  action: "prepare" | "submit" | "revoke";
+  template?: ApprovalRequestTemplate;
+  currentStatus: string;
+  auditCorrelationId: string;
+  safeNextActions: Array<"prepare" | "submit" | "revoke">;
+  data: unknown;
+}
+
 const ACTIVE_TASK_STATUSES = new Set(["NEW", "PENDING", "RUNNING", "TODO"]);
 const CLIENT_ATTACHMENT_HANDLING = {
   mode: "agent_client",
@@ -135,18 +195,30 @@ export class ApprovalService {
   readonly #attachmentLinkPolicy: AttachmentLinkPolicy;
   readonly #writeUserIds: Set<string>;
   readonly #callerUserId: string | undefined;
+  readonly #callerUnionId: string | undefined;
+  readonly #agentId: number | undefined;
+  readonly #uploadHostSuffixes: Set<string>;
   readonly #callerScopes: Set<McpScope> | undefined;
   readonly #allowedProcessCodes: Set<string>;
   readonly #audit: ApprovalAuditSink;
   readonly #idempotencyLedger: IdempotencyLedger;
   readonly #startRequests = new Map<string, { fingerprint: string; promise: Promise<unknown> }>();
   readonly #decisionRequests = new Map<string, { fingerprint: string; promise: Promise<unknown> }>();
+  readonly #approvalRequestSubmissions = new Map<
+    string,
+    { fingerprint: string; promise: Promise<ApprovalRequestEnvelope> }
+  >();
 
   constructor(options: ApprovalServiceOptions) {
     this.#api = options.api;
     this.#attachmentLinkPolicy = options.attachmentLinkPolicy ?? new AttachmentLinkPolicy();
     this.#writeUserIds = new Set(options.writeUserIds ?? []);
     this.#callerUserId = options.callerUserId;
+    this.#callerUnionId = options.callerUnionId;
+    this.#agentId = options.agentId;
+    this.#uploadHostSuffixes = new Set(
+      [...(options.uploadHostSuffixes ?? [".aliyuncs.com"])].map((suffix) => suffix.trim().toLowerCase()).filter(Boolean),
+    );
     this.#callerScopes = options.callerScopes === undefined ? undefined : new Set(options.callerScopes);
     this.#allowedProcessCodes = new Set(options.allowedProcessCodes ?? []);
     this.#audit = options.audit ?? noopAuditSink;
@@ -158,8 +230,13 @@ export class ApprovalService {
       api: this.#api,
       attachmentLinkPolicy: this.#attachmentLinkPolicy,
       callerUserId: caller.userId,
+      callerUnionId: caller.subject,
+      ...(this.#agentId === undefined ? {} : { agentId: this.#agentId }),
+      uploadHostSuffixes: this.#uploadHostSuffixes,
       callerScopes: caller.scopes,
-      writeUserIds: caller.scopes.includes("approval:decide") ? [caller.userId] : [],
+      writeUserIds: caller.scopes.some((scope) => scope === "approval:decide" || scope === "approval:create")
+        ? [caller.userId]
+        : [],
       allowedProcessCodes: this.#allowedProcessCodes,
       audit: this.#audit,
       idempotencyLedger: this.#idempotencyLedger,
@@ -280,6 +357,157 @@ export class ApprovalService {
         ...(current === undefined ? {} : { normalized: current.normalized }),
       },
     };
+  }
+
+  async approvalRequest(input: ApprovalRequestInput): Promise<ApprovalRequestEnvelope> {
+    const auditCorrelationId = randomUUID();
+    this.#assertScope("approval:read");
+    if (input.action === "revoke") {
+      this.#assertScope("approval:create");
+      const upstreamResult = await this.revokeProcessInstance({
+        processInstanceId: input.processInstanceId,
+        confirm: input.confirm,
+        ...(input.dryRun === undefined ? {} : { dryRun: input.dryRun }),
+        ...(input.remark === undefined ? {} : { remark: input.remark }),
+      });
+      return {
+        processInstanceId: input.processInstanceId,
+        action: "revoke",
+        currentStatus: input.dryRun === true ? "REVOCABLE" : "REVOKED",
+        auditCorrelationId,
+        safeNextActions: input.dryRun === true ? ["revoke"] : [],
+        data: { dryRun: input.dryRun === true, upstreamResult },
+      };
+    }
+    this.#assertScope("approval:create");
+    const contract = APPROVAL_REQUEST_CONTRACTS[input.template];
+    this.#assertProcessAllowed(contract.processCode);
+    const fields = parseApprovalRequestFields(input.template, input.fields);
+    const schema = await this.#api.request({
+      method: "GET",
+      path: "/v1.0/workflow/forms/schemas/processCodes",
+      query: { processCode: contract.processCode },
+    });
+    assertApprovalRequestTemplateSchema(input.template, schema);
+    const applicant = await this.#resolveApplicantContext(input.deptId);
+    const formComponentValues = buildApprovalFormComponentValues(input.template, fields, applicant);
+    const draft = {
+      processCode: contract.processCode,
+      deptId: input.deptId,
+      formComponentValues,
+    };
+    if (input.action === "prepare") {
+      const attachments = input.attachments ?? [];
+      for (const attachment of attachments) {
+        assertAttachmentFieldAllowed(input.template, attachment.field);
+        assertUploadFileName(attachment.fileName);
+      }
+      assertAttachmentBatchSize(attachments);
+      if (input.dryRun === true || attachments.length === 0) {
+        return {
+          action: "prepare",
+          template: input.template,
+          currentStatus: attachments.length === 0 ? "READY_TO_SUBMIT" : "VALIDATED",
+          auditCorrelationId,
+          safeNextActions: ["submit"],
+          data: { dryRun: input.dryRun === true, draft, uploadInstructions: [] },
+        };
+      }
+      if (input.confirm !== true) {
+        throw new ApprovalMcpError(
+          "CONFIRMATION_REQUIRED",
+          "Preparing DingTalk attachment upload slots requires explicit confirmation.",
+        );
+      }
+      const uploadInstructions = await this.#prepareApprovalUploads(attachments);
+      return {
+        action: "prepare",
+        template: input.template,
+        currentStatus: "READY_FOR_UPLOAD",
+        auditCorrelationId,
+        safeNextActions: ["submit"],
+        data: {
+          dryRun: false,
+          draft,
+          uploadInstructions,
+          clientInstruction:
+            "The Agent client must PUT each file directly to uploadUrl using the exact returned headers, without sending file bytes to this MCP server. After every PUT succeeds, call approval_request action=submit with the matching field, fileName, fileSize, uploadKey, and spaceId.",
+        },
+      };
+    }
+    if (input.action === "submit" && input.dryRun === true) {
+      return {
+        action: "submit",
+        template: input.template,
+        currentStatus: "VALIDATED",
+        auditCorrelationId,
+        safeNextActions: ["submit"],
+        data: { dryRun: true, draft },
+      };
+    }
+    if (input.action === "submit") {
+      const uploads = input.uploads ?? [];
+      for (const upload of uploads) {
+        assertAttachmentFieldAllowed(input.template, upload.field);
+        assertUploadFileName(upload.fileName);
+      }
+      assertAttachmentBatchSize(uploads);
+      const actorUserId = this.#requireCallerUserId();
+      this.#assertConfirmedActor(input.confirm, actorUserId);
+      if (input.requestId.trim() === "") {
+        throw new ApprovalMcpError("IDEMPOTENCY_KEY_REQUIRED", "Submitting an approval requires a stable requestId UUID.");
+      }
+      const fingerprintInput = {
+        template: input.template,
+        deptId: input.deptId,
+        fields,
+        uploads,
+      };
+      const fingerprint = createHash("sha256").update(stableStringify(fingerprintInput)).digest("hex");
+      const existing = this.#approvalRequestSubmissions.get(input.requestId);
+      if (existing !== undefined) {
+        if (existing.fingerprint !== fingerprint) {
+          throw new ApprovalMcpError(
+            "IDEMPOTENCY_CONFLICT",
+            "The requestId was already used with a different approval request payload.",
+          );
+        }
+        return existing.promise;
+      }
+      const submission = this.#audited(
+        {
+          action: "start",
+          actorUserId,
+          correlationId: auditCorrelationId,
+          processCode: contract.processCode,
+          requestId: input.requestId,
+        },
+        () => this.#submitApprovalRequestIdempotently({
+          requestId: input.requestId,
+          fingerprint,
+          template: input.template,
+          deptId: input.deptId,
+          processCode: contract.processCode,
+          originatorUserId: actorUserId,
+          fields,
+          applicant,
+          uploads,
+          auditCorrelationId,
+        }),
+      ).catch((error: unknown) => {
+        if (!(error instanceof ApprovalMcpError) || error.code !== "IDEMPOTENCY_OUTCOME_UNKNOWN") {
+          this.#approvalRequestSubmissions.delete(input.requestId);
+        }
+        throw error;
+      });
+      this.#approvalRequestSubmissions.set(input.requestId, { fingerprint, promise: submission });
+      if (this.#approvalRequestSubmissions.size > 1000) {
+        const oldest = this.#approvalRequestSubmissions.keys().next().value as string | undefined;
+        if (oldest !== undefined && oldest !== input.requestId) this.#approvalRequestSubmissions.delete(oldest);
+      }
+      return submission;
+    }
+    throw new ApprovalMcpError("CONFIGURATION_ERROR", "The requested approval_request action is not configured yet.");
   }
 
   async queryProcessInstanceIds(input: Record<string, unknown>): Promise<unknown> {
@@ -674,7 +902,11 @@ export class ApprovalService {
         serverDownloadsAttachments: false,
         serverParsesAttachments: false,
         serverPerformsOcr: false,
-        uploadAttachments: false,
+        requestTemplates: ["expense_reimbursement", "payment_request"],
+        requestTemplateAllowlistExact: true,
+        uploadAttachments:
+          this.#agentId !== undefined && this.#callerUserId !== undefined && this.#callerUnionId !== undefined,
+        uploadTransport: "agent_direct_to_dingtalk",
         eventStream: false,
       },
       writeGuard: {
@@ -788,6 +1020,265 @@ export class ApprovalService {
       );
     }
     return this.#callerUserId;
+  }
+
+  async #resolveApplicantContext(deptId: number): Promise<{
+    applicantName: string;
+    departmentName: string;
+  }> {
+    const callerUserId = this.#requireCallerUserId();
+    if (this.#api.getUserProfile === undefined || this.#api.getDepartmentProfile === undefined) {
+      throw new ApprovalMcpError(
+        "CONFIGURATION_ERROR",
+        "The DingTalk directory adapter required for approval requests is unavailable.",
+      );
+    }
+    const user = await this.#api.getUserProfile(callerUserId);
+    if (!user.departmentIds.includes(deptId)) {
+      throw new ApprovalMcpError(
+        "INVALID_INPUT",
+        "The requested department does not belong to the authenticated DingTalk applicant.",
+      );
+    }
+    const department = await this.#api.getDepartmentProfile(deptId);
+    return { applicantName: user.name, departmentName: department.name };
+  }
+
+  async #prepareApprovalUploads(
+    attachments: Array<{ field: ApprovalAttachmentField; fileName: string; fileSize: number }>,
+  ): Promise<Array<Record<string, unknown>>> {
+    const { spaceId, unionId } = await this.#resolveApprovalAttachmentSpace();
+    const instructions: Array<Record<string, unknown>> = [];
+    for (const attachment of attachments) {
+      const payload = await this.#api.request({
+        method: "POST",
+        path: `/v1.0/storage/spaces/${encodeURIComponent(spaceId)}/files/uploadInfos/query`,
+        query: { unionId },
+        body: {
+          protocol: "HEADER_SIGNATURE",
+          multipart: false,
+          option: {
+            storageDriver: "DINGTALK",
+            preCheckParam: {
+              size: attachment.fileSize,
+              parentId: "0",
+              name: attachment.fileName,
+            },
+            preferIntranet: false,
+          },
+        },
+      });
+      const record = asRecord(payload);
+      const signature = asRecord(record?.headerSignatureInfo);
+      const urls = array(signature?.resourceUrls);
+      const uploadUrl = text(urls[0]);
+      const uploadKey = text(record?.uploadKey);
+      const headers = stringRecord(signature?.headers);
+      const expiresInSeconds = positiveInteger(signature?.expirationSeconds);
+      if (uploadUrl === undefined || uploadKey === undefined || headers === undefined || expiresInSeconds === undefined) {
+        throw new ApprovalMcpError("INVALID_RESPONSE", "DingTalk returned incomplete attachment upload information.");
+      }
+      this.#assertUploadUrlAllowed(uploadUrl);
+      instructions.push({
+        ...attachment,
+        uploadKey,
+        spaceId,
+        method: "PUT",
+        uploadUrl,
+        headers,
+        expiresInSeconds,
+      });
+    }
+    return instructions;
+  }
+
+  async #submitApprovalRequestIdempotently(input: {
+    requestId: string;
+    fingerprint: string;
+    template: ApprovalRequestTemplate;
+    deptId: number;
+    processCode: string;
+    originatorUserId: string;
+    fields: ApprovalRequestFields;
+    applicant: ApplicantFormContext;
+    uploads: Array<{
+      field: ApprovalAttachmentField;
+      fileName: string;
+      fileSize: number;
+      uploadKey: string;
+      spaceId: string | number;
+    }>;
+    auditCorrelationId: string;
+  }): Promise<ApprovalRequestEnvelope> {
+    const ledgerKey = `approval-request:${input.requestId}`;
+    const reservation = await this.#idempotencyLedger.reserve(ledgerKey, input.fingerprint);
+    if (!reservation.created) {
+      if (reservation.entry.fingerprint !== input.fingerprint) {
+        throw new ApprovalMcpError(
+          "IDEMPOTENCY_CONFLICT",
+          "The requestId was already used with a different approval request payload.",
+        );
+      }
+      if (reservation.entry.status === "succeeded") {
+        return reservation.entry.result as ApprovalRequestEnvelope;
+      }
+      throw new ApprovalMcpError(
+        "IDEMPOTENCY_OUTCOME_UNKNOWN",
+        "A previous approval submission may have committed attachments or reached DingTalk.",
+      );
+    }
+    let mutationStarted = false;
+    try {
+      const committedAttachments: Array<ApprovalAttachmentFormValue & { field: ApprovalAttachmentField }> = [];
+      if (input.uploads.length > 0) {
+        const currentSpace = await this.#resolveApprovalAttachmentSpace();
+        for (const upload of input.uploads) {
+          if (scalarText(upload.spaceId) !== currentSpace.spaceId) {
+            throw new ApprovalMcpError(
+              "INVALID_INPUT",
+              "The uploaded attachment spaceId does not belong to the authenticated applicant's approval space.",
+            );
+          }
+          mutationStarted = true;
+          const payload = await this.#api.request({
+            method: "POST",
+            path: `/v1.0/storage/spaces/${encodeURIComponent(currentSpace.spaceId)}/files/commit`,
+            query: { unionId: currentSpace.unionId },
+            body: {
+              uploadKey: upload.uploadKey,
+              name: upload.fileName,
+              parentId: "0",
+              option: { size: upload.fileSize, conflictStrategy: "AUTO_RENAME" },
+            },
+          });
+          committedAttachments.push(normalizeCommittedAttachment(upload, currentSpace.spaceId, payload));
+        }
+      }
+      const byField: Partial<Record<ApprovalAttachmentField, ApprovalAttachmentFormValue[]>> = {};
+      for (const attachment of committedAttachments) {
+        const list = byField[attachment.field] ?? [];
+        list.push({
+          fileId: attachment.fileId,
+          fileName: attachment.fileName,
+          fileSize: attachment.fileSize,
+          fileType: attachment.fileType,
+          spaceId: attachment.spaceId,
+        });
+        byField[attachment.field] = list;
+      }
+      const formComponentValues = buildApprovalFormComponentValues(
+        input.template,
+        input.fields,
+        input.applicant,
+        byField,
+      );
+      mutationStarted = true;
+      const upstreamResult = await this.#api.request({
+        method: "POST",
+        path: "/v1.0/workflow/processInstances",
+        body: {
+          processCode: input.processCode,
+          originatorUserId: input.originatorUserId,
+          deptId: input.deptId,
+          formComponentValues,
+        },
+      });
+      const returned = asRecord(unwrapResult(upstreamResult));
+      const processInstanceId = text(returned?.instanceId ?? returned?.processInstanceId);
+      if (processInstanceId === undefined) {
+        throw new ApprovalMcpError("INVALID_RESPONSE", "DingTalk did not return the created approval instance ID.");
+      }
+      const result: ApprovalRequestEnvelope = {
+        processInstanceId,
+        action: "submit",
+        template: input.template,
+        currentStatus: "SUBMITTED",
+        auditCorrelationId: input.auditCorrelationId,
+        safeNextActions: ["revoke"],
+        data: { dryRun: false, upstreamResult, committedAttachments },
+      };
+      await this.#idempotencyLedger.put(ledgerKey, {
+        fingerprint: input.fingerprint,
+        status: "succeeded",
+        result,
+        updatedAt: new Date().toISOString(),
+      });
+      return result;
+    } catch (error) {
+      if (!mutationStarted && isKnownPreWriteRejection(error)) {
+        await this.#idempotencyLedger.delete(ledgerKey);
+        throw error;
+      }
+      try {
+        await this.#idempotencyLedger.put(ledgerKey, {
+          fingerprint: input.fingerprint,
+          status: "uncertain",
+          updatedAt: new Date().toISOString(),
+        });
+      } catch {
+        // The pending reservation still prevents an unsafe automatic replay.
+      }
+      throw new ApprovalMcpError(
+        "IDEMPOTENCY_OUTCOME_UNKNOWN",
+        "The approval submission result is uncertain; inspect DingTalk before using a new requestId.",
+        { cause: error },
+      );
+    }
+  }
+
+  async #resolveApprovalAttachmentSpace(): Promise<{ spaceId: string; unionId: string }> {
+    if (this.#agentId === undefined) {
+      throw new ApprovalMcpError(
+        "CONFIGURATION_ERROR",
+        "DINGTALK_AGENT_ID is required to prepare approval attachment uploads.",
+      );
+    }
+    const callerUserId = this.#requireCallerUserId();
+    const unionId = this.#requireCallerUnionId();
+    const spacePayload = await this.#api.request({
+      method: "POST",
+      path: "/v1.0/workflow/processInstances/spaces/infos/query",
+      body: { userId: callerUserId, agentId: this.#agentId },
+    });
+    const spaceId = scalarText(asRecord(unwrapResult(spacePayload))?.spaceId);
+    if (spaceId === undefined) {
+      throw new ApprovalMcpError("INVALID_RESPONSE", "DingTalk did not return an approval attachment spaceId.");
+    }
+    return { spaceId, unionId };
+  }
+
+  #requireCallerUnionId(): string {
+    if (this.#callerUnionId === undefined || this.#callerUnionId === "") {
+      throw new ApprovalMcpError(
+        "CALLER_IDENTITY_NOT_CONFIGURED",
+        "Approval attachment uploads require the authenticated DingTalk unionId.",
+      );
+    }
+    return this.#callerUnionId;
+  }
+
+  #assertUploadUrlAllowed(value: string): void {
+    let url: URL;
+    try {
+      url = new URL(value);
+    } catch {
+      throw new ApprovalMcpError("ATTACHMENT_URL_REJECTED", "DingTalk returned an invalid attachment upload URL.");
+    }
+    const hostname = url.hostname.toLowerCase();
+    const allowed =
+      url.protocol === "https:" &&
+      url.username === "" &&
+      url.password === "" &&
+      [...this.#uploadHostSuffixes].some((suffix) => {
+        const normalized = suffix.startsWith(".") ? suffix : `.${suffix}`;
+        return hostname === normalized.slice(1) || hostname.endsWith(normalized);
+      });
+    if (!allowed) {
+      throw new ApprovalMcpError(
+        "ATTACHMENT_URL_REJECTED",
+        "The approval attachment upload URL is outside the configured HTTPS allowlist.",
+      );
+    }
   }
 
   #writesEnabled(): boolean {
@@ -1007,6 +1498,74 @@ const PRE_WRITE_REJECTION_CODES = new Set<ApprovalMcpErrorCode>([
 
 function withoutUndefined<T extends Record<string, unknown>>(input: T): T {
   return Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined)) as T;
+}
+
+function scalarText(value: unknown): string | undefined {
+  if (typeof value === "string" && value !== "") return value;
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return undefined;
+}
+
+function positiveInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 && value <= 3600
+    ? value
+    : undefined;
+}
+
+function stringRecord(value: unknown): Record<string, string> | undefined {
+  const record = asRecord(value);
+  if (record === undefined || Object.keys(record).length > 32) return undefined;
+  const entries: Array<[string, string]> = [];
+  for (const [key, item] of Object.entries(record)) {
+    if (key.length === 0 || key.length > 200 || typeof item !== "string" || item.length > 8192) return undefined;
+    entries.push([key, item]);
+  }
+  return Object.fromEntries(entries);
+}
+
+function assertUploadFileName(fileName: string): void {
+  if (fileName !== fileName.trim() || fileName.endsWith(".") || /[\t*"<>|]/u.test(fileName)) {
+    throw new ApprovalMcpError("INVALID_INPUT", "The attachment fileName is not accepted by DingTalk storage.");
+  }
+}
+
+function assertAttachmentBatchSize(
+  attachments: Array<{ fileSize: number }>,
+): void {
+  const total = attachments.reduce((sum, attachment) => sum + attachment.fileSize, 0);
+  if (total > 50 * 1024 * 1024) {
+    throw new ApprovalMcpError("INVALID_INPUT", "The combined attachment size exceeds the 50 MiB request limit.");
+  }
+}
+
+function normalizeCommittedAttachment(
+  upload: {
+    field: ApprovalAttachmentField;
+    fileName: string;
+    fileSize: number;
+  },
+  expectedSpaceId: string,
+  payload: unknown,
+): ApprovalAttachmentFormValue & { field: ApprovalAttachmentField } {
+  const root = asRecord(unwrapResult(payload));
+  const dentry = asRecord(root?.dentry) ?? root;
+  const fileId = scalarText(dentry?.id ?? dentry?.fileId ?? dentry?.dentryUuid ?? dentry?.uuid);
+  const fileName = text(dentry?.name ?? dentry?.fileName) ?? upload.fileName;
+  const fileSizeValue = dentry?.size ?? dentry?.fileSize;
+  const fileSize = typeof fileSizeValue === "number" && Number.isSafeInteger(fileSizeValue) && fileSizeValue >= 0
+    ? fileSizeValue
+    : upload.fileSize;
+  const returnedSpaceId = scalarText(dentry?.spaceId) ?? expectedSpaceId;
+  const fileType = text(dentry?.extension ?? dentry?.fileType) ?? extensionOf(fileName);
+  if (fileId === undefined || returnedSpaceId !== expectedSpaceId || fileType === "") {
+    throw new ApprovalMcpError("INVALID_RESPONSE", "DingTalk returned incomplete committed attachment metadata.");
+  }
+  return { field: upload.field, fileId, fileName, fileSize, fileType, spaceId: expectedSpaceId };
+}
+
+function extensionOf(fileName: string): string {
+  const index = fileName.lastIndexOf(".");
+  return index <= 0 || index === fileName.length - 1 ? "" : fileName.slice(index + 1).toLowerCase();
 }
 
 function stableStringify(value: unknown): string {

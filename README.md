@@ -2,7 +2,7 @@
 
 `MWE审批MCP` 是部署在 `https://dingtalk.mwexk.com/mcp` 的自托管钉钉 OA 审批 MCP Server。
 
-当前版本：`0.6.3`。
+当前版本：`0.7.0`。
 
 ## 当前架构
 
@@ -25,10 +25,11 @@ WorkBuddy / Codex
 
 ## 公共工具
 
-正常 `tools/list` 只有一个审批人工具：
+正常 `tools/list` 只有两个按业务角色聚合的工具：
 
 ```text
-approval_task
+approval_task     # 审批人：查看、同意、拒绝
+approval_request  # 申请人：准备附件、提交、撤销
 ```
 
 读取审批：
@@ -69,6 +70,50 @@ approval_task
 
 拒绝时把 `action` 改为 `reject`，并提供非空 `remark`。写操作会重新读取当前任务，确认任务仍属于 OAuth 登录用户，并使用持久幂等账本阻止重复决定。
 
+### 发起审批
+
+`approval_request` 使用“默认拒绝 + 精确允许列表”。首版只接受：
+
+- `expense_reimbursement`：费用报销，固定 `processCode=PROC-2DB91B79-3CDD-421D-A223-0489A7BAB2C0`。
+- `payment_request`：付款申请，固定 `processCode=PROC-5E238117-7121-4CB3-8219-9F11A2E42BE4`。
+
+加班审批及所有其他模板均拒绝。公开 Schema 不接受 `processCode`、申请人、审批人、抄送人或流程节点；申请人来自 OAuth 绑定的钉钉用户，审批流完全沿用 OA 后台模板。每次准备或提交前都会读取线上模板 Schema，并精确核对已审查的控件 ID、名称和类型，模板发生变化时失败关闭。
+
+先用 `dryRun` 验证付款申请：
+
+```json
+{
+  "action": "submit",
+  "template": "payment_request",
+  "deptId": 42,
+  "fields": {
+    "documentNumber": "FK-20260817-001",
+    "payee": "收款单位",
+    "currency": "CNY",
+    "applicationDate": "2026-08-17",
+    "lines": [{
+      "purpose": "项目采购",
+      "amount": 880,
+      "reason": "合同付款",
+      "expenseDepartment": "研发部"
+    }]
+  },
+  "confirm": false,
+  "dryRun": true,
+  "requestId": "稳定复用的UUID"
+}
+```
+
+费用报销字段为 `date`、`reason`、`counterparty` 和至少一条 `items`；每条明细包含 `amount`、`category`（仅 `AI费用` 或 `其它`）、`expenseDepartment`、`remark`。
+
+附件采用两阶段直传：
+
+1. Agent 调用 `action=prepare`，传文件名、大小和模板允许的附件字段。
+2. MCP 返回钉钉签名的 HTTPS `PUT` 地址和请求头；Agent 直接把文件上传到钉钉，文件字节不经过 MCP。
+3. Agent 调用 `action=submit`，提交 `uploadKey`、`spaceId`、文件名和大小；MCP 提交文件元数据并发起审批。
+
+单文件最大 20 MiB、每单最多 10 个、合计最大 50 MiB。费用报销仅允许附件字段 `invoice`/`other`，付款申请仅允许 `attachment`。实际提交必须 `confirm=true` 且提供稳定 UUID `requestId`；附件提交或审批创建结果不确定时会失败关闭，禁止自动换 UUID 重试。
+
 ## OAuth 端点
 
 |端点|用途|
@@ -98,6 +143,10 @@ https://dingtalk.mwexk.com/oauth/dingtalk/callback
 - 登录用户身份/个人信息权限。
 - 根据 unionId 映射企业 userId 的通讯录权限 `qyapi_get_member`。
 - 审批实例读写和审批表单读取权限。
+- 附件直传所需的 `Storage.UploadInfo.Read` 与 `Storage.File.Write` 权限。
+- H5 微应用能力及其 AgentId；将正整数配置为 `DINGTALK_AGENT_ID`。未配置时，无附件审批仍可使用，附件 `prepare` 会明确失败。
+
+OAuth 授权范围新增 `approval:create`。已有客户端令牌不会自动获得该权限；需要在 WorkBuddy/Codex 重新发起授权并明确同意后，才能准备、提交或撤销申请。
 
 ## 本地验证
 
@@ -149,3 +198,4 @@ WorkBuddy 与 Codex 的无密钥 OAuth 配置模板和测试顺序见：
 
 - [`docs/mcp-auth-module-design.md`](docs/mcp-auth-module-design.md)
 - [`docs/dingtalk-oauth-mcp-client-auth.md`](docs/dingtalk-oauth-mcp-client-auth.md)
+- [`docs/approval-request-tool-design.md`](docs/approval-request-tool-design.md)

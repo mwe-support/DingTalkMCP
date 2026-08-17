@@ -121,4 +121,37 @@ describe("DingTalkApiClient", () => {
     expect(error).toMatchObject({ code: "DINGTALK_API_ERROR", retryable: true });
     expect(JSON.stringify(errorPayload(error))).not.toContain("network-secret-token");
   });
+
+  it("resolves the server-bound applicant and department through DingTalk directory APIs", async () => {
+    const tokenProvider = { getToken: vi.fn().mockResolvedValue("application-token"), invalidate: vi.fn() };
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        errcode: 0,
+        result: { name: "张三", dept_id_list: [42, 43] },
+      }), { status: 200, headers: { "content-type": "application/json" } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        errcode: 0,
+        result: { name: "研发部" },
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    const client = new DingTalkApiClient({ tokenProvider, fetch: fetchMock });
+
+    await expect(client.getUserProfile("user-1")).resolves.toEqual({
+      name: "张三",
+      departmentIds: [42, 43],
+    });
+    await expect(client.getDepartmentProfile(42)).resolves.toEqual({ name: "研发部" });
+
+    const firstUrl = new URL(String(fetchMock.mock.calls[0]?.[0]));
+    expect(firstUrl.pathname).toBe("/topapi/v2/user/get");
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({
+      method: "POST",
+      body: JSON.stringify({ userid: "user-1", language: "zh_CN" }),
+    });
+    const secondUrl = new URL(String(fetchMock.mock.calls[1]?.[0]));
+    expect(secondUrl.pathname).toBe("/topapi/v2/department/get");
+    expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({
+      method: "POST",
+      body: JSON.stringify({ dept_id: 42, language: "zh_CN" }),
+    });
+  });
 });

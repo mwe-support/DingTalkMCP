@@ -20,9 +20,11 @@ export interface McpAuthConfig {
 export interface ApprovalMcpConfig {
   clientId: string;
   clientSecret: string;
+  agentId?: number;
   apiBaseUrl: string;
   allowedProcessCodes: string[];
   downloadHostSuffixes: string[];
+  uploadHostSuffixes: string[];
   idempotencyLedgerPath: string;
   auditLogPath: string;
   auth: McpAuthConfig;
@@ -91,10 +93,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApprovalMcpCon
   if (allowedScopes.some((scope) => !MCP_SCOPES.includes(scope as McpScope))) {
     throw new ApprovalMcpError("CONFIGURATION_ERROR", "MCP_ALLOWED_SCOPES contains an unsupported scope.");
   }
+  const agentId = optionalPositiveInteger(env.DINGTALK_AGENT_ID, "DINGTALK_AGENT_ID");
 
   return {
     clientId,
     clientSecret,
+    ...(agentId === undefined ? {} : { agentId }),
     apiBaseUrl: parsedBaseUrl.toString().replace(/\/$/u, ""),
     allowedProcessCodes: csv(env.APPROVAL_ALLOWED_PROCESS_CODES),
     downloadHostSuffixes: csv(env.APPROVAL_DOWNLOAD_HOST_SUFFIXES, [
@@ -102,6 +106,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApprovalMcpCon
       ".alicdn.com",
       ".aliyuncs.com",
     ]),
+    uploadHostSuffixes: csv(env.APPROVAL_UPLOAD_HOST_SUFFIXES, [".aliyuncs.com"]),
     idempotencyLedgerPath: resolve(env.APPROVAL_IDEMPOTENCY_LEDGER_PATH?.trim() || "./data/approval-idempotency"),
     auditLogPath: resolve(env.APPROVAL_AUDIT_LOG_PATH?.trim() || "./data/audit"),
     auth: {
@@ -119,6 +124,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApprovalMcpCon
       allowedScopes: allowedScopes as McpScope[],
     },
   };
+}
+
+function optionalPositiveInteger(value: string | undefined, key: string): number | undefined {
+  if (value === undefined || value.trim() === "") return undefined;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new ApprovalMcpError("CONFIGURATION_ERROR", `${key} must be a positive safe integer.`);
+  }
+  return parsed;
 }
 
 function canonicalHttpsUrl(value: string, key: string): URL {

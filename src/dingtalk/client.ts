@@ -18,6 +18,15 @@ interface DingTalkApiClientOptions {
 
 const requestIdMetadata = new WeakMap<object, string>();
 
+export interface DingTalkUserProfile {
+  name: string;
+  departmentIds: number[];
+}
+
+export interface DingTalkDepartmentProfile {
+  name: string;
+}
+
 export function getDingTalkRequestId(value: unknown): string | undefined {
   return typeof value === "object" && value !== null ? requestIdMetadata.get(value) : undefined;
 }
@@ -97,6 +106,37 @@ export class DingTalkApiClient {
     return userId;
   }
 
+  async getUserProfile(userId: string): Promise<DingTalkUserProfile> {
+    const payload = await this.#legacyPost("/topapi/v2/user/get", { userid: userId, language: "zh_CN" });
+    const result = asRecord(asRecord(payload)?.result);
+    const name = result?.name;
+    const rawDepartmentIds = result?.dept_id_list ?? result?.deptIdList;
+    const departmentIds = Array.isArray(rawDepartmentIds)
+      ? rawDepartmentIds.filter((value): value is number => typeof value === "number" && Number.isInteger(value))
+      : [];
+    if (typeof name !== "string" || name === "" || departmentIds.length === 0) {
+      throw new ApprovalMcpError(
+        "INVALID_RESPONSE",
+        "DingTalk did not return a usable applicant directory profile.",
+        { details: { path: "/topapi/v2/user/get" } },
+      );
+    }
+    return { name, departmentIds };
+  }
+
+  async getDepartmentProfile(deptId: number): Promise<DingTalkDepartmentProfile> {
+    const payload = await this.#legacyPost("/topapi/v2/department/get", { dept_id: deptId, language: "zh_CN" });
+    const name = asRecord(asRecord(payload)?.result)?.name;
+    if (typeof name !== "string" || name === "") {
+      throw new ApprovalMcpError(
+        "INVALID_RESPONSE",
+        "DingTalk did not return a usable department profile.",
+        { details: { path: "/topapi/v2/department/get" } },
+      );
+    }
+    return { name };
+  }
+
   async request<T = unknown>(request: DingTalkRequest): Promise<T> {
     const token = await this.#tokenProvider.getToken();
     const url = new URL(`${this.#baseUrl}${request.path}`);
@@ -154,6 +194,46 @@ export class DingTalkApiClient {
       requestIdMetadata.set(payload, successfulRequestId);
     }
     return payload as T;
+  }
+
+  async #legacyPost(path: `/${string}`, body: Record<string, unknown>): Promise<unknown> {
+    const token = await this.#tokenProvider.getToken();
+    const url = new URL(`${this.#legacyBaseUrl}${path}`);
+    url.searchParams.set("access_token", token);
+    let response: Response;
+    try {
+      response = await this.#fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(this.#timeoutMs),
+      });
+    } catch {
+      throw new ApprovalMcpError("DINGTALK_API_ERROR", "Unable to reach the DingTalk directory endpoint.", {
+        details: { method: "POST", path },
+        retryable: true,
+      });
+    }
+    const payload = await parseResponseBody(response);
+    const record = asRecord(payload);
+    const upstreamCode = stringValue(record?.errcode ?? record?.code);
+    if (!response.ok || upstreamCode !== "0") {
+      if (response.status === 401) this.#tokenProvider.invalidate();
+      const denied = asRecord(record?.AccessDeniedDetail ?? record?.accessDeniedDetail);
+      throw new ApprovalMcpError("DINGTALK_API_ERROR", "DingTalk rejected the directory request.", {
+        details: {
+          status: response.status,
+          method: "POST",
+          path,
+          upstreamCode,
+          upstreamMessage: stringValue(record?.errmsg ?? record?.message),
+          requestId: stringValue(record?.request_id ?? record?.requestid ?? record?.requestId),
+          requiredScopes: denied?.requiredScopes,
+        },
+        retryable: response.status === 429 || response.status >= 500,
+      });
+    }
+    return payload;
   }
 }
 

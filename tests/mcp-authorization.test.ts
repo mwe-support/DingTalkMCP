@@ -55,7 +55,7 @@ describe("createMcpAuthorization", () => {
       code_challenge: challenge,
       code_challenge_method: "S256",
       resource,
-      scope: "approval:read approval:decide",
+      scope: "approval:read approval:decide approval:create",
       state: "client-state-1",
     }).toString();
     const start = await fetch(authorize, { redirect: "manual" });
@@ -63,6 +63,7 @@ describe("createMcpAuthorization", () => {
     const consentHtml = await start.text();
     expect(consentHtml).toContain("OAuth test client");
     expect(consentHtml).toContain("approval:decide");
+    expect(consentHtml).toContain("approval:create");
     const dingtalkLocation = await submitConsent(baseUrl, consentHtml, "approve");
     expect(dingtalkLocation.origin).toBe("https://login.dingtalk.test");
 
@@ -83,7 +84,7 @@ describe("createMcpAuthorization", () => {
     expect(tokens).toMatchObject({
       token_type: "bearer",
       expires_in: 600,
-      scope: "approval:read approval:decide",
+      scope: "approval:read approval:decide approval:create",
     });
     expect(typeof tokens.access_token).toBe("string");
     expect(typeof tokens.refresh_token).toBe("string");
@@ -97,7 +98,7 @@ describe("createMcpAuthorization", () => {
       tenantId: "corp-1",
       userId: "user-1",
       clientId: client.client_id,
-      scopes: ["approval:read", "approval:decide"],
+      scopes: ["approval:read", "approval:decide", "approval:create"],
       authenticatedAt: 1_800_000_000,
     });
     expect(securityEvents).toEqual(expect.arrayContaining([
@@ -353,7 +354,7 @@ async function fixture(identityOverride?: DingTalkIdentityPort): Promise<{
     resourceUrl: new URL(resource),
     expectedCorpId: "corp-1",
     redirectUrl: new URL("https://dingtalk.mwexk.com/oauth/dingtalk/callback"),
-    allowedScopes: ["approval:read", "approval:decide"],
+    allowedScopes: ["approval:read", "approval:decide", "approval:create"],
     accessTokenTtlSeconds: 600,
     refreshTokenTtlSeconds: 28_800,
     transactionTtlSeconds: 300,

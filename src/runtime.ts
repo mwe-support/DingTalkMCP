@@ -33,6 +33,8 @@ export function createApprovalRuntime(
   const service = new ApprovalService({
     api,
     attachmentLinkPolicy,
+    ...(config.agentId === undefined ? {} : { agentId: config.agentId }),
+    uploadHostSuffixes: config.uploadHostSuffixes,
     allowedProcessCodes: config.allowedProcessCodes,
     audit: options.audit ?? new JsonLineAuditSink(),
     idempotencyLedger: new DirectoryIdempotencyLedger(config.idempotencyLedgerPath),
