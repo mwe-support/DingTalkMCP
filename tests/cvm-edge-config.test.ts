@@ -22,9 +22,10 @@ describe("CVM DingTalk edge contract", () => {
     expect(config).not.toContain("location ~ ^/(authorize|token|register|revoke)$");
     expect(exactLocation(config, "/mcp")).toMatch(/limit_except GET POST DELETE/u);
     expect(exactLocation(config, "/authorize")).toMatch(/limit_except GET POST/u);
-    for (const path of ["/token", "/register", "/revoke", "/oauth/consent"]) {
+    for (const path of ["/token", "/register", "/revoke"]) {
       expect(exactLocation(config, path)).toMatch(/limit_except POST/u);
     }
+    expect(config).not.toContain("/oauth/consent");
     for (const path of [
       "/.well-known/oauth-authorization-server",
       "/.well-known/oauth-protected-resource/mcp",

@@ -234,22 +234,6 @@ export function createMcpAuthorization(options: CreateMcpAuthorizationOptions): 
   router.use("/authorize", auditRejectedOAuthResponse(options.securityAudit, "AUTHORIZATION_REQUEST_REJECTED"));
   router.use("/token", auditRejectedOAuthResponse(options.securityAudit, "TOKEN_REQUEST_REJECTED"));
 
-  router.post("/oauth/consent", express.urlencoded({ extended: false, limit: "8kb" }), async (request, response) => {
-    response.setHeader("cache-control", "no-store");
-    const token = singleBodyValue(request.body, "consent_token");
-    const decision = singleBodyValue(request.body, "decision");
-    if (token === undefined || (decision !== "approve" && decision !== "deny")) {
-      await recordSecurity(options.securityAudit, {
-        event: "authorization_failed",
-        outcome: "rejected",
-        reasonCode: "CONSENT_RESPONSE_INVALID",
-      }).catch(() => undefined);
-      response.status(400).json({ error: "invalid_request", error_description: "Invalid consent response." });
-      return;
-    }
-    await provider.continueAfterConsent(token, decision, response);
-  });
-
   router.get("/oauth/dingtalk/callback", async (request, response) => {
     response.setHeader("cache-control", "no-store");
     const state = singleQueryValue(request.query.state);
@@ -442,49 +426,6 @@ class DingTalkBackedOAuthProvider implements OAuthServerProvider {
       scopes,
       expiresAt: this.#now() + this.#options.transactionTtlSeconds,
     });
-    if (scopes.some((scope) => scope === "approval:decide" || scope === "approval:create")) {
-      renderConsent(response, client, upstreamState, scopes);
-      return;
-    }
-    response.redirect(302, this.#options.identity.authorizationUrl(upstreamState).href);
-  }
-
-  async continueAfterConsent(
-    consentToken: string,
-    decision: "approve" | "deny",
-    response: express.Response,
-  ): Promise<void> {
-    const transaction = await this.#options.store.consumeTransaction(consentToken);
-    if (transaction === undefined) {
-      await recordSecurity(this.#options.securityAudit, {
-        event: "authorization_failed",
-        outcome: "rejected",
-        reasonCode: "CONSENT_TRANSACTION_INVALID",
-      }).catch(() => undefined);
-      response.status(400).json({ error: "invalid_request", error_description: "Consent is invalid or expired." });
-      return;
-    }
-    if (decision === "deny") {
-      await recordSecurity(this.#options.securityAudit, {
-        event: "consent_denied",
-        outcome: "rejected",
-        clientId: transaction.clientId,
-        reasonCode: "USER_DENIED_DECISION_SCOPE",
-      }).catch(() => undefined);
-      const target = new URL(transaction.redirectUri);
-      target.searchParams.set("error", "access_denied");
-      target.searchParams.set("error_description", "The user denied approval decision access.");
-      if (transaction.clientState !== undefined) target.searchParams.set("state", transaction.clientState);
-      response.redirect(302, target.href);
-      return;
-    }
-    await recordSecurity(this.#options.securityAudit, {
-      event: "consent_approved",
-      outcome: "succeeded",
-      clientId: transaction.clientId,
-    });
-    const upstreamState = this.#randomToken();
-    await this.#options.store.putTransaction(upstreamState, transaction);
     response.redirect(302, this.#options.identity.authorizationUrl(upstreamState).href);
   }
 
@@ -677,49 +618,6 @@ function hash(value: string): string {
 
 function singleQueryValue(value: unknown): string | undefined {
   return typeof value === "string" && value !== "" ? value : undefined;
-}
-
-function singleBodyValue(body: unknown, key: string): string | undefined {
-  if (!isPlainRecord(body)) return undefined;
-  const value = body[key];
-  return typeof value === "string" && value !== "" ? value : undefined;
-}
-
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function renderConsent(
-  response: express.Response,
-  client: OAuthClientInformationFull,
-  consentToken: string,
-  scopes: readonly McpScope[],
-): void {
-  response.setHeader("cache-control", "no-store");
-  response.setHeader("content-security-policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
-  response.setHeader("x-frame-options", "DENY");
-  response.setHeader("referrer-policy", "no-referrer");
-  const clientName = escapeHtml(client.client_name ?? client.client_id);
-  const scopeItems = scopes.map((scope) => `<li><code>${escapeHtml(scope)}</code></li>`).join("");
-  const writeScopeDescriptions = [
-    ...(scopes.includes("approval:decide")
-      ? ["<p><strong>approval:decide</strong> 允许客户端代表你同意或拒绝分配给你的审批任务。</p>"]
-      : []),
-    ...(scopes.includes("approval:create")
-      ? ["<p><strong>approval:create</strong> 允许客户端代表你准备、提交或撤销精确允许列表中的审批申请。</p>"]
-      : []),
-  ].join("");
-  response.status(200).type("html").send(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>MWE审批MCP 授权</title></head><body><main><h1>MWE审批MCP 权限确认</h1><p>客户端 <strong>${clientName}</strong> 请求以下权限：</p><ul>${scopeItems}</ul>${writeScopeDescriptions}<form method="post" action="/oauth/consent"><input type="hidden" name="consent_token" value="${escapeHtml(consentToken)}"><button type="submit" name="decision" value="approve">同意并使用钉钉登录</button><button type="submit" name="decision" value="deny">拒绝</button></form></main></body></html>`);
-}
-
-function escapeHtml(value: string): string {
-  return value.replace(/[&<>"']/gu, (character) => ({
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-    "'": "&#39;",
-  })[character] ?? character);
 }
 
 function recordSecurity(sink: SecurityAuditSink | undefined, event: SecurityAuditEventInput): Promise<void> {

@@ -59,12 +59,8 @@ describe("createMcpAuthorization", () => {
       state: "client-state-1",
     }).toString();
     const start = await fetch(authorize, { redirect: "manual" });
-    expect(start.status).toBe(200);
-    const consentHtml = await start.text();
-    expect(consentHtml).toContain("OAuth test client");
-    expect(consentHtml).toContain("approval:decide");
-    expect(consentHtml).toContain("approval:create");
-    const dingtalkLocation = await submitConsent(baseUrl, consentHtml, "approve");
+    expect(start.status).toBe(302);
+    const dingtalkLocation = new URL(requiredHeader(start, "location"));
     expect(dingtalkLocation.origin).toBe("https://login.dingtalk.test");
 
     const callback = new URL("/oauth/dingtalk/callback", baseUrl);
@@ -101,10 +97,9 @@ describe("createMcpAuthorization", () => {
       scopes: ["approval:read", "approval:decide", "approval:create"],
       authenticatedAt: 1_800_000_000,
     });
-    expect(securityEvents).toEqual(expect.arrayContaining([
-      expect.objectContaining({ event: "consent_approved", outcome: "succeeded" }),
+    expect(securityEvents).toContainEqual(
       expect.objectContaining({ event: "login_succeeded", outcome: "succeeded", subject: "union-1" }),
-    ]));
+    );
   });
 
   it("audits the safe DingTalk identity stage when enterprise user mapping fails", async () => {
@@ -146,7 +141,7 @@ describe("createMcpAuthorization", () => {
     expect(JSON.stringify(securityEvents)).not.toContain("must-not-enter-audit");
   });
 
-  it("does not start DingTalk login when the user denies approval decision scope", async () => {
+  it("redirects elevated approval scopes directly to DingTalk OAuth", async () => {
     const { baseUrl, identity } = await fixture();
     const client = await registerPublicClient(baseUrl);
     const authorize = new URL("/authorize", baseUrl);
@@ -158,15 +153,14 @@ describe("createMcpAuthorization", () => {
       code_challenge_method: "S256",
       resource,
       scope: "approval:read approval:decide",
-      state: "client-denied-state",
+      state: "client-state",
     }).toString();
     const start = await fetch(authorize, { redirect: "manual" });
-    const denied = await submitConsent(baseUrl, await start.text(), "deny");
+    const dingtalkLocation = new URL(requiredHeader(start, "location"));
 
-    expect(denied.origin + denied.pathname).toBe(redirectUri);
-    expect(denied.searchParams.get("error")).toBe("access_denied");
-    expect(denied.searchParams.get("state")).toBe("client-denied-state");
-    expect(identity.authorizationUrl).not.toHaveBeenCalled();
+    expect(start.status).toBe(302);
+    expect(dingtalkLocation.origin).toBe("https://login.dingtalk.test");
+    expect(identity.authorizationUrl).toHaveBeenCalledOnce();
   });
 
   it("rotates refresh tokens and revokes the family when an old token is replayed", async () => {
@@ -378,19 +372,6 @@ async function fixture(identityOverride?: DingTalkIdentityPort): Promise<{
   });
   const address = server.address() as AddressInfo;
   return { baseUrl: new URL(`http://127.0.0.1:${address.port}`), securityEvents, identity };
-}
-
-async function submitConsent(baseUrl: URL, html: string, decision: "approve" | "deny"): Promise<URL> {
-  const token = /name="consent_token" value="([^"]+)"/u.exec(html)?.[1];
-  if (token === undefined) throw new Error(`Missing consent token: ${html}`);
-  const response = await fetch(new URL("/oauth/consent", baseUrl), {
-    method: "POST",
-    redirect: "manual",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ consent_token: token, decision }),
-  });
-  expect(response.status).toBe(302);
-  return new URL(requiredHeader(response, "location"));
 }
 
 async function registerPublicClient(baseUrl: URL): Promise<{ client_id: string }> {

@@ -66,7 +66,7 @@ codex mcp login mwe_approval_mcp
 
 1. 确认 metadata 两个 URL 返回 200。
 2. 添加客户端配置并触发连接。
-3. 初次授权时，服务端的 HTTP 401 challenge 不携带单一 scope；客户端应从 protected resource metadata 的 `scopes_supported` 读取 `approval:read`、`approval:create` 与 `approval:decide`。本站权限页会单独展示两个写权限，用户明确同意后才签发 token。
+3. 初次授权时，服务端的 HTTP 401 challenge 不携带单一 scope；客户端应从 protected resource metadata 的 `scopes_supported` 读取 `approval:read`、`approval:create` 与 `approval:decide`。本站 `/authorize` 校验请求后直接跳转到钉钉官方 OAuth 页面，不展示自建权限确认页。
 4. 已持有较小 scope 的客户端调用发起审批、同意或拒绝动作时，服务端仍通过 HTTP 403 `insufficient_scope` 分别要求 `approval:create` 或 `approval:decide`。WorkBuddy 5.3.13 会把运行时 403 归类为 transport error，不能自动升级；应只执行一次“重新授权”，让它按 metadata 重新申请。自动打开授权页后不要同时点击第二个手动授权按钮，否则并行 OAuth 流程会互相覆盖本地 `clientInformation` 与 `pendingOAuth` 状态。
 5. 浏览器跳转到 `login.dingtalk.com`，使用公司当前账号授权。
 6. 确认回调最终回到客户端 loopback URI，而不是停留在本站 callback。

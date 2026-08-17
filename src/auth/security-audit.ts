@@ -8,8 +8,6 @@ import {
 
 export type SecurityAuditEventName =
   | "authorization_failed"
-  | "consent_approved"
-  | "consent_denied"
   | "login_succeeded"
   | "login_failed"
   | "tenant_mismatch"
