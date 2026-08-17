@@ -324,6 +324,35 @@ describe("approval_request public MCP contract", () => {
     }));
   });
 
+  it("returns a stable pre-write rejection instead of poisoning the revoke idempotency key", async () => {
+    const { client, request } = await connectedApplicantClient();
+    request.mockResolvedValue({
+      result: {
+        processInstanceId: "pi-completed-1",
+        processCode: "PROC-2DB91B79-3CDD-421D-A223-0489A7BAB2C0",
+        originatorUserId: "user-1",
+        status: "COMPLETED",
+        tasks: [],
+      },
+    });
+    const arguments_ = {
+      action: "revoke",
+      processInstanceId: "pi-completed-1",
+      requestId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      confirm: true,
+    } as const;
+
+    const first = await client.callTool({ name: "approval_request", arguments: arguments_ });
+    const repeated = await client.callTool({ name: "approval_request", arguments: arguments_ });
+
+    expect(first.structuredContent).toMatchObject({ error: { code: "INSTANCE_NOT_REVOCABLE" } });
+    expect(repeated.structuredContent).toMatchObject({ error: { code: "INSTANCE_NOT_REVOCABLE" } });
+    expect(JSON.stringify(repeated.structuredContent)).not.toContain("IDEMPOTENCY_OUTCOME_UNKNOWN");
+    expect(request).not.toHaveBeenCalledWith(expect.objectContaining({
+      path: "/v1.0/workflow/processInstances/terminate",
+    }));
+  });
+
   it("namespaces submission idempotency by the OAuth-bound applicant", async () => {
     const ledger = new InMemoryIdempotencyLedger();
     const first = await connectedApplicantClient({
