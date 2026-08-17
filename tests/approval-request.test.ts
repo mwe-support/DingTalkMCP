@@ -895,6 +895,109 @@ describe("approval_request public MCP contract", () => {
     expect(secondResult.structuredContent).toMatchObject({ result: { processInstanceId: "pi-user-2" } });
   });
 
+  it("releases submission idempotency after a definite DingTalk rejection", async () => {
+    const { client, request } = await connectedApplicantClient();
+    request.mockImplementation(async (input: { path: string }) => {
+      if (input.path === "/v1.0/workflow/forms/schemas/processCodes") return expenseSchemaResponse();
+      if (input.path === "/v1.0/workflow/processInstances") {
+        throw new ApprovalMcpError("DINGTALK_API_ERROR", "DingTalk OpenAPI rejected the request.", {
+          details: { status: 400, upstreamCode: "InvalidParameter" },
+          retryable: false,
+        });
+      }
+      throw new Error(`Unexpected DingTalk request: ${input.path}`);
+    });
+    const arguments_ = {
+      action: "submit",
+      template: "expense_reimbursement",
+      deptId: 42,
+      fields: expenseFields(),
+      confirm: true,
+      requestId: "abababab-abab-4bab-8bab-abababababab",
+    } as const;
+
+    const first = await client.callTool({ name: "approval_request", arguments: arguments_ });
+    const repeated = await client.callTool({ name: "approval_request", arguments: arguments_ });
+
+    expect(first.structuredContent).toMatchObject({
+      error: { code: "DINGTALK_API_ERROR", retryable: false, details: { status: 400, upstreamCode: "InvalidParameter" } },
+    });
+    expect(repeated.structuredContent).toMatchObject({
+      error: { code: "DINGTALK_API_ERROR", retryable: false, details: { status: 400, upstreamCode: "InvalidParameter" } },
+    });
+    expect(request.mock.calls.filter(([input]) => input.path === "/v1.0/workflow/processInstances")).toHaveLength(2);
+  });
+
+  it("keeps submission idempotency blocked after a retryable DingTalk failure", async () => {
+    const { client, request } = await connectedApplicantClient();
+    request.mockImplementation(async (input: { path: string }) => {
+      if (input.path === "/v1.0/workflow/forms/schemas/processCodes") return expenseSchemaResponse();
+      if (input.path === "/v1.0/workflow/processInstances") {
+        throw new ApprovalMcpError("DINGTALK_API_ERROR", "DingTalk request timed out.", { retryable: true });
+      }
+      throw new Error(`Unexpected DingTalk request: ${input.path}`);
+    });
+    const arguments_ = {
+      action: "submit",
+      template: "expense_reimbursement",
+      deptId: 42,
+      fields: expenseFields(),
+      confirm: true,
+      requestId: "acacacac-acac-4cac-8cac-acacacacacac",
+    } as const;
+
+    const first = await client.callTool({ name: "approval_request", arguments: arguments_ });
+    const repeated = await client.callTool({ name: "approval_request", arguments: arguments_ });
+
+    expect(first.structuredContent).toMatchObject({ error: { code: "IDEMPOTENCY_OUTCOME_UNKNOWN" } });
+    expect(repeated.structuredContent).toMatchObject({ error: { code: "IDEMPOTENCY_OUTCOME_UNKNOWN" } });
+    expect(request.mock.calls.filter(([input]) => input.path === "/v1.0/workflow/processInstances")).toHaveLength(1);
+  });
+
+  it("keeps submission idempotency blocked when an attachment committed before a definite start rejection", async () => {
+    const { client, request } = await connectedApplicantClient({
+      agentId: 123456,
+      callerUnionId: "union-1",
+    });
+    request.mockImplementation(async (input: { path: string }) => {
+      if (input.path === "/v1.0/workflow/forms/schemas/processCodes") return expenseSchemaResponse();
+      if (input.path === "/v1.0/workflow/processInstances/spaces/infos/query") return { result: { spaceId: 9988 } };
+      if (input.path === "/v1.0/storage/spaces/9988/files/commit") {
+        return { dentry: { id: "file-side-effect", name: "invoice.pdf", extension: "pdf", size: 4096, spaceId: 9988 } };
+      }
+      if (input.path === "/v1.0/workflow/processInstances") {
+        throw new ApprovalMcpError("DINGTALK_API_ERROR", "DingTalk rejected the approval.", {
+          details: { status: 400, upstreamCode: "InvalidParameter" },
+          retryable: false,
+        });
+      }
+      throw new Error(`Unexpected DingTalk request: ${input.path}`);
+    });
+    const arguments_ = {
+      action: "submit",
+      template: "expense_reimbursement",
+      deptId: 42,
+      fields: expenseFields(),
+      uploads: [{
+        field: "invoice",
+        fileName: "invoice.pdf",
+        fileSize: 4096,
+        uploadKey: "upload-side-effect",
+        spaceId: "9988",
+      }],
+      confirm: true,
+      requestId: "adadadad-adad-4dad-8dad-adadadadadad",
+    } as const;
+
+    const first = await client.callTool({ name: "approval_request", arguments: arguments_ });
+    const repeated = await client.callTool({ name: "approval_request", arguments: arguments_ });
+
+    expect(first.structuredContent).toMatchObject({ error: { code: "IDEMPOTENCY_OUTCOME_UNKNOWN" } });
+    expect(repeated.structuredContent).toMatchObject({ error: { code: "IDEMPOTENCY_OUTCOME_UNKNOWN" } });
+    expect(request.mock.calls.filter(([input]) => input.path.endsWith("/files/commit"))).toHaveLength(1);
+    expect(request.mock.calls.filter(([input]) => input.path === "/v1.0/workflow/processInstances")).toHaveLength(1);
+  });
+
   it("prepares bounded direct-to-DingTalk attachment uploads without receiving file bytes", async () => {
     const { client, request } = await connectedApplicantClient({
       agentId: 123456,

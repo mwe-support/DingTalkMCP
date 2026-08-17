@@ -1371,7 +1371,7 @@ export class ApprovalService {
         "A previous approval submission may have committed attachments or reached DingTalk.",
       );
     }
-    let mutationStarted = false;
+    let sideEffectCommitted = false;
     try {
       const committedAttachments: Array<ApprovalAttachmentFormValue & { field: ApprovalAttachmentField }> = [];
       if (input.uploads.length > 0) {
@@ -1383,7 +1383,6 @@ export class ApprovalService {
               "The uploaded attachment spaceId does not belong to the authenticated applicant's approval space.",
             );
           }
-          mutationStarted = true;
           const payload = await this.#api.request({
             method: "POST",
             path: `/v1.0/storage/spaces/${encodeURIComponent(currentSpace.spaceId)}/files/commit`,
@@ -1395,6 +1394,7 @@ export class ApprovalService {
               option: { size: upload.fileSize, conflictStrategy: "AUTO_RENAME" },
             },
           });
+          sideEffectCommitted = true;
           committedAttachments.push(normalizeCommittedAttachment(upload, currentSpace.spaceId, payload));
         }
       }
@@ -1416,7 +1416,6 @@ export class ApprovalService {
         input.applicant,
         byField,
       );
-      mutationStarted = true;
       const upstreamResult = await this.#api.request({
         method: "POST",
         path: "/v1.0/workflow/processInstances",
@@ -1449,7 +1448,7 @@ export class ApprovalService {
       });
       return result;
     } catch (error) {
-      if (!mutationStarted && isKnownPreWriteRejection(error)) {
+      if (!sideEffectCommitted && isKnownPreWriteRejection(error)) {
         await this.#idempotencyLedger.delete(ledgerKey);
         throw error;
       }
