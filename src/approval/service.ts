@@ -220,6 +220,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const MAX_INBOX_REFRESH_PAGES_PER_PROCESS = 5;
 const MAX_INBOX_REFRESH_CANDIDATES = 40;
 const MAX_INBOX_REFRESH_PROCESS_CODES = 10;
+const ISO_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/u;
 const CLIENT_ATTACHMENT_HANDLING = {
   mode: "agent_client",
   agentMustDownload: true,
@@ -2562,7 +2563,14 @@ function nonNegativeSafeInteger(value: unknown): number | undefined {
 
 function timestamp(value: unknown, fallback: number): number {
   const parsed = nonNegativeSafeInteger(value);
-  return parsed !== undefined && parsed > 0 ? parsed : fallback;
+  if (parsed !== undefined && parsed > 0) return parsed;
+  if (typeof value === "string") {
+    const candidate = value.trim();
+    if (/^[+-]?\d+$/u.test(candidate) || !ISO_TIMESTAMP_PATTERN.test(candidate)) return fallback;
+    const dateTime = Date.parse(candidate);
+    if (Number.isSafeInteger(dateTime) && dateTime > 0) return dateTime;
+  }
+  return fallback;
 }
 
 function inboxDecisionResult(value: unknown): "agree" | "refuse" | "redirect" | undefined {

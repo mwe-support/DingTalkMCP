@@ -707,7 +707,9 @@ describe("approval_inbox public MCP contract", () => {
   });
 
   it("refreshes completed records from the official instance ID list API", async () => {
-    const now = 1_800_000_000_000;
+    const now = Date.parse("2026-08-18T09:00:00.000Z");
+    const createdAt = Date.parse("2026-08-14T19:46:00.000Z");
+    const completedAt = Date.parse("2026-08-14T20:00:00.000Z");
     const root = await mkdtemp(join(tmpdir(), "approval-inbox-openapi-refresh-"));
     const request = vi.fn().mockImplementation((input: {
       method: string;
@@ -741,13 +743,13 @@ describe("approval_inbox public MCP contract", () => {
           processCode: "PROC-REFRESH",
           title: "Refreshed completed approval",
           status: "RUNNING",
-          createTime: now - 10_000,
+          createTime: "2026-08-14T19:46Z",
           tasks: ["refresh-task-1", "refresh-task-2"].map((taskId) => ({
             taskId,
             userId: "user-1",
             status: "COMPLETED",
             result: "AGREE",
-            finishTime: now - 1_000,
+            finishTime: "2026-08-14T20:00Z",
           })),
         },
       });
@@ -795,12 +797,73 @@ describe("approval_inbox public MCP contract", () => {
             processInstanceId: "pi-refresh-completed",
             taskCount: 2,
             decisionResult: "agree",
-            completedAt: now - 1_000,
+            completedAt,
+            createdAt,
+            updatedAt: completedAt,
           }],
         },
       },
     });
     expect(request).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not reinterpret non-positive numeric timestamp strings as calendar dates", async () => {
+    const now = Date.parse("2026-08-18T09:00:00.000Z");
+    const root = await mkdtemp(join(tmpdir(), "approval-inbox-invalid-numeric-time-"));
+    const request = vi.fn().mockImplementation((input: {
+      path: string;
+      query?: { processInstanceId?: string };
+    }) => {
+      if (input.path === "/v1.0/workflow/processes/instanceIds/query") {
+        return Promise.resolve({ result: { list: ["pi-time-zero", "pi-time-negative"], nextToken: 0 } });
+      }
+      const processInstanceId = input.query?.processInstanceId ?? "missing";
+      return Promise.resolve({
+        result: {
+          processInstanceId,
+          processCode: "PROC-REFRESH",
+          status: "COMPLETED",
+          createTime: processInstanceId === "pi-time-zero" ? "0" : "-1",
+          tasks: [{
+            taskId: `task-${processInstanceId}`,
+            userId: "user-1",
+            status: "COMPLETED",
+            result: "AGREE",
+            finishTime: processInstanceId === "pi-time-zero" ? "0" : "-1",
+          }],
+        },
+      });
+    });
+    const service = new ApprovalService({
+      api: { request } as unknown as Pick<DingTalkApiClient, "request">,
+      callerUserId: "user-1",
+      callerScopes: ["approval:read"],
+      inboxIndex: new DirectoryApprovalInboxIndex(root, { now: () => now }),
+      inboxProcessCodes: ["PROC-REFRESH"],
+      inboxCursorSecret: INBOX_CURSOR_SECRET,
+      corpId: "corp-1",
+      now: () => now,
+    });
+    const server = createApprovalMcpServer(service);
+    const client = new Client({ name: "approval-inbox-invalid-numeric-time-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    closeables.push(client, server);
+
+    const result = await client.callTool({
+      name: "approval_inbox",
+      arguments: { recordStatus: "completed", refreshWindowDays: 1 },
+    });
+    const items = (result.structuredContent as {
+      result?: { data?: { items?: Array<Record<string, unknown>> } };
+    }).result?.data?.items;
+
+    expect(items).toHaveLength(2);
+    expect(items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ processInstanceId: "pi-time-zero", createdAt: now, completedAt: now }),
+      expect.objectContaining({ processInstanceId: "pi-time-negative", createdAt: now, completedAt: now }),
+    ]));
   });
 
   it("refreshes only the OAuth user's pending tasks from scanned instances", async () => {
